@@ -1,0 +1,8 @@
+data.json
+data.json.tmp
+data.json.imported
+hub.db
+hub.db-wal
+hub.db-shm
+hub-backup-*.db
+public/

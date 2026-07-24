@@ -1,0 +1,16 @@
+{
+  "name": "household-hub",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Self-hosted family wall display: calendar, meals, chores, grocery list, notes and countdowns",
+  "license": "MIT",
+  "scripts": {
+    "setup": "npm --prefix server install && npm --prefix web install",
+    "build": "npm --prefix web run build",
+    "start": "npm --prefix server start",
+    "dev:server": "npm --prefix server start",
+    "dev:web": "npm --prefix web run dev",
+    "serve": "npm run build && npm start",
+    "backup": "npm --prefix server run backup"
+  }
+}

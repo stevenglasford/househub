@@ -1,0 +1,6 @@
+# Install to /etc/caddy/Caddyfile, then: sudo systemctl reload caddy
+# Caddy obtains and renews the Let's Encrypt certificate automatically.
+hub.example.com {
+    encode zstd gzip
+    reverse_proxy localhost:4000
+}

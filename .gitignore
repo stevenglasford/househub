@@ -1,0 +1,26 @@
+# dependencies
+node_modules/
+
+# the built front-end is generated into the server's public dir
+server/public/
+
+# live household data — never commit this
+server/data.json
+server/data.json.tmp
+server/data.json.imported
+server/hub.db
+server/hub.db-wal
+server/hub.db-shm
+server/hub-backup-*.db
+
+# logs / editor / OS noise
+*.log
+npm-debug.log*
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# env
+.env
+.env.local

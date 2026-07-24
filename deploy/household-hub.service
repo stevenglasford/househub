@@ -1,0 +1,26 @@
+# Install to /etc/systemd/system/household-hub.service
+# Then:  sudo systemctl daemon-reload && sudo systemctl enable --now household-hub
+[Unit]
+Description=Household Hub
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# adjust User and WorkingDirectory to match where you cloned the repo
+User=steven
+WorkingDirectory=/home/steven/household-hub/server
+ExecStart=/usr/bin/node server.js
+Environment=NODE_ENV=production
+Environment=PORT=4000
+Environment=REFRESH_MINUTES=15
+# set this to your household's timezone so feed times land on the right day
+Environment=TZ=America/Chicago
+Restart=always
+RestartSec=5
+# light hardening
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
