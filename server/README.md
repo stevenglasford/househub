@@ -6,11 +6,8 @@ See the [root README](../README.md) for setup, deployment, and the full API refe
 
 - `server.js` — routes, static hosting, background calendar refresh
 - `ics.js` — iCalendar parsing, recurrence and multi-day expansion
-- `store.js` — SQLite datastore (better-sqlite3, WAL, one transaction per mutation)
-- `backup.mjs` — WAL-safe online backup (`npm run backup`)
-- `hub.db` — created on first run; this is your household's data (gitignored).
-  An existing `data.json` from the old JSON store is imported automatically on
-  first boot and renamed to `data.json.imported`.
+- `store.js` — JSON-file datastore with atomic writes
+- `data.json` — created on first run; this is your household's data (gitignored)
 
 ```bash
 npm install

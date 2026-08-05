@@ -3,6 +3,8 @@
 // INTERVAL, COUNT, UNTIL, and BYDAY (for weekly). Times are interpreted in
 // the server's local timezone, so set the server TZ to your household's zone.
 
+import { ICS_FETCH_TIMEOUT_MS } from "./config.js";
+
 const pad = (n) => String(n).padStart(2, "0");
 export const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
@@ -74,8 +76,13 @@ export function expandEvents(parsed, winStart, winEnd) {
       const key = dstr + time + (ev.summary || "");
       if (seen.has(key)) continue;
       seen.add(key);
+      // endTime only on the first day, and only for timed events — the check-in
+      // scheduler needs to know when something like a work shift finishes
+      const endTime = (i === 0 && !ev.start.allDay && ev.end && !ev.end.allDay
+        && ev.end.h !== undefined && span === 1)
+        ? `${pad(ev.end.h)}:${pad(ev.end.mi)}` : "";
       out.push({
-        title: ev.summary || "(No title)", date: dstr, time,
+        title: ev.summary || "(No title)", date: dstr, time, endTime,
         allDay: !!ev.start.allDay || i > 0,
         spanDays: span, spanIndex: i, cont: i > 0,
       });
@@ -122,7 +129,12 @@ export function expandEvents(parsed, winStart, winEnd) {
 // because this runs on the server, not in the browser.
 export async function fetchICS(url) {
   const u = url.replace(/^webcal:/i, "https:");
-  const res = await fetch(u, { redirect: "follow" });
+  // Timeout is configurable (ICS_FETCH_TIMEOUT_MS) so one unresponsive feed
+  // can't stall the refresh loop.
+  const res = await fetch(u, {
+    redirect: "follow",
+    signal: AbortSignal.timeout(ICS_FETCH_TIMEOUT_MS),
+  });
   if (!res.ok) throw new Error("HTTP " + res.status);
   const text = await res.text();
   if (!/BEGIN:VCALENDAR/i.test(text)) throw new Error("Not a calendar feed");

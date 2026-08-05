@@ -37,3 +37,5 @@ export const refreshCalendar = (id) =>
 
 export const deleteCalendar = (id) =>
   fetch(`api/calendars/${id}`, { method: "DELETE" }).then(j);
+
+export const loadConfig = () => fetch("api/config").then(j);

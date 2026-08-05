@@ -16,6 +16,16 @@ Environment=PORT=4000
 Environment=REFRESH_MINUTES=15
 # set this to your household's timezone so feed times land on the right day
 Environment=TZ=America/Chicago
+# Absolute path is safest — it keeps the database OUTSIDE the deploy
+# directory, so unzipping a new version can never touch your data.
+Environment=DB_FILE=/var/lib/household-hub/hub.db
+# Optional: read-only Home Assistant integration for the Home tab.
+# The token stays on the server, never reaches the browser.
+# Generate the token at your HA profile page (/profile).
+#Environment=HA_URL=http://192.168.1.50:8123
+#Environment=HA_TOKEN=
+# Anything from .env.example can be set here, or loaded from a file:
+#EnvironmentFile=/etc/household-hub.env
 Restart=always
 RestartSec=5
 # light hardening

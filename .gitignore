@@ -4,14 +4,14 @@ node_modules/
 # the built front-end is generated into the server's public dir
 server/public/
 
-# live household data — never commit this
-server/data.json
-server/data.json.tmp
-server/data.json.imported
+# live household data — never commit these
 server/hub.db
 server/hub.db-wal
 server/hub.db-shm
 server/hub-backup-*.db
+server/data.json
+server/data.json.tmp
+server/data.json.imported
 
 # logs / editor / OS noise
 *.log

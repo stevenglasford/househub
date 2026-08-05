@@ -1,51 +1,62 @@
 // store.js — SQLite-backed datastore (better-sqlite3, WAL mode).
 //
-// Same interface as the original JSON-file version — load() returns the
-// in-memory household document, mutate(fn) applies a change and persists —
-// so server.js is unchanged. The difference is what "persist" means: every
-// mutation is written to hub.db in one transaction instead of rewriting a
-// JSON file.
+// Public interface matches the JSON store exactly — load() returns the whole
+// in-memory household document, mutate(fn) applies a change and persists — so
+// server.js doesn't care which store is underneath. (A plain JSON store with
+// the same interface lives in store-json.js for anyone who prefers it.)
 //
-// Layout: one table per collection, one row per entity. Each entity is
-// stored whole in a `data` JSON column, so fields the client adds later
-// survive without a schema migration; `pos` preserves array order (notes
-// are newest-first, etc.). Calendar feed text is large and server-only, so
-// it lives in its own column instead of inside the JSON.
+// SCHEMA COMPATIBILITY: the deployed hub already runs on a SQLite database
+// written by an earlier version of this store. That database is the whole
+// reason for this upgrade, so this store uses the SAME on-disk schema and
+// simply reads it in place:
+//   meta       (key, json)
+//   <list>     (id, pos, data)   one table per list collection
+//   meals      (date, data)      legacy per-day meals, its own table
+//   calendars  (id, pos, data, ics_text)
 //
-// A full rewrite per mutation sounds heavy but isn't: household-scale data
-// is a few hundred rows and better-sqlite3 clears + reinserts that in well
-// under a millisecond. In exchange, the DB always mirrors the in-memory
-// document exactly, no matter what shape a mutation takes.
+// The list collections have grown since that schema was written (projects,
+// agenda, dateIdeas, …). New list tables are created on first boot; old ones
+// are read as-is. Meals changed shape too — old rows are one dish per slot,
+// the new model is a per-person entry list — so meals are read from the legacy
+// `meals` table if present, put back into the in-memory document, and migrated
+// by normalize() (document.js). From then on meals live in the `meta` table
+// like every other non-list value, and the legacy table is left empty.
 //
-// First boot against an empty DB imports an existing data.json (the old
-// store) automatically, then renames it to data.json.imported.
+// A mutation clears and rewrites the affected tables in a single transaction,
+// so the database always mirrors the in-memory document exactly.
+//
+// First boot against a genuinely empty DB imports an existing data.json (the
+// store this version shipped with, or an even older one) automatically, then
+// renames it to data.json.imported.
 
 import Database from "better-sqlite3";
 import { readFileSync, renameSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
+import { DB_FILE, LEGACY_JSON } from "./config.js";
+import { seed, normalize, uid } from "./document.js";
 
-const DIR = dirname(fileURLToPath(import.meta.url));
-const DB_FILE = process.env.DB_FILE || join(DIR, "hub.db");
-const LEGACY_JSON = process.env.DATA_FILE || join(DIR, "data.json");
+/* ---------- which top-level keys are stored as ordered rows ---------- */
 
-const uid = () => Math.random().toString(36).slice(2, 9);
+// Every array-of-entities collection in the current document. The first seven
+// match the deployed schema; the rest are new and get fresh tables.
+const LISTS = [
+  "people", "events", "chores", "tasks", "grocery", "notes", "dates",
+  "projects", "agenda", "agendaArchive", "agendaPrompts", "dateJars", "dateIdeas",
+];
+// Keys with bespoke storage; everything else is a plain JSON meta value.
+// (meals is read from its legacy table but written into meta after migration.)
+const SPECIAL = new Set([...LISTS, "calendars", "meals"]);
 
-/* ---------- schema ---------- */
+/* ---------- schema (matches the deployed database) ---------- */
 
 const db = new Database(DB_FILE);
 db.pragma("journal_mode = WAL");
 db.pragma("synchronous = NORMAL");
 db.pragma("busy_timeout = 5000");
 
-const LISTS = ["people", "events", "chores", "tasks", "grocery", "notes", "dates"];
-// top-level keys that are NOT plain meta values (they get their own tables)
-const NON_META = new Set([...LISTS, "meals", "calendars"]);
-
 db.exec(`
   CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, json TEXT NOT NULL);
   ${LISTS.map((t) => `
-  CREATE TABLE IF NOT EXISTS ${t} (
+  CREATE TABLE IF NOT EXISTS "${t}" (
     id   TEXT PRIMARY KEY,
     pos  INTEGER NOT NULL,
     data TEXT NOT NULL
@@ -67,7 +78,6 @@ const stmt = {
   metaPut: db.prepare("INSERT OR REPLACE INTO meta (key, json) VALUES (?, ?)"),
   mealsAll: db.prepare("SELECT date, data FROM meals"),
   mealsClear: db.prepare("DELETE FROM meals"),
-  mealsPut: db.prepare("INSERT OR REPLACE INTO meals (date, data) VALUES (?, ?)"),
   calsAll: db.prepare("SELECT data, ics_text FROM calendars ORDER BY pos"),
   calsClear: db.prepare("DELETE FROM calendars"),
   calsPut: db.prepare("INSERT OR REPLACE INTO calendars (id, pos, data, ics_text) VALUES (?, ?, ?, ?)"),
@@ -75,9 +85,9 @@ const stmt = {
 };
 for (const t of LISTS) {
   stmt.list[t] = {
-    all: db.prepare(`SELECT data FROM ${t} ORDER BY pos`),
-    clear: db.prepare(`DELETE FROM ${t}`),
-    put: db.prepare(`INSERT OR REPLACE INTO ${t} (id, pos, data) VALUES (?, ?, ?)`),
+    all: db.prepare(`SELECT data FROM "${t}" ORDER BY pos`),
+    clear: db.prepare(`DELETE FROM "${t}"`),
+    put: db.prepare(`INSERT OR REPLACE INTO "${t}" (id, pos, data) VALUES (?, ?, ?)`),
   };
 }
 
@@ -90,23 +100,34 @@ function readAll() {
   const s = {};
   for (const { key, json } of metaRows) s[key] = JSON.parse(json);
   for (const t of LISTS) s[t] = stmt.list[t].all.all().map((r) => JSON.parse(r.data));
-  s.meals = {};
-  for (const r of stmt.mealsAll.all()) s.meals[r.date] = JSON.parse(r.data);
   s.calendars = stmt.calsAll.all().map((r) => ({ ...JSON.parse(r.data), icsText: r.ics_text }));
+
+  // Meals: a document migrated by a previous run has meals in `meta` already.
+  // A database from the older store has them only in the legacy `meals` table.
+  // Prefer meta if it's there; otherwise pull the legacy rows in so normalize()
+  // can migrate them to the per-person shape.
+  if (!s.meals || typeof s.meals !== "object" || !Object.keys(s.meals).length) {
+    const legacy = {};
+    for (const r of stmt.mealsAll.all()) legacy[r.date] = JSON.parse(r.data);
+    if (Object.keys(legacy).length) s.meals = legacy;
+  }
   return s;
 }
 
 const writeAll = db.transaction((s) => {
   stmt.metaClear.run();
   for (const [k, v] of Object.entries(s)) {
-    if (!NON_META.has(k)) stmt.metaPut.run(k, JSON.stringify(v ?? null));
+    if (!SPECIAL.has(k)) stmt.metaPut.run(k, JSON.stringify(v ?? null));
   }
+  // meals now live in meta alongside the other non-list values.
+  stmt.metaPut.run("meals", JSON.stringify(s.meals ?? {}));
+  // and the legacy meals table is emptied once, so it can never shadow meta.
+  stmt.mealsClear.run();
+
   for (const t of LISTS) {
     stmt.list[t].clear.run();
     (s[t] || []).forEach((e, i) => stmt.list[t].put.run(String(e.id ?? uid()), i, JSON.stringify(e)));
   }
-  stmt.mealsClear.run();
-  for (const [date, m] of Object.entries(s.meals || {})) stmt.mealsPut.run(date, JSON.stringify(m));
   stmt.calsClear.run();
   (s.calendars || []).forEach((c, i) => {
     const { icsText, ...meta } = c;
@@ -114,56 +135,24 @@ const writeAll = db.transaction((s) => {
   });
 });
 
-/* ---------- seed + defaults (unchanged from the JSON version) ---------- */
-
-function seed() {
-  const ryan = uid(), steven = uid();
-  return {
-    householdName: "Ryan & Steven",
-    people: [
-      { id: ryan, name: "Ryan", color: "#2E9187" },
-      { id: steven, name: "Steven", color: "#E86A4C" },
-    ],
-    events: [],
-    meals: {},
-    chores: [
-      { id: uid(), title: "Feed pets", personId: ryan, done: {} },
-      { id: uid(), title: "Dishes", personId: steven, done: {} },
-      { id: uid(), title: "Take out trash", personId: "", done: {} },
-    ],
-    tasks: [],
-    grocery: [],
-    notes: [],
-    dates: [],
-    weather: { lat: 44.98, lon: -93.27, label: "Minneapolis", unit: "f" },
-    layoutMode: "auto",
-    noteDisplay: "overlay",
-    calendars: [],
-  };
-}
-
-// Defaults for documents created by older versions of the app.
-function normalize(s) {
-  if (!Array.isArray(s.tasks)) s.tasks = [];
-  if (!Array.isArray(s.grocery)) s.grocery = [];
-  if (!Array.isArray(s.notes)) s.notes = [];
-  if (!Array.isArray(s.dates)) s.dates = [];
-  if (!s.weather) s.weather = { lat: 44.98, lon: -93.27, label: "Minneapolis", unit: "f" };
-  if (!s.layoutMode) s.layoutMode = "auto";
-  if (!s.noteDisplay) s.noteDisplay = "overlay";
-  return s;
-}
-
-/* ---------- public interface (same as before) ---------- */
+/* ---------- public interface ---------- */
 
 let state = null;
 
 export function load() {
   if (state) return state;
   state = readAll();
-  if (state) return normalize(state);
+  if (state) {
+    const before = JSON.stringify(state);
+    normalize(state);
+    // If normalize changed anything (new fields backfilled, meals migrated to
+    // the per-person shape and moved into meta, an old upNextSource folded in),
+    // persist once so the database matches what the server serves from here on.
+    if (JSON.stringify(state) !== before) writeAll(state);
+    return state;
+  }
 
-  // Empty DB. Import the legacy JSON store if one exists, otherwise seed.
+  // Empty DB. Import a legacy JSON store if one exists, otherwise seed.
   let imported = false;
   if (existsSync(LEGACY_JSON)) {
     try {

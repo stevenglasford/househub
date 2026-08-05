@@ -1,8 +1,9 @@
-data.json
-data.json.tmp
-data.json.imported
+# live household data — never commit these
 hub.db
 hub.db-wal
 hub.db-shm
 hub-backup-*.db
+data.json
+data.json.tmp
+data.json.imported
 public/

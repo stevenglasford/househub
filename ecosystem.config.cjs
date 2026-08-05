@@ -19,7 +19,15 @@ module.exports = {
         PORT: 4000,
         REFRESH_MINUTES: 15,
         TZ: "America/Chicago",
-        // DB_FILE: "/absolute/path/hub.db",   // default: server/hub.db
+        // Point at a path OUTSIDE the repo so redeploys can't touch your data.
+        // Default if unset: server/hub.db
+        DB_FILE: "/var/lib/household-hub/hub.db",
+        // Optional read-only Home Assistant integration. The token stays here
+        // on the server and is never sent to the browser.
+        // HA_URL: "http://192.168.1.50:8123",
+        // HA_TOKEN: "",
+        // Any variable from .env.example can be set here — see that file for
+        // the full list (weather location, seed household, display defaults).
       },
       max_memory_restart: "300M",
       restart_delay: 5000,
