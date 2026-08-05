@@ -1,0 +1,17 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: #f3ede2;
+  /* a wall display shouldn't rubber-band or show a text cursor */
+  overscroll-behavior: none;
+  -webkit-tap-highlight-color: transparent;
+}

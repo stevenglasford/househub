@@ -1,0 +1,49 @@
+# systemd unit for a non-Docker install.
+#   sudo cp deploy/household-hub.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now household-hub
+
+[Unit]
+Description=HouseHub
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=househub
+Group=househub
+WorkingDirectory=/opt/househub/server
+ExecStart=/usr/bin/node src/index.js
+Restart=on-failure
+RestartSec=5
+
+Environment=NODE_ENV=production
+Environment=HOST=127.0.0.1
+Environment=PORT=4000
+Environment=TZ=America/Chicago
+Environment=PUBLIC_URL=https://hub.example.com
+Environment=TRUST_PROXY=1
+Environment=DATABASE_URL=postgres://househub:CHANGEME@localhost/househub
+Environment=OLLAMA_URL=http://127.0.0.1:11434
+Environment=OLLAMA_MODEL=llama3.2:3b
+
+# Keep the root secret out of the unit file, which is world-readable.
+# Put SECRET_KEY=... in this file, chmod 600, owned by the service user.
+EnvironmentFile=-/etc/househub/secret.env
+
+# Hardening. The upgrade pipeline needs write access to its work directory and
+# spawns git/npm, so ReadWritePaths is set rather than ProtectSystem=strict.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=false
+ReadWritePaths=/var/lib/househub
+
+[Install]
+WantedBy=multi-user.target

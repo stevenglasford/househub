@@ -1,0 +1,323 @@
+// session.js — the unlocked household, held in memory.
+//
+// This module owns every key the browser has: the user's identity key, and the
+// household key it unwraps. Two rules govern all of it:
+//
+//   1. Keys live in memory only. Not localStorage, not IndexedDB, not a cookie.
+//      A shared wall tablet, a borrowed laptop, or an XSS payload that survives
+//      a reload should find nothing waiting for it. The cost is that a page
+//      refresh asks for the password again, and that is the right trade for
+//      software whose users may need it to be genuinely unreadable by someone
+//      with physical access.
+//
+//   2. Nothing leaves here in the clear. `save()` seals before it fetches;
+//      `load()` opens after. There is no code path that PUTs a plaintext
+//      document, which is why the 5,600-line UI on top never has to think
+//      about encryption at all.
+
+import * as C from "./crypto.js";
+
+const state = {
+  token: null,
+  user: null,
+  householdId: null,
+  role: null,
+  keyEpoch: null,
+  keys: null,          // { masterKey, masterKeyRaw, privateKey, publicKey }
+  householdKey: null,  // raw 32 bytes
+  version: 0,
+  // Set when this tab is a wall display rather than a signed-in person.
+  display: null,
+};
+
+const listeners = new Set();
+export const onChange = (fn) => { listeners.add(fn); return () => listeners.delete(fn); };
+const emit = () => listeners.forEach((fn) => fn(snapshot()));
+
+export const snapshot = () => ({
+  signedIn: Boolean(state.token || state.display),
+  unlocked: Boolean(state.householdKey),
+  user: state.user,
+  householdId: state.householdId,
+  role: state.role,
+  version: state.version,
+  isDisplay: Boolean(state.display),
+  displayScopes: state.display?.scopes || null,
+});
+
+export const currentToken = () => state.token || state.display?.token || null;
+export const householdId = () => state.householdId;
+export const isDisplay = () => Boolean(state.display);
+
+/* ------------------------------------------------------------- transport --- */
+
+class ApiError extends Error {
+  constructor(status, body) {
+    super(body?.error || `HTTP ${status}`);
+    this.status = status;
+    this.code = body?.code;
+    this.body = body;
+  }
+}
+export { ApiError };
+
+export async function request(method, path, body) {
+  const token = currentToken();
+  const res = await fetch(path.replace(/^\//, ""), {
+    method,
+    headers: {
+      ...(body === undefined ? {} : { "Content-Type": "application/json" }),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: body === undefined ? undefined : JSON.stringify(body),
+    credentials: "same-origin",
+  });
+
+  let json = null;
+  const text = await res.text();
+  if (text) { try { json = JSON.parse(text); } catch { /* non-JSON error page */ } }
+
+  if (!res.ok) throw new ApiError(res.status, json);
+  return json;
+}
+
+/* --------------------------------------------------------------- signing --- */
+
+export async function register({ email, password, displayName }) {
+  const cfg = await request("GET", "api/config");
+  const { upload, keys } = await C.createIdentity(password, cfg.kdfIterations || 650000);
+  const res = await request("POST", "api/auth/register", { email, displayName, ...upload });
+
+  state.token = res.token;
+  state.user = res.user;
+  state.keys = keys;
+  emit();
+  return res;
+}
+
+export async function signIn({ email, password, totp }) {
+  // Two steps, because the browser needs the salt before it can produce a proof.
+  // The server answers with plausible decoy parameters for addresses it does
+  // not know, so this exchange does not reveal whether an account exists.
+  const params = await request("POST", "api/auth/kdf-params", { email });
+  const authProof = await C.loginProof(password, params);
+
+  const res = await request("POST", "api/auth/login", { email, authProof, totp });
+
+  state.token = res.token;
+  state.user = res.user;
+  state.keys = await C.unlockIdentity(password, res.identity);
+  emit();
+  return res;
+}
+
+export async function signOut() {
+  try { await request("POST", "api/auth/logout"); } catch { /* going anyway */ }
+  wipe();
+}
+
+/** Zero the key material rather than just dropping the references. */
+export function wipe() {
+  try {
+    state.householdKey?.fill(0);
+    state.keys?.privateKey?.fill(0);
+    state.keys?.masterKeyRaw?.fill(0);
+  } catch { /* already gone */ }
+  Object.assign(state, {
+    token: null, user: null, householdId: null, role: null,
+    keyEpoch: null, keys: null, householdKey: null, version: 0, display: null,
+  });
+  emit();
+}
+
+/* ------------------------------------------------------------ households --- */
+
+export async function listHouseholds() {
+  const me = await request("GET", "api/auth/me");
+  state.user = { id: me.id, email: me.email, displayName: me.displayName, isSuperAdmin: me.isSuperAdmin };
+  return me.households;
+}
+
+/** Open a household: fetch the wrapped key and unwrap it with the identity key. */
+export async function openHousehold(id) {
+  if (!state.keys) throw new Error("Sign in first.");
+  const hh = await request("GET", `api/households/${id}`);
+
+  state.householdKey = await C.unwrapHouseholdKey(
+    hh.wrappedKey, state.keys.privateKey, state.keys.publicKey
+  );
+  state.householdId = hh.id;
+  state.role = hh.role;
+  state.keyEpoch = hh.keyEpoch;
+  emit();
+  return hh;
+}
+
+/** Create a household. The key is generated here and wrapped to ourselves. */
+export async function createHousehold(name, seedDoc) {
+  if (!state.keys) throw new Error("Sign in first.");
+  const hk = C.newHouseholdKeyRaw();
+  const wrappedKey = await C.wrapHouseholdKey(hk, state.keys.publicKey);
+
+  const doc = { ...seedDoc, householdName: name };
+  // The server assigns version 1; the placeholder id matches what it seals
+  // against before the real id exists.
+  const document = await C.sealDocument(hk, doc, { householdId: "pending", version: 1 });
+
+  const res = await request("POST", "api/households", { wrappedKey, document });
+
+  state.householdKey = hk;
+  state.householdId = res.id;
+  state.role = "admin";
+  state.keyEpoch = res.keyEpoch;
+  state.version = 1;
+  emit();
+  return res;
+}
+
+/* ----------------------------------------------------------------- vault --- */
+
+/**
+ * The context bound into the document's AAD.
+ *
+ * A household's first document is sealed before its id exists, so version 1
+ * uses the same "pending" placeholder the creation path used. Every later
+ * version binds the real id.
+ */
+const docContext = (version) => ({
+  householdId: version === 1 ? "pending" : state.householdId,
+  version,
+});
+
+export async function loadVault() {
+  const path = state.display ? "api/display/vault" : `api/households/${state.householdId}/vault`;
+  const res = await request("GET", path);
+  state.version = res.version;
+
+  const doc = await C.openDocument(state.householdKey, {
+    ciphertext: res.ciphertext,
+    compression: res.compression,
+    ...docContext(res.version),
+  });
+  emit();
+  return doc;
+}
+
+/**
+ * Seal and store. On a version conflict the server hands back the winning
+ * document, so `onConflict` gets both sides and returns the merged result --
+ * one round trip rather than a fetch-then-retry.
+ */
+export async function saveVault(doc, { onConflict } = {}) {
+  if (state.display) throw new Error("A display cannot write.");
+  if (!state.householdKey) throw new Error("The household is locked.");
+
+  const next = state.version + 1;
+  const sealed = await C.sealDocument(state.householdKey, doc, docContext(next));
+
+  try {
+    const res = await request("PUT", `api/households/${state.householdId}/vault`, {
+      ...sealed, baseVersion: state.version,
+    });
+    state.version = res.version;
+    emit();
+    return res;
+  } catch (err) {
+    if (err.code !== "version_conflict" || !err.body?.current) throw err;
+
+    const current = err.body.current;
+    const theirs = await C.openDocument(state.householdKey, {
+      ciphertext: current.ciphertext,
+      compression: current.compression,
+      ...docContext(current.version),
+    });
+
+    state.version = current.version;
+    if (!onConflict) {
+      // No merge strategy supplied: surface theirs rather than silently
+      // discarding either side.
+      const e = new Error("Someone else saved while you were editing.");
+      e.code = "version_conflict";
+      e.theirs = theirs;
+      throw e;
+    }
+    return saveVault(await onConflict(doc, theirs), { onConflict });
+  }
+}
+
+/** Cheap poll for other devices' changes. */
+export async function remoteVersion() {
+  const path = state.display ? "api/display/version" : `api/households/${state.householdId}/vault/version`;
+  const res = await request("GET", path);
+  return res.version;
+}
+
+export const localVersion = () => state.version;
+
+/* --------------------------------------------------------------- display --- */
+
+/**
+ * Bring up a wall display from its permanent link.
+ *
+ * The private key arrives in the URL *fragment*, which browsers never send to
+ * the server. It is stashed in localStorage afterwards -- deliberately, and
+ * unlike everything else in this module -- because a hallway tablet has to
+ * survive a power cut without someone fetching the setup link again. It is
+ * sealed under the display token, so the key and the thing that unseals it are
+ * not both sitting in the same store.
+ */
+const DISPLAY_STORE = "hh.display.v1";
+
+export async function startDisplay({ token, privateKeyB64 }) {
+  let sealedKey = null;
+  const saved = localStorage.getItem(DISPLAY_STORE);
+  if (saved) {
+    try { sealedKey = JSON.parse(saved); } catch { /* corrupt, re-provision */ }
+  }
+
+  let privateKey;
+  if (privateKeyB64) {
+    privateKey = C.fromB64(privateKeyB64);
+    localStorage.setItem(DISPLAY_STORE, JSON.stringify({
+      token, key: await C.sealDisplayKey(privateKey, token),
+    }));
+  } else if (sealedKey?.token === token) {
+    privateKey = await C.openDisplayKey(sealedKey.key, token);
+  } else {
+    throw new Error("This display has not been set up on this device. Open its setup link again.");
+  }
+
+  state.display = { token };
+  const boot = await request("GET", "api/display/bootstrap");
+
+  const publicKey = C.publicKeyFromPrivate(privateKey);
+  state.householdKey = await C.unwrapHouseholdKey(boot.wrappedKey, privateKey, publicKey, "display");
+  state.householdId = boot.householdId;
+  state.display = { token, scopes: boot.scopes, name: boot.name, id: boot.displayId };
+  state.keyEpoch = boot.keyEpoch;
+  emit();
+  return boot;
+}
+
+export function forgetDisplay() {
+  localStorage.removeItem(DISPLAY_STORE);
+  wipe();
+}
+
+/* -------------------------------------------------------------------- ai --- */
+
+/**
+ * Ask the local model for something.
+ *
+ * `context` is assembled by the caller from the *decrypted* document and is the
+ * only household detail that reaches the server, for the duration of one
+ * request. web/src/lib/checkin.js builds it, and defaults to sending counts
+ * rather than content.
+ */
+export async function generate(kind, context, opts = {}) {
+  return request("POST", `api/ai/households/${state.householdId}/generate`, {
+    kind, context, ...opts,
+  });
+}
+
+export const aiStatus = () => request("GET", "api/ai/status");

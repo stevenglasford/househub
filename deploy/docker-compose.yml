@@ -1,0 +1,110 @@
+# docker-compose.yml — a complete HouseHub in one command.
+#
+#   cp deploy/env.example .env
+#   ./scripts/generate-secret.sh >> .env      # writes SECRET_KEY
+#   docker compose -f deploy/docker-compose.yml up -d
+#
+# Ollama runs alongside rather than being reached over the network, so household
+# context never leaves the host. On a machine with an NVIDIA GPU, uncomment the
+# `deploy.resources` block; on a CPU-only box use a small model (llama3.2:3b) and
+# expect the first generation of the evening to take a few seconds.
+
+name: househub
+
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-househub}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:-househub}
+      # Postgres' own on-disk checksums. Cheap, and turns silent bit-rot in a
+      # household's only copy of its data into a loud error.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    # Not published to the host. Nothing outside this compose network has any
+    # business reaching the database directly.
+    expose:
+      - "5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-househub} -d ${POSTGRES_DB:-househub}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama-models:/root/.ollama
+    expose:
+      - "11434"
+    # Uncomment for NVIDIA GPUs (needs nvidia-container-toolkit on the host).
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # Pulls the model once, then exits. Without this the first check-in of the
+  # evening is the request that downloads several gigabytes.
+  ollama-init:
+    image: ollama/ollama:latest
+    depends_on: [ollama]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until ollama list >/dev/null 2>&1; do sleep 2; done
+        ollama pull ${OLLAMA_MODEL:-llama3.2:3b}
+    restart: "no"
+
+  app:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 4000
+      DATABASE_URL: postgres://${POSTGRES_USER:-househub}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-househub}
+      # The one secret you must generate and back up. Losing it makes sealed
+      # server-side values (emails, calendar URLs) unrecoverable.
+      SECRET_KEY: ${SECRET_KEY:?run scripts/generate-secret.sh}
+      PUBLIC_URL: ${PUBLIC_URL:?set the URL people will actually type}
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+      OLLAMA_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
+      AI_ENABLED: ${AI_ENABLED:-1}
+      ALLOW_SIGNUP: ${ALLOW_SIGNUP:-1}
+      TZ: ${TZ:-UTC}
+      # Off by default. See docs/SELF-HOSTING.md before turning either on.
+      BILLING_ENABLED: ${BILLING_ENABLED:-0}
+      UPGRADES_ENABLED: ${UPGRADES_ENABLED:-0}
+    ports:
+      # Bound to loopback: put Caddy or nginx in front for TLS. Web Crypto is
+      # unavailable outside a secure context, so the app cannot decrypt anything
+      # over plain http from another machine.
+      - "127.0.0.1:4000:4000"
+    volumes:
+      - upgrade-work:/var/lib/househub/upgrades
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  db-data:
+  ollama-models:
+  upgrade-work:

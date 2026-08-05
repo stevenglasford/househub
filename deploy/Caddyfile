@@ -1,0 +1,22 @@
+# Caddy handles Let's Encrypt automatically. Edit the hostname and:
+#   sudo cp deploy/Caddyfile /etc/caddy/Caddyfile && sudo systemctl reload caddy
+
+hub.example.com {
+	reverse_proxy 127.0.0.1:4000
+
+	# HouseHub sets its own CSP, HSTS and frame protections (middleware/security.js).
+	# Caddy adds compression and sane logging; it must not override those headers.
+	encode gzip zstd
+
+	log {
+		output file /var/log/caddy/househub.log
+		# The default format logs full request URIs. Display and invite links carry
+		# their token in the URL *fragment*, which is never sent -- but query
+		# strings can carry one too, so keep logs off the shared box or redact.
+		format json
+	}
+
+	header {
+		-Server
+	}
+}

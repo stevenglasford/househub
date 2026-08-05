@@ -1,0 +1,10 @@
+node_modules/
+.env
+.env.*
+!deploy/env.example
+.secret-key
+server/public/
+server/.secret-key
+dist/
+*.log
+.DS_Store

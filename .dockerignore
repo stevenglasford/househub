@@ -1,0 +1,9 @@
+node_modules
+**/node_modules
+.git
+.env
+.secret-key
+server/public
+docs
+security
+*.md
