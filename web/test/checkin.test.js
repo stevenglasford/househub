@@ -1,0 +1,75 @@
+// checkin.test.js — what leaves the browser when a question is generated.
+//
+// This is the one place in the client where anything decrypted is sent to the
+// server, so the assertions below are about *absence*: household content must
+// not appear in the context object at the default privacy level.
+
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { buildContext, PRIVACY_LEVELS } from "../src/lib/checkin.js";
+
+const doc = () => ({
+  people: [{ id: "1", name: "Steven" }, { id: "2", name: "Ryan" }],
+  tasks: [
+    { id: "t1", title: "Call the clinic", date: "2026-08-01", done: false },
+    { id: "t2", title: "Renew prescription", date: "2026-08-02", done: false },
+    { id: "t3", title: "Already done", date: "2026-08-01", done: true },
+  ],
+  agenda: [{ id: "a1", text: "whether to move to Portland", resolved: false }],
+  projects: [{ id: "p1", title: "Restain the deck", dates: ["2026-08-01"], percent: 40 }],
+  events: [], meals: {}, notes: [{ id: "n1", text: "a private note" }],
+  status: { "2026-08-04": { 1: { happiness: 5 }, 2: { happiness: 4 } } },
+  checkin: {},
+});
+
+// Every string in the document that must never be transmitted.
+const SECRETS = [
+  "Steven", "Ryan", "Call the clinic", "Renew prescription",
+  "whether to move to Portland", "Restain the deck", "a private note",
+];
+
+test("the default privacy level sends counts, never content", () => {
+  const ctx = buildContext(doc(), "2026-08-05");
+  const wire = JSON.stringify(ctx);
+  for (const secret of SECRETS) {
+    assert.ok(!wire.includes(secret), `"${secret}" must not leave the browser: ${wire}`);
+  }
+  // But the counts that make the question feel observant are there.
+  assert.equal(ctx.signals.overdueCount, 2, "the completed task should not count");
+  assert.equal(ctx.signals.agendaCount, 1);
+  assert.equal(ctx.signals.projectsSlipped, 1);
+  assert.equal(ctx.signals.mealsUnplanned, true);
+});
+
+test("minimal sends nothing about the household at all", () => {
+  const ctx = buildContext(doc(), "2026-08-05", { privacy: "minimal" });
+  assert.deepEqual(Object.keys(ctx).sort(), ["householdSize", "tone"]);
+  assert.equal(ctx.signals, undefined);
+  assert.equal(ctx.mood, undefined);
+});
+
+test("mood is banded, never a raw score", () => {
+  const ctx = buildContext(doc(), "2026-08-05");
+  assert.equal(ctx.mood, "good");
+  assert.ok(!JSON.stringify(ctx).includes("happiness"));
+});
+
+test("full is opt-in and is the only level that sends titles", () => {
+  const ctx = buildContext(doc(), "2026-08-05", { privacy: "full" });
+  assert.ok(JSON.stringify(ctx).includes("whether to move to Portland"));
+  assert.deepEqual(PRIVACY_LEVELS, ["minimal", "signals", "full"]);
+});
+
+test("recent topics are the model's own questions, not household content", () => {
+  const d = doc();
+  d.checkin.generated = { "2026-08-04": { question: "What made today easier?" } };
+  const ctx = buildContext(d, "2026-08-05");
+  assert.deepEqual(ctx.recentTopics, ["What made today easier?"]);
+});
+
+test("an empty document does not throw", () => {
+  // A household on its first evening has none of these fields yet.
+  const ctx = buildContext({}, "2026-08-05");
+  assert.equal(ctx.householdSize, 2);
+  assert.equal(ctx.signals.overdueCount, 0);
+});
