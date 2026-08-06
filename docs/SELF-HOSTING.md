@@ -34,8 +34,31 @@ cp deploy/env.example .env
 ./scripts/generate-secret.sh >> .env
 $EDITOR .env                      # set PUBLIC_URL and POSTGRES_PASSWORD
 
-docker compose -f deploy/docker-compose.yml up -d
+docker compose -f deploy/docker-compose.yml --env-file .env up -d
 ```
+
+> **A `$` in your password must be written `$$` in `.env`.** Compose treats a
+> single `$` as a variable reference and silently substitutes it away. The app
+> reads the database credential as discrete `PG*` values rather than through a
+> URL, so `@ / # ?` are all fine -- only `$` needs escaping, and only because of
+> Compose.
+
+> **Already running Ollama on this host?** Add the overlay and keep the models
+> you have already pulled, instead of the bundled container downloading its own:
+>
+> ```bash
+> echo 'OLLAMA_URL=http://127.0.0.1:11434' >> .env
+> docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.hostnet.yml \
+>   --env-file .env up -d
+> ```
+>
+> That puts the app on the host network so it reaches Ollama on loopback. The
+> alternative -- rebinding Ollama to `0.0.0.0` so a bridged container can see it
+> -- publishes an unauthenticated LLM to your whole network, and to the internet
+> if that port is forwarded. Don't.
+>
+> Without the overlay, `docker compose ... --profile bundled-ollama up -d`
+> starts a self-contained Ollama instead.
 
 That starts PostgreSQL, Ollama, pulls a model, and runs the app on
 `127.0.0.1:4000`. Put a TLS proxy in front:

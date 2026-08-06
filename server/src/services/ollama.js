@@ -24,6 +24,10 @@ function assertLocal(url) {
   const isLocal =
     host === "localhost" || host === "127.0.0.1" || host === "::1" || host === "[::1]" ||
     host.endsWith(".local") ||
+    // Docker's gateway back to the host, for the common case of a containerised
+    // app talking to an Ollama the operator already runs natively.
+    host === "host.docker.internal" ||
+    host === "gateway.docker.internal" ||
     /^10\./.test(host) ||
     /^192\.168\./.test(host) ||
     /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||

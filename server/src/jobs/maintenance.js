@@ -9,7 +9,7 @@ import { sweepRateLimits } from "../middleware/ratelimit.js";
 import { refreshDueFeeds } from "../services/calendars.js";
 import { warm } from "../services/ollama.js";
 import { checkPendingInvoices } from "../services/billing.js";
-import { REFRESH_MINUTES, AI_ENABLED, OLLAMA_KEEP_WARM, BILLING_ENABLED } from "../config.js";
+import { REFRESH_MINUTES, AI_ENABLED, OLLAMA_KEEP_WARM, BILLING_ENABLED, ORPHAN_GRACE_DAYS } from "../config.js";
 
 const MINUTE = 60_000;
 
@@ -67,8 +67,34 @@ async function freezeOverdue() {
   return rowCount;
 }
 
+/**
+ * Households nobody can open any more.
+ *
+ * When the last member's account is deleted, their wrapped key goes with it
+ * (household_keys cascades on the user). The household row and its vault
+ * survive, but no key to that vault exists anywhere in the world -- it is
+ * ciphertext that can never be read again, by anyone, including its owners.
+ *
+ * Kept for a grace period first, because "the last member left" and "the last
+ * member deleted their account by mistake" look identical for a while, and
+ * because an admin may be mid-way through handing the household over.
+ */
+async function sweepOrphanedHouseholds() {
+  const { rowCount } = await q(
+    `DELETE FROM households h
+      WHERE h.updated_at < now() - ($1 || ' days')::interval
+        AND NOT EXISTS (
+          SELECT 1 FROM household_members m
+           WHERE m.household_id = h.id AND m.status = 'active'
+        )`,
+    [String(ORPHAN_GRACE_DAYS)]
+  );
+  return rowCount;
+}
+
 const TASKS = [
   { name: "sessions", every: 60, fn: expireSessions },
+  { name: "orphans", every: 720, fn: sweepOrphanedHouseholds },
   { name: "invites", every: 360, fn: expireInvites },
   { name: "displays", every: 5, fn: expireDisplays },
   { name: "invoices", every: 5, fn: expireInvoices },

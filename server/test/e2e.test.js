@@ -478,3 +478,39 @@ test("audit rows cannot be altered, even with direct database access", async () 
   );
   await assert.rejects(() => q("DELETE FROM audit_log"), /append-only/);
 });
+
+/* ------------------------------------------------------------- deletion --- */
+
+test("an account can actually be deleted", async () => {
+  // Regression test for a real bug: audit_log had ON DELETE SET NULL foreign
+  // keys to users and households, while a trigger rejected every UPDATE to make
+  // the log tamper-evident. The two contradicted each other, so deleting any
+  // account failed with "audit_log is append-only" -- meaning nobody could ever
+  // remove their account. Fixed in migration 003 by detaching the FKs.
+  const doomed = await register(`doomed-${Date.now()}@example.com`, "delete-me-please");
+  const house = await createHousehold(doomed, { householdName: "Temporary" });
+
+  // Generate audit entries referencing this user, which is what used to block it.
+  await api("POST", `/api/households/${house.id}/invites`, {
+    token: doomed.token, body: { role: "adult" },
+  });
+
+  await assert.doesNotReject(() => q("DELETE FROM users WHERE id = $1", [doomed.userId]));
+
+  const gone = await q("SELECT 1 FROM users WHERE id = $1", [doomed.userId]);
+  assert.equal(gone.rowCount, 0);
+});
+
+test("deleting an account leaves the audit chain intact and truthful", async () => {
+  const { verifyChain } = await import("../src/services/audit.js");
+  const result = await verifyChain();
+  assert.equal(result.ok, true, "the hash chain must still verify after a deletion");
+
+  // The historical entries still name who acted, rather than having been
+  // rewritten to "nobody" -- which is the property that makes the log an audit
+  // trail rather than a mutable summary.
+  const { rows } = await q(
+    "SELECT count(*)::int AS n FROM audit_log WHERE actor_user_id IS NOT NULL"
+  );
+  assert.ok(rows[0].n > 0, "past entries must keep their actor after that actor is deleted");
+});

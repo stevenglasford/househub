@@ -1,0 +1,46 @@
+# Overlay for the common case: you already run Ollama natively on this host.
+#
+#   docker compose -f deploy/docker-compose.yml -f deploy/docker-compose.hostnet.yml \
+#     --env-file .env up -d
+#
+# WHY THIS EXISTS. Ollama listens on 127.0.0.1 by default, which a bridged
+# container cannot reach. The usual advice is to rebind it to 0.0.0.0 -- but
+# Ollama has no authentication, so on a machine with a public address that
+# publishes an unauthenticated LLM to anyone who finds the port. An open Ollama
+# is a known abuse target and it is not worth it to save a config file.
+#
+# Instead the app joins the host's network namespace, so it reaches Ollama on
+# 127.0.0.1 exactly as any other local process would. Postgres is published on
+# loopback for the app to reach. Nothing new is exposed beyond localhost, no
+# host configuration changes, and the models you have already pulled are used
+# as they are.
+#
+# The trade: the app container shares the host network namespace, so it is less
+# isolated than a bridged one. It still binds only to 127.0.0.1 and still runs
+# as an unprivileged user.
+
+services:
+  db:
+    # Bridged still, but published on loopback so the host-networked app can
+    # connect. Not reachable from anywhere but this machine.
+    ports:
+      - "127.0.0.1:${DB_PORT:-5433}:5432"
+
+  app:
+    network_mode: host
+    # host networking ignores `ports`; the app binds HOST:PORT itself.
+    ports: !reset []
+    extra_hosts: !reset []
+    environment:
+      HOST: 127.0.0.1
+      PORT: ${APP_PORT:-4000}
+      PGHOST: 127.0.0.1
+      PGPORT: ${DB_PORT:-5433}
+      # Ollama as a local process sees it.
+      OLLAMA_URL: ${OLLAMA_URL:-http://127.0.0.1:11434}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:${APP_PORT:-4000}/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s

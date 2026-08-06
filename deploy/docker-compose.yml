@@ -34,7 +34,11 @@ services:
       timeout: 5s
       retries: 10
 
+  # Only started with --profile bundled-ollama. If you already run Ollama on the
+  # host, leave this out and point OLLAMA_URL at it instead -- you keep the
+  # models you have already pulled.
   ollama:
+    profiles: ["bundled-ollama"]
     image: ollama/ollama:latest
     restart: unless-stopped
     volumes:
@@ -53,6 +57,7 @@ services:
   # Pulls the model once, then exits. Without this the first check-in of the
   # evening is the request that downloads several gigabytes.
   ollama-init:
+    profiles: ["bundled-ollama"]
     image: ollama/ollama:latest
     depends_on: [ollama]
     environment:
@@ -76,13 +81,22 @@ services:
       NODE_ENV: production
       HOST: 0.0.0.0
       PORT: 4000
-      DATABASE_URL: postgres://${POSTGRES_USER:-househub}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-househub}
+      # Discrete values rather than a DATABASE_URL: a password containing $ @ /
+      # or # is legitimate, and would either break URL parsing or be silently
+      # truncated on the way through one.
+      PGHOST: db
+      PGPORT: "5432"
+      PGUSER: ${POSTGRES_USER:-househub}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATABASE: ${POSTGRES_DB:-househub}
       # The one secret you must generate and back up. Losing it makes sealed
       # server-side values (emails, calendar URLs) unrecoverable.
       SECRET_KEY: ${SECRET_KEY:?run scripts/generate-secret.sh}
       PUBLIC_URL: ${PUBLIC_URL:?set the URL people will actually type}
       TRUST_PROXY: ${TRUST_PROXY:-1}
-      OLLAMA_URL: http://ollama:11434
+      # Defaults to the bundled container; override in .env to use an Ollama you
+      # already run (http://host.docker.internal:11434).
+      OLLAMA_URL: ${OLLAMA_URL:-http://ollama:11434}
       OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.2:3b}
       AI_ENABLED: ${AI_ENABLED:-1}
       ALLOW_SIGNUP: ${ALLOW_SIGNUP:-1}
@@ -97,6 +111,10 @@ services:
       #
       # APP_PORT lets this sit alongside an older install still on 4000.
       - "127.0.0.1:${APP_PORT:-4000}:4000"
+    # Lets OLLAMA_URL=http://host.docker.internal:11434 reach an Ollama running
+    # natively on the host.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - upgrade-work:/var/lib/househub/upgrades
     healthcheck:

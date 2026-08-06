@@ -13,8 +13,30 @@ pg.types.setTypeParser(1700, (v) => v);
 // Same for BIGINT: vault versions are counters, not floats.
 pg.types.setTypeParser(20, (v) => v);
 
+/**
+ * Connection settings.
+ *
+ * Discrete PG* variables are preferred over DATABASE_URL when they are present,
+ * because a password is not URL-safe. Characters that are perfectly good in a
+ * password -- $ @ / # ? : -- either break URL parsing outright or silently
+ * truncate the credential. Passing them as separate values sidesteps the whole
+ * class of bug; DATABASE_URL still works for anyone already using it.
+ */
+function connectionConfig() {
+  if (process.env.PGHOST || process.env.PGUSER) {
+    return {
+      host: process.env.PGHOST || "localhost",
+      port: Number(process.env.PGPORT) || 5432,
+      user: process.env.PGUSER,
+      password: process.env.PGPASSWORD,
+      database: process.env.PGDATABASE,
+    };
+  }
+  return { connectionString: DATABASE_URL };
+}
+
 export const pool = new pg.Pool({
-  connectionString: DATABASE_URL,
+  ...connectionConfig(),
   max: DB_POOL_MAX,
   ssl: DB_SSL ? { rejectUnauthorized: true } : undefined,
   idleTimeoutMillis: 30_000,

@@ -128,6 +128,10 @@ export const BODY_LIMIT = env.BODY_LIMIT || "4mb";
 export const VAULT_LIMIT = env.VAULT_LIMIT || "16mb";
 export const REFRESH_MINUTES = int(env.REFRESH_MINUTES, 15);
 export const VAULT_REVISIONS_KEPT = int(env.VAULT_REVISIONS_KEPT, 50);
+// How long a household with no active members is kept before being removed.
+// Its vault is already unreadable at that point -- the last key went with the
+// last member -- but the delay covers an accidental account deletion.
+export const ORPHAN_GRACE_DAYS = int(env.ORPHAN_GRACE_DAYS, 30);
 
 /* -------------------------------------------------------------- upgrades --- */
 export const UPGRADES_ENABLED = bool(env.UPGRADES_ENABLED, false);
