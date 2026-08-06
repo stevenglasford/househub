@@ -94,7 +94,9 @@ services:
       # Bound to loopback: put Caddy or nginx in front for TLS. Web Crypto is
       # unavailable outside a secure context, so the app cannot decrypt anything
       # over plain http from another machine.
-      - "127.0.0.1:4000:4000"
+      #
+      # APP_PORT lets this sit alongside an older install still on 4000.
+      - "127.0.0.1:${APP_PORT:-4000}:4000"
     volumes:
       - upgrade-work:/var/lib/househub/upgrades
     healthcheck:
