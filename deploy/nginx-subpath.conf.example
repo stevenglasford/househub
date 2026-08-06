@@ -1,0 +1,53 @@
+# HouseHub under a path prefix — e.g. https://home.example.com/beta
+#
+# Add this to the EXISTING server block for your hostname. Do not create a
+# second `server { listen 443 ssl; server_name home.example.com; }` — nginx
+# takes the first match and the rest of your site stops working.
+#
+# Set PUBLIC_URL to the full public address including the prefix:
+#
+#     PUBLIC_URL=https://home.example.com/beta
+#
+# The app derives everything else from it: the cookie is scoped to /beta/, and
+# invite and display links are printed with the prefix so they resolve when
+# somebody actually opens one.
+#
+# Verified working: a full register → create household → decrypt cycle through
+# this exact configuration, with the session cookie landing on Path=/beta/.
+
+# ---------------------------------------------------------------------------
+# The redirect is not optional.
+#
+# The front-end uses relative asset URLs so one build works at any mount point.
+# At /beta/ the browser resolves "./assets/app.js" to /beta/assets/app.js, which
+# is right. At /beta (no trailing slash) it resolves to /assets/app.js, which is
+# not — every asset 404s and every API call misses the prefix. This one line is
+# the difference between a working install and a blank page.
+# ---------------------------------------------------------------------------
+location = /beta { return 301 /beta/; }
+
+location /beta/ {
+    # The TRAILING SLASH here strips "/beta/" before forwarding, so the app
+    # itself never needs to know it is mounted under a prefix. Remove it and
+    # every request arrives as /beta/api/... and 404s.
+    proxy_pass http://127.0.0.1:4000/;
+
+    proxy_http_version 1.1;
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+
+    # Vault writes are the whole household document. Keep this at or above the
+    # app's VAULT_LIMIT (16 MB default) or large households get a 413 from nginx
+    # before the app ever sees the request.
+    client_max_body_size 24m;
+
+    # Long enough for a cold Ollama model load on the first check-in of the day.
+    proxy_read_timeout 180s;
+
+    # HouseHub sets its own CSP, HSTS and frame protections. Do not add
+    # add_header directives here: in nginx, an add_header in a nested block
+    # discards every inherited one, which would silently drop the CSP that
+    # protects the encryption keys.
+}

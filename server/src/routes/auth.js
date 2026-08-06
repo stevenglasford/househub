@@ -26,7 +26,7 @@ import { newToken, hashToken } from "../crypto/tokens.js";
 import * as totp from "../crypto/totp.js";
 import { audit } from "../services/audit.js";
 import {
-  IS_PROD, PUBLIC_URL, SESSION_TTL_HOURS, ALLOW_SIGNUP,
+  IS_PROD, PUBLIC_URL, COOKIE_PATH, SESSION_TTL_HOURS, ALLOW_SIGNUP,
   MAX_FAILED_LOGINS, LOCKOUT_MINUTES, CLIENT_KDF_ITERATIONS,
 } from "../config.js";
 
@@ -81,7 +81,9 @@ function setSessionCookie(res, token) {
     secure: IS_PROD || PUBLIC_URL.startsWith("https://"),
     sameSite: "strict",                              // primary CSRF defence
     maxAge: SESSION_TTL_HOURS * 3600_000,
-    path: "/",
+    // Scoped to the mount point, so a hub at /beta does not hand its session
+    // cookie to everything else on the same hostname.
+    path: COOKIE_PATH,
   });
 }
 
@@ -291,7 +293,7 @@ router.post("/logout", resolveSession, wrap(async (req, res) => {
     await q("UPDATE sessions SET revoked_at = now() WHERE id = $1", [req.session.id]);
     await audit("logout", { actorUserId: req.user.id });
   }
-  res.clearCookie(SESSION_COOKIE, { path: "/" });
+  res.clearCookie(SESSION_COOKIE, { path: COOKIE_PATH });
   res.json({ ok: true });
 }));
 

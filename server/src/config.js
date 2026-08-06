@@ -24,6 +24,25 @@ export const HOST = env.HOST || "127.0.0.1";
 // type, including any reverse-proxy path prefix.
 export const PUBLIC_URL = (env.PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 
+/**
+ * The path the app is mounted at, derived from PUBLIC_URL.
+ *
+ * Deploying under a prefix -- https://home.example.com/beta -- means the
+ * session cookie must be scoped to that prefix. Left at "/" it would be sent to
+ * every other application on the same hostname, which on a home server is
+ * usually several. Scoping it is the difference between "my hub's cookie" and
+ * "a credential my whole domain can see".
+ */
+export const BASE_PATH = (() => {
+  try {
+    const p = new URL(PUBLIC_URL).pathname.replace(/\/+$/, "");
+    return p || "/";
+  } catch {
+    return "/";
+  }
+})();
+export const COOKIE_PATH = BASE_PATH === "/" ? "/" : `${BASE_PATH}/`;
+
 export const DATABASE_URL = env.DATABASE_URL || "postgres://househub:househub@localhost:5432/househub";
 export const DB_POOL_MAX = int(env.DB_POOL_MAX, 10);
 export const DB_SSL = bool(env.DB_SSL, false);
