@@ -5,10 +5,10 @@
 // targets do not: `href="/"` means the domain root, so it walks straight out of
 // the install and into whatever else is on that hostname.
 //
-// That was a real bug -- an invited person who finished the join flow was sent
-// to home.example.com instead of home.example.com/beta, landing on an unrelated
-// site. These helpers derive the mount point from the current URL so links stay
-// inside it.
+// That was a real bug: an invited person who finished the join flow was sent to
+// https://example.com instead of https://example.com/hub, landing on whatever
+// else shares that hostname. These helpers derive the mount point from the
+// current URL so links stay inside it.
 
 const ROUTES = ["/join", "/display"];
 
