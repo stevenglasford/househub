@@ -31,6 +31,10 @@ ENV NODE_ENV=production
 COPY --from=deps  --chown=househub:househub /build/server/node_modules ./node_modules
 COPY --chown=househub:househub server/package.json ./package.json
 COPY --chown=househub:househub server/src ./src
+# Operator tooling -- promoting a super-admin, and anything else that has to be
+# run against a live database. Omitting these made the documented
+# create-super-admin command fail with MODULE_NOT_FOUND inside the container.
+COPY --chown=househub:househub server/scripts ./scripts
 COPY --from=web   --chown=househub:househub /build/server/public ./public
 
 # Writable state lives here and nowhere else in the image.

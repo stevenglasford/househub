@@ -191,6 +191,11 @@ There is no default admin account and no bootstrap password. Sign up normally,
 then:
 
 ```bash
+# Docker (the credentials and SECRET_KEY live in the container):
+docker compose -f deploy/docker-compose.yml --env-file .env \
+  exec -T app node scripts/create-super-admin.js you@example.com
+
+# Running natively:
 ./scripts/create-super-admin.sh you@example.com
 ```
 

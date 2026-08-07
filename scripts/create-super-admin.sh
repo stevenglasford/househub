@@ -6,6 +6,12 @@
 #
 #   ./scripts/create-super-admin.sh you@example.com
 #
+# Running under Docker? The database and SECRET_KEY live in the container, so
+# run it there instead:
+#
+#   docker compose -f deploy/docker-compose.yml --env-file .env \
+#     exec -T app node scripts/create-super-admin.js you@example.com
+#
 # A super-admin operates the server. They cannot read any household -- they hold
 # no household key, and no endpoint exists that would give them one.
 set -eu
