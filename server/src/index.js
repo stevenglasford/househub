@@ -25,6 +25,9 @@ import aiRoutes from "./routes/ai.js";
 import displayRoutes from "./routes/displays.js";
 import adminRoutes from "./routes/admin.js";
 import calendarRoutes from "./routes/calendars.js";
+import proposalRoutes from "./routes/proposals.js";
+import homeRoutes from "./routes/home.js";
+import { loadDisplay } from "./routes/displays.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(here, "..", "public");
@@ -64,8 +67,13 @@ export function createApp() {
   app.use("/api/households", householdRoutes);
   app.use("/api/households", vaultRoutes);
   app.use("/api/households", calendarRoutes);
+  app.use("/api/households", proposalRoutes);
   app.use("/api/households", displayRoutes.householdRouter);
+  app.use("/api/households/:householdId/home", homeRoutes.memberRouter);
   app.use("/api/display", displayRoutes.publicRouter);
+  // The display side of the Home Assistant bridge authenticates with the same
+  // permanent token as the rest of /api/display.
+  app.use("/api/display/home", loadDisplay, homeRoutes.displayRouter);
   app.use("/api/ai", aiRoutes);
   app.use("/api/admin", adminRoutes);
 

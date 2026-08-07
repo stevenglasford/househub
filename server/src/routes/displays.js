@@ -92,6 +92,12 @@ householdRouter.post("/:householdId/displays",
       // fragment, which browsers never transmit.
       publicKey: b64(64),
       expiresAt: z.string().datetime().nullable().optional(),
+      // Off unless asked for. A screen that can only show things is the safe
+      // default; ticking a chore off from the kitchen is opt-in.
+      canWrite: z.boolean().default(false),
+      // Home Assistant domains this screen may operate. 'lock' is absent from
+      // the enum on purpose -- see CONTROLLABLE_BY_DISPLAY below.
+      controlDomains: z.array(z.enum(["light", "switch", "fan", "cover"])).max(4).default([]),
     }), req.body);
 
     if (bin(body.publicKey).length !== 32) throw badRequest("publicKey must be 32 bytes");
@@ -112,10 +118,11 @@ householdRouter.post("/:householdId/displays",
     }
 
     const { rows } = await q(
-      `INSERT INTO displays (household_id, name, public_key, scopes, expires_at, created_by, status)
-       VALUES ($1, $2, $3, $4::jsonb, $5, $6, 'pending') RETURNING id, created_at`,
+      `INSERT INTO displays (household_id, name, public_key, scopes, expires_at, created_by,
+                             status, can_write, control_domains)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6, 'pending', $7, $8::jsonb) RETURNING id, created_at`,
       [req.household.id, body.name, bin(body.publicKey), JSON.stringify(body.scopes),
-       body.expiresAt || null, req.user.id]
+       body.expiresAt || null, req.user.id, body.canWrite, JSON.stringify(body.controlDomains)]
     );
     const display = rows[0];
 
@@ -146,6 +153,7 @@ householdRouter.get("/:householdId/displays", requireAuth, loadHousehold(), wrap
   const { rows } = await q(
     `SELECT d.id, d.name, d.scopes, d.status, d.expires_at, d.last_seen_at,
             d.created_by, d.created_at, d.activated_at, d.public_key,
+            d.can_write, d.control_domains,
             COALESCE(json_agg(json_build_object('userId', a.user_id, 'decision', a.decision))
                      FILTER (WHERE a.user_id IS NOT NULL), '[]') AS approvals
        FROM displays d
@@ -167,6 +175,8 @@ householdRouter.get("/:householdId/displays", requireAuth, loadHousehold(), wrap
     createdAt: d.created_at,
     activatedAt: d.activated_at,
     publicKey: Buffer.from(d.public_key).toString("base64"),
+    canWrite: d.can_write,
+    controlDomains: d.control_domains,
     approvals: d.approvals,
     requiredApprovals: required,
   })));
@@ -323,17 +333,22 @@ householdRouter.patch("/:householdId/displays/:id",
       name: z.string().trim().min(1).max(60).optional(),
       scopes: z.array(z.enum(SCOPES)).min(1).max(SCOPES.length).optional(),
       expiresAt: z.string().datetime().nullable().optional(),
+      canWrite: z.boolean().optional(),
+      controlDomains: z.array(z.enum(["light", "switch", "fan", "cover"])).max(4).optional(),
     }), req.body);
 
     const { rowCount } = await q(
       `UPDATE displays
           SET name = COALESCE($3, name),
               scopes = COALESCE($4::jsonb, scopes),
-              expires_at = CASE WHEN $5::boolean THEN $6::timestamptz ELSE expires_at END
+              expires_at = CASE WHEN $5::boolean THEN $6::timestamptz ELSE expires_at END,
+              can_write = COALESCE($7, can_write),
+              control_domains = COALESCE($8::jsonb, control_domains)
         WHERE id = $1 AND household_id = $2 AND status IN ('active','pending','expired')`,
       [req.params.id, req.household.id, body.name ?? null,
        body.scopes ? JSON.stringify(body.scopes) : null,
-       Object.prototype.hasOwnProperty.call(body, "expiresAt"), body.expiresAt ?? null]
+       Object.prototype.hasOwnProperty.call(body, "expiresAt"), body.expiresAt ?? null,
+       body.canWrite ?? null, body.controlDomains ? JSON.stringify(body.controlDomains) : null]
     );
     if (!rowCount) throw notFound();
 
@@ -399,13 +414,14 @@ function displayToken(req) {
   return (m ? m[1] : req.query.token ? String(req.query.token) : "").trim();
 }
 
-async function loadDisplay(req, res, next) {
+export async function loadDisplay(req, res, next) {
   try {
     const token = displayToken(req);
     if (!token) return next(notFound());
 
     const { rows } = await q(
       `SELECT d.id, d.household_id, d.name, d.scopes, d.status, d.expires_at,
+              d.can_write, d.control_domains,
               h.key_epoch, h.status AS household_status
          FROM display_tokens t
          JOIN displays d ON d.id = t.display_id
@@ -450,6 +466,8 @@ publicRouter.get("/bootstrap",
       name: req.display.name,
       householdId: req.display.household_id,
       scopes: req.display.scopes,
+      canWrite: req.display.can_write,
+      controlDomains: req.display.control_domains,
       keyEpoch: rows[0].key_epoch,
       expiresAt: req.display.expires_at,
       wrappedKey: {
@@ -508,6 +526,92 @@ publicRouter.get("/version",
     if (!rows[0]) throw notFound();
     await q("UPDATE displays SET last_seen_at = now() WHERE id = $1", [req.display.id]);
     res.json({ version: Number(rows[0].version), keyEpoch: rows[0].key_epoch });
+  })
+);
+
+/**
+ * Write the household document from a display.
+ *
+ * Displays were read-only, which made a screen in the kitchen useless for the
+ * thing people actually want from one: ticking the bins off on the way past
+ * without unlocking a phone.
+ *
+ * What makes this safe enough to offer, rather than a hole in an otherwise
+ * careful design:
+ *
+ *   - it is off unless an admin explicitly grants `can_write`
+ *   - the display cannot pretend to be a person. Every completion it records
+ *     carries the screen's name as its source, and the archive shows "ticked on
+ *     the kitchen iPad" rather than crediting somebody who may have been at work
+ *   - the same optimistic-concurrency check applies, so a screen left open for a
+ *     month cannot silently overwrite a phone's edits
+ *   - revoking the display, or rotating the household key, ends it
+ */
+publicRouter.put("/vault",
+  limit("display-vault-write", { capacity: 60, perSecond: 0.5 }),
+  loadDisplay,
+  wrap(async (req, res) => {
+    if (!req.display.can_write) {
+      throw forbidden("This display is not allowed to change anything. An admin can enable it.");
+    }
+    if (req.display.household_status === "suspended") {
+      throw forbidden("This household is read-only.");
+    }
+
+    const body = parse(z.object({
+      ciphertext: z.string().min(38).max(24_000_000).regex(/^[A-Za-z0-9+/]+={0,2}$/, "ciphertext must be base64"),
+      compression: z.enum(["gzip", "none"]),
+      plainBytes: z.number().int().nonnegative().max(200_000_000),
+      baseVersion: z.number().int().nonnegative(),
+    }), req.body);
+
+    const result = await tx(async ({ q: query }) => {
+      const { rows } = await query(
+        "SELECT version, key_epoch, ciphertext, compression FROM vault_documents WHERE household_id = $1 FOR UPDATE",
+        [req.display.household_id]
+      );
+      const current = rows[0];
+      if (!current) throw notFound();
+      if (current.key_epoch !== req.display.key_epoch) {
+        throw conflict("The household key was rotated. Reload this display.", { code: "epoch_changed" });
+      }
+      if (Number(current.version) !== body.baseVersion) {
+        throw conflict("Someone else saved first", {
+          code: "version_conflict",
+          current: {
+            version: Number(current.version),
+            ciphertext: Buffer.from(current.ciphertext).toString("base64"),
+            compression: current.compression,
+            keyEpoch: current.key_epoch,
+          },
+        });
+      }
+
+      await query(
+        `INSERT INTO vault_revisions (household_id, key_epoch, version, ciphertext, compression, updated_by)
+         SELECT household_id, key_epoch, version, ciphertext, compression, updated_by
+           FROM vault_documents WHERE household_id = $1
+         ON CONFLICT (household_id, version) DO NOTHING`,
+        [req.display.household_id]
+      );
+
+      const { rows: updated } = await query(
+        `UPDATE vault_documents
+            SET version = version + 1, ciphertext = $2, compression = $3,
+                plain_bytes = $4, updated_by = NULL, updated_at = now()
+          WHERE household_id = $1 RETURNING version`,
+        [req.display.household_id, Buffer.from(body.ciphertext, "base64"), body.compression, body.plainBytes]
+      );
+      return { version: Number(updated[0].version) };
+    });
+
+    await q("UPDATE displays SET last_seen_at = now() WHERE id = $1", [req.display.id]);
+    await audit("display_wrote_vault", {
+      householdId: req.display.household_id, target: req.display.id,
+      meta: { display: req.display.name, version: result.version },
+    });
+
+    res.json({ version: result.version, keyEpoch: req.display.key_epoch });
   })
 );
 

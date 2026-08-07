@@ -634,3 +634,185 @@ test("a non-admin cannot delete a household", async () => {
   const { rows } = await q("SELECT 1 FROM households WHERE id = $1", [house.id]);
   assert.equal(rows.length, 1);
 });
+
+/* --------------------------------------------- archives, displays, locks --- */
+
+/** Two admins in one household, for the unanimity tests. */
+async function twoAdminHousehold(tag) {
+  const a = await register(`${tag}-a-${Date.now()}@example.com`, `${tag}-passphrase-a`);
+  const b = await register(`${tag}-b-${Date.now()}@example.com`, `${tag}-passphrase-b`);
+  const house = await createHousehold(a, { householdName: tag });
+
+  const invite = await api("POST", `/api/households/${house.id}/invites`, {
+    token: a.token, body: { role: "admin" },
+  });
+  await api("POST", "/api/invites/accept", { token: b.token, body: { token: invite.body.url.split("#")[1] } });
+  const members = await api("GET", `/api/households/${house.id}/members`, { token: a.token });
+  const bRow = members.body.find((m) => m.userId === b.userId);
+  await api("POST", `/api/households/${house.id}/members/${b.userId}/key`, {
+    token: a.token,
+    body: {
+      wrappedKey: await C.wrapHouseholdKey(house.hk, C.fromB64(bRow.publicKey)),
+      publicKey: bRow.publicKey,
+    },
+  });
+  return { a, b, house };
+}
+
+test("turning an archive off needs every admin, and one refusal ends it", async () => {
+  const { a, b, house } = await twoAdminHousehold("arch");
+
+  const proposed = await api("POST", `/api/households/${house.id}/proposals`, {
+    token: a.token, body: { kind: "disable_archive", payload: { collections: ["chores"] } },
+  });
+  assert.equal(proposed.status, 201);
+  assert.equal(proposed.body.required, 2);
+  // Proposing counts as consenting, but one of two is not enough.
+  assert.equal(proposed.body.satisfied, false);
+
+  // Applying before everyone agrees is refused.
+  const early = await api("POST", `/api/households/${house.id}/proposals/${proposed.body.id}/applied`, {
+    token: a.token,
+  });
+  assert.equal(early.status, 403);
+
+  // The second admin refuses: that ends it outright.
+  const denied = await api("POST", `/api/households/${house.id}/proposals/${proposed.body.id}/decide`, {
+    token: b.token, body: { decision: "deny" },
+  });
+  assert.equal(denied.body.status, "denied");
+
+  const stillBlocked = await api("POST", `/api/households/${house.id}/proposals/${proposed.body.id}/applied`, {
+    token: a.token,
+  });
+  assert.equal(stillBlocked.status, 403);
+});
+
+test("with every admin agreeing, the wipe is authorised and recorded", async () => {
+  const { a, b, house } = await twoAdminHousehold("arch2");
+
+  const proposed = await api("POST", `/api/households/${house.id}/proposals`, {
+    token: a.token, body: { kind: "disable_archive", payload: { collections: ["chores"] } },
+  });
+  const agreed = await api("POST", `/api/households/${house.id}/proposals/${proposed.body.id}/decide`, {
+    token: b.token, body: { decision: "approve" },
+  });
+  assert.equal(agreed.body.status, "approved");
+  assert.equal(agreed.body.satisfied, true);
+
+  const applied = await api("POST", `/api/households/${house.id}/proposals/${proposed.body.id}/applied`, {
+    token: a.token,
+  });
+  assert.equal(applied.status, 200);
+
+  const { rows } = await q(
+    "SELECT action FROM audit_log WHERE household_id = $1 AND action = 'proposal_applied'", [house.id]
+  );
+  assert.equal(rows.length, 1, "the wipe must be permanently recorded");
+});
+
+test("a non-admin cannot propose or decide", async () => {
+  const { a, house } = await twoAdminHousehold("arch3");
+  const outsider = await register(`out-${Date.now()}@example.com`, "outsider-passphrase-x");
+
+  const proposed = await api("POST", `/api/households/${house.id}/proposals`, {
+    token: outsider.token, body: { kind: "disable_archive", payload: { collections: ["chores"] } },
+  });
+  assert.equal(proposed.status, 404);
+  assert.ok(a);
+});
+
+/** An active display, optionally allowed to write and control things. */
+async function activeDisplay(owner, house, opts = {}) {
+  const keys = C.newDisplayKeypair();
+  const created = await api("POST", `/api/households/${house.id}/displays`, {
+    token: owner.token,
+    body: {
+      name: opts.name || "Kitchen iPad",
+      scopes: ["today", "home"],
+      publicKey: C.toB64(keys.publicKey),
+      canWrite: opts.canWrite ?? false,
+      controlDomains: opts.controlDomains ?? [],
+    },
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.body));
+
+  const activated = await api("POST", `/api/households/${house.id}/displays/${created.body.id}/activate`, {
+    token: owner.token,
+    body: {
+      wrappedKey: await C.wrapHouseholdKey(house.hk, keys.publicKey, "display"),
+      publicKey: C.toB64(keys.publicKey),
+    },
+  });
+  assert.equal(activated.status, 200, JSON.stringify(activated.body));
+  return { keys, token: activated.body.url.split("#")[1], id: created.body.id };
+}
+
+test("a display cannot write unless it has been granted it", async () => {
+  const owner = await register(`disp-${Date.now()}@example.com`, "display-passphrase-x");
+  const house = await createHousehold(owner, { householdName: "Screened" });
+  const display = await activeDisplay(owner, house, { canWrite: false });
+
+  const sealed = await C.sealDocument(house.hk, { householdName: "Screened", n: 1 }, ctx(house.id, 2));
+  const refused = await api("PUT", "/api/display/vault", {
+    token: display.token, body: { ...sealed, baseVersion: 1 },
+  });
+  assert.equal(refused.status, 403);
+  assert.match(refused.body.error, /not allowed to change/i);
+});
+
+test("a display granted write can tick things off, and it is recorded as the display", async () => {
+  const owner = await register(`dispw-${Date.now()}@example.com`, "display-passphrase-w");
+  const house = await createHousehold(owner, { householdName: "Screened" });
+  const display = await activeDisplay(owner, house, { canWrite: true, name: "Hall iPad" });
+
+  const sealed = await C.sealDocument(house.hk, { householdName: "Screened", ticked: true }, ctx(house.id, 2));
+  const wrote = await api("PUT", "/api/display/vault", {
+    token: display.token, body: { ...sealed, baseVersion: 1 },
+  });
+  assert.equal(wrote.status, 200, JSON.stringify(wrote.body));
+  assert.equal(wrote.body.version, 2);
+
+  // The member sees the display's write, and can still decrypt it.
+  const read = await api("GET", `/api/households/${house.id}/vault`, { token: owner.token });
+  const doc = await C.openDocument(house.hk, { ...read.body, householdId: house.id, version: 2 });
+  assert.equal(doc.ticked, true);
+
+  // And the write is attributed to the screen, not to a person.
+  const { rows } = await q(
+    "SELECT meta FROM audit_log WHERE household_id = $1 AND action = 'display_wrote_vault'", [house.id]
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].meta.display, "Hall iPad");
+  const { rows: vrows } = await q("SELECT updated_by FROM vault_documents WHERE household_id = $1", [house.id]);
+  assert.equal(vrows[0].updated_by, null, "a display write must not be credited to a member");
+});
+
+test("a display is refused a lock even if every other gate would allow it", async () => {
+  // The central safety rule: a screen mounted by the front door must never be
+  // able to open the front door. Checked against the caller, so no capability
+  // list can grant it.
+  const owner = await register(`lock-${Date.now()}@example.com`, "lock-passphrase-x");
+  const house = await createHousehold(owner, { householdName: "Locked" });
+  const display = await activeDisplay(owner, house, {
+    canWrite: true, controlDomains: ["light", "switch", "fan", "cover"],
+  });
+
+  const res = await api("POST", "/api/display/home/control", {
+    token: display.token, body: { entityId: "lock.front_door", action: "on" },
+  });
+  assert.equal(res.status, 403, `a display must never operate a lock (got ${res.status})`);
+  assert.match(res.body.error, /signed in/i);
+});
+
+test("control domains a display was not granted are refused", async () => {
+  const owner = await register(`dom-${Date.now()}@example.com`, "domain-passphrase-x");
+  const house = await createHousehold(owner, { householdName: "Domains" });
+  const display = await activeDisplay(owner, house, { controlDomains: ["light"] });
+
+  const covers = await api("POST", "/api/display/home/control", {
+    token: display.token, body: { entityId: "cover.garage", action: "off" },
+  });
+  assert.equal(covers.status, 403);
+  assert.match(covers.body.error, /has not been given control/i);
+});

@@ -20,6 +20,9 @@ import {
 import { getConfig } from "./config.js";
 import { useCheckinPrompt } from "./lib/useCheckinPrompt.js";
 import HouseholdPanel from "./components/HouseholdPanel.jsx";
+import ArchivePanel from "./components/ArchivePanel.jsx";
+import SuperAdminPanel from "./components/SuperAdminPanel.jsx";
+import * as COMPLETION from "./lib/completion.js";
 
 /* ---------------------------------------------------------------
    Theme — warm "kitchen paper" palette, pine-green brand.
@@ -302,9 +305,15 @@ function choreDueOn(chore, dateKey) {
                   crediting anyone or advancing the rotation
    An empty string is never stored, since it would read as falsy.
 --------------------------------------------------------------- */
-const SKIPPED = "skipped";
-const isSkipped = (v) => v === SKIPPED;
-const isCompletion = (v) => Boolean(v) && !isSkipped(v);
+// Completion marks used to be `true`, a person id, or "skipped". They may now
+// also be a record carrying who ticked it off and how (lib/completion.js). The
+// helpers there read every shape, so old documents keep working untouched.
+const { SKIPPED, isSkipped, isCompletion } = COMPLETION;
+
+// Who is ticking things off right now -- a signed-in member, or a shared
+// display. Resolved against the document so an account can be matched to the
+// person it belongs to.
+const actorFor = (doc) => session.currentActor(doc);
 
 // The most recent scheduled day strictly before dateKey.
 function previousOccurrence(chore, dateKey, lookback = 400) {
@@ -383,7 +392,8 @@ function choreAssignee(chore, dateKey) {
 
   // completed on this very day? that's who it was for
   const mark = chore.done?.[target];
-  if (isCompletion(mark) && typeof mark === "string" && rot.includes(mark)) return mark;
+  const credited = COMPLETION.completedBy(mark);
+  if (credited && rot.includes(credited)) return credited;
 
   const prior = lastDoneEntry(chore, target);
   if (!prior) return rot[0];
@@ -1368,16 +1378,7 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
 
   // record WHO did it, not just that it happened — the rotation advances from
   // the completion record, so a bare `true` here would freeze everyone's turn
-  const toggleChore = (id) => update((d) => {
-    d.chores = d.chores.map((c) => {
-      if (c.id !== id) return c;
-      const done = { ...c.done };
-      if (done[viewKey]) delete done[viewKey];
-      else done[viewKey] = choreAssignee(c, viewKey) || true;
-      return { ...c, done };
-    });
-    return d;
-  });
+  const toggleChore = (id) => update((d) => COMPLETION.toggleChore(d, id, viewKey, actorFor(d), { assigneeOf: choreAssignee }))
   // doneAt records which day it was ticked, so a completed task can sit under
   // that day's "done" list instead of vanishing from the view entirely
   const toggleTask = (id) => update((d) => {
@@ -1991,16 +1992,7 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
   const chores = allChores.filter((c) => choreState(c, todayKey).active);
   const otherChores = allChores.filter((c) => !choreState(c, todayKey).active);
   const done = chores.filter((c) => c.done[todayKey]).length;
-  const toggleChore = (id) => update((d) => {
-    d.chores = d.chores.map((c) => {
-      if (c.id !== id) return c;
-      const done = { ...c.done };
-      if (done[todayKey]) delete done[todayKey];
-      else done[todayKey] = choreAssignee(c, todayKey) || true;
-      return { ...c, done };
-    });
-    return d;
-  });
+  const toggleChore = (id) => update((d) => COMPLETION.toggleChore(d, id, todayKey, actorFor(d), { assigneeOf: choreAssignee }))
   /* Skip clears every occurrence currently owed — not just one — otherwise a
      chore owed for three days would reappear tomorrow. Nobody is credited, so
      nobody loses their turn. */
@@ -3964,15 +3956,7 @@ function CheckInOverlay({ data, update, personById, allEvents, todayKey, onOpenM
   const generated = useCheckinPrompt(todayKey, data, update, promptForDate(todayKey, data.agendaPrompts));
   const prompt = generated.question;
 
-  const toggleChore = (id) => update((d) => {
-    d.chores = d.chores.map((c) => {
-      if (c.id !== id) return c;
-      const done = { ...c.done };
-      if (done[todayKey]) delete done[todayKey]; else done[todayKey] = choreAssignee(c, todayKey) || true;
-      return { ...c, done };
-    });
-    return d;
-  });
+  const toggleChore = (id) => update((d) => COMPLETION.toggleChore(d, id, todayKey, actorFor(d), { assigneeOf: choreAssignee }))
   const toggleTask = (id) => update((d) => {
     d.tasks = d.tasks.map((t) => t.id === id
       ? (t.done ? { ...t, done: false, doneAt: "" } : { ...t, done: true, doneAt: todayKey }) : t);
@@ -5104,6 +5088,39 @@ function SettingsModal({ data, update, syncCalendars, close, currentUser }) {
           admits someone happens in the browser, so it has to live in the UI. */}
       <Field label="People">
         <HouseholdPanel theme={T} me={currentUser} householdName={data.householdName} />
+      </Field>
+      <Field label="Archive">
+        <ArchivePanel theme={T} data={data} update={update} me={currentUser} />
+      </Field>
+      {currentUser?.isSuperAdmin && (
+        <Field label="Server (super admin)">
+          <SuperAdminPanel theme={T} />
+        </Field>
+      )}
+      <Field label="Account">
+        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <button
+            className="tapfade px-4 py-3 rounded-xl font-semibold"
+            style={{ background: T.panelAlt, color: T.ink, border: `1px solid ${T.line}` }}
+            onClick={() => window.dispatchEvent(new CustomEvent("househub:switch-household"))}
+          >
+            Switch household
+          </button>
+          {/* Signing out was only reachable from the household picker, which you
+              cannot get back to once inside a household. */}
+          <button
+            className="tapfade px-4 py-3 rounded-xl font-semibold"
+            style={{ background: T.panelAlt, color: "#a12f1c", border: `1px solid ${T.line}` }}
+            onClick={async () => {
+              if (!confirm("Sign out?\n\nYour keys are only held in memory, so you will need your password again.")) return;
+              await session.signOut();
+              window.location.reload();
+            }}
+          >
+            Sign out
+          </button>
+          <span style={{ color: T.faint, fontSize: 13 }}>{currentUser?.email || ""}</span>
+        </div>
       </Field>
       <Field label="Display mode">
         <div className="flex gap-2">

@@ -247,16 +247,20 @@ export async function loadVault() {
  * one round trip rather than a fetch-then-retry.
  */
 export async function saveVault(doc, { onConflict } = {}) {
-  if (state.display) throw new Error("A display cannot write.");
   if (!state.householdKey) throw new Error("The household is locked.");
+  if (state.display && !state.display.canWrite) {
+    throw new Error("This display can show things but not change them.");
+  }
 
   const next = state.version + 1;
   const sealed = await C.sealDocument(state.householdKey, doc, docContext(next));
 
   try {
-    const res = await request("PUT", `api/households/${state.householdId}/vault`, {
-      ...sealed, baseVersion: state.version,
-    });
+    const res = await request(
+      "PUT",
+      state.display ? "api/display/vault" : `api/households/${state.householdId}/vault`,
+      { ...sealed, baseVersion: state.version }
+    );
     state.version = res.version;
     emit();
     return res;
@@ -331,7 +335,11 @@ export async function startDisplay({ token, privateKeyB64 }) {
   const publicKey = C.publicKeyFromPrivate(privateKey);
   state.householdKey = await C.unwrapHouseholdKey(boot.wrappedKey, privateKey, publicKey, "display");
   state.householdId = boot.householdId;
-  state.display = { token, scopes: boot.scopes, name: boot.name, id: boot.displayId };
+  state.display = {
+    token, id: boot.displayId, name: boot.name, scopes: boot.scopes,
+    canWrite: Boolean(boot.canWrite),
+    controlDomains: Array.isArray(boot.controlDomains) ? boot.controlDomains : [],
+  };
   state.keyEpoch = boot.keyEpoch;
   emit();
   return boot;
@@ -445,3 +453,67 @@ export async function generate(kind, context, opts = {}) {
 }
 
 export const aiStatus = () => request("GET", "api/ai/status");
+
+/* --------------------------------------------------------------- actor ---- */
+
+/**
+ * Who is doing something, for attribution.
+ *
+ * `personId` links an account to an entry in the household document's people
+ * list -- they are different things: an account is who signs in, a person is who
+ * the chores belong to. Until a member links themselves, completions record the
+ * account and the UI shows the email.
+ */
+export function currentActor(doc) {
+  if (state.display) {
+    return {
+      isDisplay: true,
+      displayId: state.display.id,
+      displayName: state.display.name,
+      canWrite: state.display.canWrite,
+      controlDomains: state.display.controlDomains,
+    };
+  }
+  const person = (doc?.people || []).find((p) => p.userId && p.userId === state.user?.id);
+  return {
+    isDisplay: false,
+    userId: state.user?.id || null,
+    personId: person?.id || "",
+    displayName: state.user?.displayName || state.user?.email || null,
+    role: state.role,
+  };
+}
+
+/* ------------------------------------------------------------ proposals --- */
+
+export const listProposals = () =>
+  request("GET", `api/households/${state.householdId}/proposals`);
+
+export const createProposal = (kind, payload) =>
+  request("POST", `api/households/${state.householdId}/proposals`, { kind, payload });
+
+export const decideProposal = (id, decision) =>
+  request("POST", `api/households/${state.householdId}/proposals/${id}/decide`, { decision });
+
+export const markProposalApplied = (id) =>
+  request("POST", `api/households/${state.householdId}/proposals/${id}/applied`);
+
+export const withdrawProposal = (id) =>
+  request("DELETE", `api/households/${state.householdId}/proposals/${id}`);
+
+/* ----------------------------------------------------------------- home --- */
+
+export const homeEntities = () =>
+  state.display
+    ? request("GET", "api/display/home/entities")
+    : request("GET", `api/households/${state.householdId}/home/entities`);
+
+export const homeControl = (entityId, action = "toggle") =>
+  state.display
+    ? request("POST", "api/display/home/control", { entityId, action })
+    : request("POST", `api/households/${state.householdId}/home/control`, { entityId, action });
+
+export const cameraUrl = (entityId) =>
+  state.display
+    ? `api/display/home/camera/${encodeURIComponent(entityId)}.jpg?token=${encodeURIComponent(state.display.token)}`
+    : `api/households/${state.householdId}/home/camera/${encodeURIComponent(entityId)}.jpg`;

@@ -24,13 +24,15 @@ export const isConfigured = () => Boolean(HA_URL && HA_TOKEN);
 let stateCache = { at: 0, data: null };
 const snapCache = new Map(); // entityId -> { at, buf, type }
 
-async function haFetch(path, { raw = false, timeoutMs = 8000 } = {}) {
+async function haFetch(path, { raw = false, timeoutMs = 8000, method = "GET", body = null } = {}) {
   if (!isConfigured()) throw new Error("Home Assistant isn't configured on the server");
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), timeoutMs);
   try {
     const res = await fetch(`${HA_URL}/api${path}`, {
+      method,
       headers: { Authorization: `Bearer ${HA_TOKEN}`, "Content-Type": "application/json" },
+      body: body ? JSON.stringify(body) : undefined,
       signal: ctl.signal,
     });
     if (!res.ok) throw new Error(`Home Assistant returned ${res.status}`);
@@ -109,4 +111,60 @@ export async function getSnapshot(entityId) {
   const entry = { at: now, buf, type: res.headers.get("content-type") || "image/jpeg" };
   snapCache.set(entityId, entry);
   return entry;
+}
+
+/* ---------------------------------------------------------------- control ---
+ *
+ * The original hub was display-only, and said so: "a stray tap on a wall-mounted
+ * screen can't unlock a door." That was the right instinct and slightly too
+ * broad -- a visitor turning the hall light on, or glancing at the garden camera
+ * to see where the dogs are, is exactly what a screen by the door is for.
+ *
+ * So control is split by consequence rather than switched on wholesale:
+ *
+ *   light, switch, fan, cover   reversible, visible, low stakes -- a display may
+ *   lock                        physical access to the house -- members only
+ *
+ * The lock rule is enforced in routes/home.js against the *caller*, not here, so
+ * that no display capability list can ever grant it.
+ */
+
+const SERVICES = {
+  light:  { on: "turn_on", off: "turn_off", toggle: "toggle" },
+  switch: { on: "turn_on", off: "turn_off", toggle: "toggle" },
+  fan:    { on: "turn_on", off: "turn_off", toggle: "toggle" },
+  cover:  { on: "open_cover", off: "close_cover", toggle: "toggle" },
+  // "on" means unlocked, matching how Home Assistant reports lock state.
+  lock:   { on: "unlock", off: "lock" },
+};
+
+/** Domains a display may ever be granted. Locks are deliberately absent. */
+export const DISPLAY_CONTROLLABLE = ["light", "switch", "fan", "cover"];
+
+/** Domains that require a signed-in member, whatever else is configured. */
+export const MEMBER_ONLY_DOMAINS = ["lock"];
+
+export const domainOf = (entityId) => String(entityId || "").split(".")[0];
+
+export function isControllable(entityId) {
+  return Boolean(SERVICES[domainOf(entityId)]);
+}
+
+export async function callService(entityId, action = "toggle") {
+  const domain = domainOf(entityId);
+  const map = SERVICES[domain];
+  if (!map) throw new Error(`${domain || "That"} cannot be switched from here`);
+
+  const service = map[action] || map.toggle;
+  if (!service) throw new Error(`Cannot ${action} a ${domain}`);
+
+  await haFetch(`/services/${domain}/${service}`, {
+    method: "POST",
+    body: { entity_id: entityId },
+  });
+
+  // The cached state is stale the instant we change something; drop it so the
+  // next poll reflects reality rather than showing the light still off.
+  stateCache = { at: 0, data: null };
+  return { entityId, domain, service };
 }
