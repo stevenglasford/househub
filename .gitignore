@@ -43,7 +43,9 @@ id_rsa*
 node_modules/
 dist/
 build/
-server/public/          # built by web/; regenerate with `npm run build`
+# Built by web/; regenerate with `npm run build`. Git has no inline
+# comments, so this must sit on its own line.
+server/public/
 coverage/
 .turbo/
 .cache/
