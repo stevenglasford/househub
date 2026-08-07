@@ -132,10 +132,47 @@ export function wipe() {
 
 /* ------------------------------------------------------------ households --- */
 
+/**
+ * Every household this account belongs to, with its name decrypted.
+ *
+ * The name is sealed under each household's own key, so this unwraps each one
+ * locally to read it. That is a little work per household and it is the only way
+ * a picker can show "The Flat" rather than "Household" -- the server genuinely
+ * cannot help, because it cannot read either the name or the key.
+ */
 export async function listHouseholds() {
+  if (!state.keys) throw new Error("Sign in first.");
+  const rows = await request("GET", "api/households");
+
+  return Promise.all(rows.map(async (h) => {
+    let name = null;
+    let unlockable = false;
+    if (h.wrappedKey) {
+      try {
+        const hk = await C.unwrapHouseholdKey(h.wrappedKey, state.keys.privateKey, state.keys.publicKey);
+        unlockable = true;
+        name = await C.openName(hk, h.nameEnc);
+        hk.fill(0);
+      } catch {
+        // A key we cannot unwrap: usually a rotation we have not caught up with.
+      }
+    }
+    return {
+      ...h,
+      name,
+      unlockable,
+      // No wrapped key at all means an admin has not finished admitting us yet.
+      pendingApproval: !h.wrappedKey,
+    };
+  }));
+}
+
+/** Refresh the signed-in user's own details. */
+export async function loadMe() {
   const me = await request("GET", "api/auth/me");
   state.user = { id: me.id, email: me.email, displayName: me.displayName, isSuperAdmin: me.isSuperAdmin };
-  return me.households;
+  emit();
+  return me;
 }
 
 /** Open a household: fetch the wrapped key and unwrap it with the identity key. */
@@ -163,8 +200,9 @@ export async function createHousehold(name, seedDoc) {
   // The server assigns version 1; the placeholder id matches what it seals
   // against before the real id exists.
   const document = await C.sealDocument(hk, doc, { householdId: "pending", version: 1 });
+  const nameEnc = await C.sealName(hk, name);
 
-  const res = await request("POST", "api/households", { wrappedKey, document });
+  const res = await request("POST", "api/households", { wrappedKey, document, nameEnc });
 
   state.householdKey = hk;
   state.householdId = res.id;
@@ -302,6 +340,44 @@ export async function startDisplay({ token, privateKeyB64 }) {
 export function forgetDisplay() {
   localStorage.removeItem(DISPLAY_STORE);
   wipe();
+}
+
+/**
+ * Keep the sealed household name in step with the document.
+ *
+ * The name lives in two places -- inside the encrypted document, where the UI
+ * edits it, and as a small separate ciphertext the picker can read without
+ * downloading the vault. This pushes the second copy up when the first changes,
+ * and backfills households created before names were stored separately.
+ */
+export async function syncHouseholdName(name) {
+  if (!state.householdKey || !state.householdId) return;
+  if (state._lastName === name) return;                 // nothing changed
+  state._lastName = name;
+  try {
+    await request("PUT", `api/households/${state.householdId}/settings`, {
+      nameEnc: await C.sealName(state.householdKey, name),
+    });
+  } catch {
+    // Cosmetic. A failure here must never block a save of the real document.
+  }
+}
+
+export const archiveHousehold = (id, archived = true) =>
+  request("POST", `api/households/${id}/archive`, { archived });
+
+export const deleteHousehold = (id) =>
+  request("DELETE", `api/households/${id}`);
+
+/** Drop the open household but stay signed in, for switching. */
+export function closeHousehold() {
+  try { state.householdKey?.fill(0); } catch {}
+  state.householdKey = null;
+  state.householdId = null;
+  state.role = null;
+  state.version = 0;
+  state._lastName = null;
+  emit();
 }
 
 /* ------------------------------------------------------------ membership --- */

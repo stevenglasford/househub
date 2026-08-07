@@ -327,6 +327,31 @@ export async function openDocument(householdKeyRaw, { ciphertext, compression, h
   return JSON.parse(dec.decode(await gunzip(raw, compression)));
 }
 
+/* ------------------------------------------------------------------ name --- */
+
+// The household's name, sealed under the household key.
+//
+// Kept separate from the document so a member can see which home is which
+// *before* downloading and opening a whole vault -- which is what the household
+// picker needs at login. The server stores the ciphertext and cannot read it.
+
+export async function sealName(householdKeyRaw, name) {
+  const key = await importAes(householdKeyRaw, ["encrypt"]);
+  return toB64(await aesSeal(key, enc.encode(String(name ?? "")), enc.encode("househub/name/v1")));
+}
+
+export async function openName(householdKeyRaw, nameEnc) {
+  if (!nameEnc) return null;
+  const key = await importAes(householdKeyRaw, ["decrypt"]);
+  try {
+    return dec.decode(await aesOpen(key, fromB64(nameEnc), enc.encode("househub/name/v1")));
+  } catch {
+    // A name sealed under a rotated-away key. Not worth failing the whole
+    // picker over -- the caller falls back to a placeholder.
+    return null;
+  }
+}
+
 /* --------------------------------------------------------------- display --- */
 
 // A wall display gets its own X25519 keypair. The private half is generated on

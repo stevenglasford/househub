@@ -63,6 +63,11 @@ async function api(method, path, { token, body } = {}) {
 
 /** Register a user the way the browser does: keys first, password never sent. */
 async function register(email, password) {
+  // The signup limiter allows 5 registrations then refills slowly, which is the
+  // right setting for a real server and far below what this suite needs. Clear
+  // the buckets rather than weakening the limit -- the limiter itself is
+  // exercised properly by security/pentest/run.js.
+  await q("DELETE FROM rate_limits");
   const { upload, keys } = await C.createIdentity(password, ITER);
   const res = await api("POST", "/api/auth/register", {
     body: { email, displayName: email.split("@")[0], ...upload },
@@ -513,4 +518,119 @@ test("deleting an account leaves the audit chain intact and truthful", async () 
     "SELECT count(*)::int AS n FROM audit_log WHERE actor_user_id IS NOT NULL"
   );
   assert.ok(rows[0].n > 0, "past entries must keep their actor after that actor is deleted");
+});
+
+/* ------------------------------------------------- listing and retiring --- */
+
+test("the household list carries a decryptable name", async () => {
+  // Regression: the picker showed "Household" for every entry, because the name
+  // lived only inside the encrypted document and nothing decrypted it up front.
+  const owner = await register(`namer-${Date.now()}@example.com`, "name-test-passphrase");
+  const hk = C.newHouseholdKeyRaw();
+  const res = await api("POST", "/api/households", {
+    token: owner.token,
+    body: {
+      wrappedKey: await C.wrapHouseholdKey(hk, owner.keys.publicKey),
+      document: await C.sealDocument(hk, { householdName: "The Narrowboat" }, ctx("pending", 1)),
+      nameEnc: await C.sealName(hk, "The Narrowboat"),
+    },
+  });
+  assert.equal(res.status, 201);
+
+  const list = await api("GET", "/api/households", { token: owner.token });
+  assert.equal(list.status, 200);
+  const row = list.body.find((h) => h.id === res.body.id);
+
+  assert.ok(row.wrappedKey, "the wrapped key must come back so the client can read the name");
+  const key = await C.unwrapHouseholdKey(row.wrappedKey, owner.keys.privateKey, owner.keys.publicKey);
+  assert.equal(await C.openName(key, row.nameEnc), "The Narrowboat");
+
+  // And the server still cannot read it.
+  const { rows } = await q("SELECT name_enc FROM households WHERE id = $1", [res.body.id]);
+  assert.ok(!Buffer.from(rows[0].name_enc).toString("utf8").includes("Narrowboat"));
+});
+
+test("archiving is per-member, not shared", async () => {
+  // After a breakup the two people will not agree that the household is over.
+  // One archiving it must not remove it from the other's list.
+  const a = await register(`arch-a-${Date.now()}@example.com`, "archive-passphrase-a");
+  const b = await register(`arch-b-${Date.now()}@example.com`, "archive-passphrase-b");
+  const house = await createHousehold(a, { householdName: "Shared" });
+
+  const invite = await api("POST", `/api/households/${house.id}/invites`, {
+    token: a.token, body: { role: "admin" },
+  });
+  await api("POST", "/api/invites/accept", { token: b.token, body: { token: invite.body.url.split("#")[1] } });
+  const members = await api("GET", `/api/households/${house.id}/members`, { token: a.token });
+  const bRow = members.body.find((m) => m.userId === b.userId);
+  await api("POST", `/api/households/${house.id}/members/${b.userId}/key`, {
+    token: a.token,
+    body: {
+      wrappedKey: await C.wrapHouseholdKey(house.hk, C.fromB64(bRow.publicKey)),
+      publicKey: bRow.publicKey,
+    },
+  });
+
+  const archived = await api("POST", `/api/households/${house.id}/archive`, {
+    token: a.token, body: { archived: true },
+  });
+  assert.equal(archived.status, 200);
+
+  const aList = await api("GET", "/api/households", { token: a.token });
+  const bList = await api("GET", "/api/households", { token: b.token });
+  assert.equal(aList.body.find((h) => h.id === house.id).archived, true);
+  assert.equal(bList.body.find((h) => h.id === house.id).archived, false,
+    "one member archiving must not hide the household from the other");
+
+  // Reversible.
+  await api("POST", `/api/households/${house.id}/archive`, { token: a.token, body: { archived: false } });
+  const back = await api("GET", "/api/households", { token: a.token });
+  assert.equal(back.body.find((h) => h.id === house.id).archived, false);
+});
+
+test("a household cannot be deleted while anyone else is still in it", async () => {
+  // The scenario is a relationship ending. Either party being able to destroy
+  // the shared record unilaterally would make this a weapon.
+  const a = await register(`del-a-${Date.now()}@example.com`, "delete-passphrase-a");
+  const b = await register(`del-b-${Date.now()}@example.com`, "delete-passphrase-b");
+  const house = await createHousehold(a, { householdName: "Ours" });
+
+  const invite = await api("POST", `/api/households/${house.id}/invites`, {
+    token: a.token, body: { role: "adult" },
+  });
+  await api("POST", "/api/invites/accept", { token: b.token, body: { token: invite.body.url.split("#")[1] } });
+  const members = await api("GET", `/api/households/${house.id}/members`, { token: a.token });
+  const bRow = members.body.find((m) => m.userId === b.userId);
+  await api("POST", `/api/households/${house.id}/members/${b.userId}/key`, {
+    token: a.token,
+    body: {
+      wrappedKey: await C.wrapHouseholdKey(house.hk, C.fromB64(bRow.publicKey)),
+      publicKey: bRow.publicKey,
+    },
+  });
+
+  const blocked = await api("DELETE", `/api/households/${house.id}`, { token: a.token });
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.body.error, /other member/i);
+
+  // Once alone, it goes.
+  await api("DELETE", `/api/households/${house.id}/members/${b.userId}`, { token: a.token });
+  const gone = await api("DELETE", `/api/households/${house.id}`, { token: a.token });
+  assert.equal(gone.status, 200);
+
+  const { rows } = await q("SELECT 1 FROM households WHERE id = $1", [house.id]);
+  assert.equal(rows.length, 0);
+  const vault = await q("SELECT 1 FROM vault_documents WHERE household_id = $1", [house.id]);
+  assert.equal(vault.rows.length, 0, "the vault must go with the household");
+});
+
+test("a non-admin cannot delete a household", async () => {
+  const owner = await register(`solo-${Date.now()}@example.com`, "solo-passphrase");
+  const outsider = await register(`out-${Date.now()}@example.com`, "outsider-passphrase");
+  const house = await createHousehold(owner, { householdName: "Mine" });
+
+  const res = await api("DELETE", `/api/households/${house.id}`, { token: outsider.token });
+  assert.equal(res.status, 404);
+  const { rows } = await q("SELECT 1 FROM households WHERE id = $1", [house.id]);
+  assert.equal(rows.length, 1);
 });

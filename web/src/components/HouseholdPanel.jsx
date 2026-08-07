@@ -22,6 +22,37 @@ import React, { useState, useEffect, useCallback } from "react";
 import * as session from "../lib/session.js";
 import { keyFingerprint } from "../lib/crypto.js";
 
+/**
+ * Copy to clipboard, and say whether it worked.
+ *
+ * navigator.clipboard is unavailable outside a secure context and can be
+ * refused by permissions policy, in which case the old code failed silently and
+ * left people staring at a button that appeared to do nothing. The textarea
+ * fallback works everywhere, and the caller always learns the outcome.
+ */
+async function copyText(text) {
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch { /* fall through */ }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 const ROLE_HELP = {
   admin: "Full control: can invite, remove, approve displays, rotate the key.",
   adult: "Reads and writes everything. Cannot change who is in the household.",
@@ -29,7 +60,7 @@ const ROLE_HELP = {
   viewer: "Read-only.",
 };
 
-export default function HouseholdPanel({ theme: T, me }) {
+export default function HouseholdPanel({ theme: T, me, householdName }) {
   const [members, setMembers] = useState(null);
   const [invites, setInvites] = useState([]);
   const [inviteRole, setInviteRole] = useState("admin");
@@ -37,6 +68,8 @@ export default function HouseholdPanel({ theme: T, me }) {
   const [busy, setBusy] = useState(null);
   const [error, setError] = useState(null);
   const [confirming, setConfirming] = useState(null);
+  const [copied, setCopied] = useState(null);   // 'ok' | 'failed'
+
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -109,6 +142,24 @@ export default function HouseholdPanel({ theme: T, me }) {
 
   return (
     <div>
+      {/* Which household this is, and the way out of it. Switching used to mean
+          signing out and back in, which is a strange thing to have to do to look
+          at a different calendar. */}
+      <div style={{ ...card, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+        <div>
+          <div style={{ fontWeight: 600, color: T.ink }}>{householdName || "This household"}</div>
+          <div style={{ color: T.faint, fontSize: 12 }}>
+            {active.length} {active.length === 1 ? "person" : "people"} · you are {members.find((m) => m.userId === me?.id)?.role || "a member"}
+          </div>
+        </div>
+        <button
+          style={btn(false)}
+          onClick={() => window.dispatchEvent(new CustomEvent("househub:switch-household"))}
+        >
+          Switch household
+        </button>
+      </div>
+
       {error && (
         <div role="alert" style={{ ...card, background: "#fdecea", borderColor: "#f0b4ae", color: "#7a1c12" }}>
           {error}
@@ -223,9 +274,23 @@ export default function HouseholdPanel({ theme: T, me }) {
                 server — can recover or re-issue it. After they accept, come back here to
                 check their fingerprint and let them in.
               </p>
-              <div style={{ display: "flex", gap: 8 }}>
-                <button style={btn(true)} onClick={() => navigator.clipboard?.writeText(newLink)}>Copy link</button>
-                <button style={btn(false)} onClick={() => setNewLink(null)}>Done</button>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <button
+                  style={btn(true)}
+                  onClick={async () => {
+                    const ok = await copyText(newLink);
+                    setCopied(ok ? "ok" : "failed");
+                    setTimeout(() => setCopied(null), 4000);
+                  }}
+                >
+                  {copied === "ok" ? "Copied ✓" : "Copy link"}
+                </button>
+                <button style={btn(false)} onClick={() => { setNewLink(null); setCopied(null); }}>Done</button>
+                {copied === "failed" && (
+                  <span style={{ fontSize: 12, color: "#8a3d12" }}>
+                    Could not reach the clipboard — select the link above and copy it manually.
+                  </span>
+                )}
               </div>
             </div>
           ) : (

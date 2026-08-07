@@ -20,7 +20,14 @@ export async function loadState() {
   // Documents written by older versions are brought up to the current shape
   // here, in the client -- the server cannot read them, so it cannot migrate
   // them. A migration is just a normal edit that the next save persists.
-  return normalize(doc);
+  const normalized = normalize(doc);
+
+  // Backfill the separately sealed household name. Households created before
+  // names were stored outside the document have none, which is why the picker
+  // used to label every one of them "Household". Opening one fixes it.
+  session.syncHouseholdName(normalized.householdName);
+
+  return normalized;
 }
 
 /**

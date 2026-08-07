@@ -5076,7 +5076,13 @@ function PersonPicker({ people, value, onChange }) {
 function SettingsModal({ data, update, syncCalendars, close, currentUser }) {
   const [name, setName] = useState(data.householdName || "Our Home");
   const [tab, setTab] = useState("people");
-  const saveName = () => update((d) => { d.householdName = name.trim() || "Our Home"; return d; });
+  const saveName = () => {
+    const next = name.trim() || "Our Home";
+    update((d) => { d.householdName = next; return d; });
+    // The picker reads a separately sealed copy of the name so it can label
+    // households without downloading each vault. Push the rename there too.
+    session.syncHouseholdName(next);
+  };
   const upNextAll = !Array.isArray(data.upNextSources) || data.upNextSources.length === 0;
   const resetAll = () => {
     if (!confirm("Clear everything and start fresh? This wipes events, meals, chores, tasks, groceries, notes and dates on the server.")) return;
@@ -5097,7 +5103,7 @@ function SettingsModal({ data, update, syncCalendars, close, currentUser }) {
       {/* Who is in this household, and letting new people in. The key wrap that
           admits someone happens in the browser, so it has to live in the UI. */}
       <Field label="People">
-        <HouseholdPanel theme={T} me={currentUser} />
+        <HouseholdPanel theme={T} me={currentUser} householdName={data.householdName} />
       </Field>
       <Field label="Display mode">
         <div className="flex gap-2">

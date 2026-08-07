@@ -106,6 +106,123 @@ router.post("/",
   })
 );
 
+
+/* ---------------------------------------------------- list (with keys) ----- */
+
+/**
+ * Every household this user belongs to, with the wrapped key and encrypted name
+ * for each.
+ *
+ * Returning the wrapped key here is what lets the picker show real names. The
+ * household name is sealed under the *household* key, so the server cannot read
+ * it -- but the client can, once it unwraps. Without this the picker had nothing
+ * to display and every entry read "Household", which is useless the moment
+ * somebody belongs to more than one.
+ *
+ * One round trip rather than N, because this is on the path of every login.
+ */
+router.get("/", requireAuth, wrap(async (req, res) => {
+  const { rows } = await q(
+    `SELECT h.id, h.name_enc, h.key_epoch, h.status, h.created_at,
+            m.role, m.joined_at, m.archived_at,
+            k.wrapped_key, k.wrap_epk,
+            v.version, v.updated_at AS vault_updated_at,
+            (SELECT count(*)::int FROM household_members mm
+              WHERE mm.household_id = h.id AND mm.status = 'active') AS member_count
+       FROM household_members m
+       JOIN households h ON h.id = m.household_id
+       LEFT JOIN household_keys k
+         ON k.household_id = h.id AND k.subject_type = 'user'
+        AND k.subject_id = m.user_id AND k.key_epoch = h.key_epoch
+       LEFT JOIN vault_documents v ON v.household_id = h.id
+      WHERE m.user_id = $1 AND m.status = 'active' AND h.status <> 'closed'
+      ORDER BY m.archived_at NULLS FIRST, v.updated_at DESC NULLS LAST`,
+    [req.user.id]
+  );
+
+  res.json(rows.map((r) => ({
+    id: r.id,
+    role: r.role,
+    keyEpoch: r.key_epoch,
+    status: r.status,
+    archived: Boolean(r.archived_at),
+    memberCount: r.member_count,
+    joinedAt: r.joined_at,
+    createdAt: r.created_at,
+    version: r.version == null ? null : Number(r.version),
+    updatedAt: r.vault_updated_at,
+    nameEnc: r.name_enc ? Buffer.from(r.name_enc).toString("base64") : null,
+    // Absent when an admin has not finished granting access yet.
+    wrappedKey: r.wrapped_key
+      ? {
+          epk: Buffer.from(r.wrap_epk).toString("base64"),
+          wrapped: Buffer.from(r.wrapped_key).toString("base64"),
+        }
+      : null,
+  })));
+}));
+
+/* --------------------------------------------------------- archive -------- */
+
+/**
+ * Hide a household from this member's own list, or bring it back.
+ *
+ * Per-member, and reversible. After a breakup the two people involved will not
+ * agree about whether the household is over, and neither should be able to make
+ * it vanish for the other.
+ */
+router.post("/:householdId/archive", requireAuth, loadHousehold(), wrap(async (req, res) => {
+  const { archived } = parse(z.object({ archived: z.boolean().default(true) }), req.body);
+  await q(
+    `UPDATE household_members SET archived_at = CASE WHEN $3 THEN now() ELSE NULL END
+      WHERE household_id = $1 AND user_id = $2`,
+    [req.household.id, req.user.id, archived]
+  );
+  await audit(archived ? "household_archived" : "household_unarchived", {
+    householdId: req.household.id, actorUserId: req.user.id,
+  });
+  res.json({ ok: true, archived });
+}));
+
+/* ---------------------------------------------------------- delete -------- */
+
+/**
+ * Destroy a household and everything in it. Irreversible.
+ *
+ * Only permitted when the caller is the last active member. That restriction is
+ * the point: the scenario this feature exists for is a relationship ending, and
+ * a design where either party can unilaterally delete the shared record of a
+ * life together -- the calendar, the photos, the history -- is a design that
+ * hands one person a weapon. Remove the others first, which is visible, audited,
+ * and leaves them holding whatever they exported.
+ */
+router.delete("/:householdId", requireAuth, loadHousehold(), requireRole("admin"),
+  wrap(async (req, res) => {
+    const { rows } = await q(
+      `SELECT count(*)::int AS n FROM household_members
+        WHERE household_id = $1 AND status = 'active' AND user_id <> $2`,
+      [req.household.id, req.user.id]
+    );
+    if (rows[0].n > 0) {
+      throw conflict(
+        `This household still has ${rows[0].n} other member(s). Remove them first, or archive ` +
+        "it instead — deleting would destroy their data as well as yours.",
+        { otherMembers: rows[0].n }
+      );
+    }
+
+    // Recorded before the row goes: the audit log outlives what it describes.
+    await audit("household_deleted", {
+      householdId: req.household.id, actorUserId: req.user.id,
+      meta: { keyEpoch: req.household.keyEpoch },
+    });
+    // CASCADE clears memberships, keys, the vault, revisions, displays, invites.
+    await q("DELETE FROM households WHERE id = $1", [req.household.id]);
+
+    res.json({ ok: true, deleted: true });
+  })
+);
+
 /* -------------------------------------------------------------- read ------- */
 
 router.get("/:householdId", requireAuth, loadHousehold(), wrap(async (req, res) => {
