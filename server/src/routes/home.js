@@ -207,6 +207,153 @@ memberRouter.delete("/",
   })
 );
 
+/* -------------------------------------------------- device management ----- */
+
+/**
+ * The household's own names, rooms and ordering for its devices.
+ *
+ * Home Assistant will not let us create a device -- pairing happens in its own
+ * config flow, which is the right place for it. Everything after that is fair
+ * game, and is what actually makes a wall display readable: a household is never
+ * going to rename `sensor.0x00158d0004a1b2c3_temperature` upstream, but they
+ * will happily call it "Greenhouse" here.
+ */
+async function readDevices(householdId) {
+  const { rows } = await q(
+    "SELECT devices_enc FROM household_home_assistant WHERE household_id = $1", [householdId]
+  );
+  if (!rows[0]?.devices_enc) return { rooms: [], overrides: {} };
+  try {
+    const parsed = JSON.parse(openText("haDevices", rows[0].devices_enc, householdId));
+    return { rooms: parsed.rooms || [], overrides: parsed.overrides || {} };
+  } catch {
+    return { rooms: [], overrides: {} };
+  }
+}
+
+/**
+ * Entities with the household's overrides applied, grouped into rooms.
+ *
+ * One call, because every screen that shows devices needs exactly this and
+ * making each of them merge two responses is how they drift apart.
+ */
+memberRouter.get("/devices", requireAuth, loadHousehold(), wrap(async (req, res) => {
+  const conn = required(await connectionFor(req.household.id));
+  const { rooms, overrides } = await readDevices(req.household.id);
+
+  const live = await ha.getStates(conn, req.household.id, conn.entities);
+  const merged = live
+    .map((e) => {
+      const o = overrides[e.entityId] || {};
+      return {
+        ...e,
+        // The household's name wins; Home Assistant's is kept so the settings
+        // screen can show what it is actually called upstream.
+        name: o.name || e.name,
+        haName: e.name,
+        room: o.room || null,
+        order: Number.isFinite(o.order) ? o.order : 9999,
+        hidden: Boolean(o.hidden),
+        controllable: ha.isControllable(e.entityId) && conn.controlEnabled,
+        memberOnly: ha.MEMBER_ONLY_DOMAINS.includes(e.domain),
+      };
+    })
+    .filter((e) => !e.hidden)
+    .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
+
+  // Rooms in the household's own order, with anything unassigned last.
+  const byRoom = [
+    ...rooms.map((r) => ({ room: r, entities: merged.filter((e) => e.room === r) })),
+    { room: null, entities: merged.filter((e) => !e.room || !rooms.includes(e.room)) },
+  ].filter((g) => g.entities.length);
+
+  res.json({ rooms, groups: byRoom, entities: merged, controlEnabled: conn.controlEnabled });
+}));
+
+memberRouter.put("/devices",
+  requireAuth, loadHousehold(), atLeast("adult"), requireWritable,
+  limit("ha-devices", { capacity: 60, perSecond: 0.5, by: "household" }),
+  wrap(async (req, res) => {
+    const body = parse(z.object({
+      rooms: z.array(z.string().trim().min(1).max(40)).max(40).optional(),
+      overrides: z.record(
+        z.string().max(120),
+        z.object({
+          name: z.string().trim().max(60).optional(),
+          room: z.string().trim().max(40).nullable().optional(),
+          order: z.number().int().min(0).max(99999).optional(),
+          hidden: z.boolean().optional(),
+        }).strict()
+      ).optional(),
+    }).strict(), req.body);
+
+    const current = await readDevices(req.household.id);
+    const next = {
+      rooms: body.rooms ?? current.rooms,
+      // Merged rather than replaced, so renaming one lamp does not wipe the rest.
+      overrides: { ...current.overrides, ...(body.overrides || {}) },
+    };
+    // An override that says nothing is just clutter.
+    for (const [id, o] of Object.entries(next.overrides)) {
+      if (!o || (!o.name && !o.room && o.order === undefined && !o.hidden)) delete next.overrides[id];
+    }
+
+    await q(
+      "UPDATE household_home_assistant SET devices_enc = $2, updated_at = now() WHERE household_id = $1",
+      [req.household.id, seal("haDevices", JSON.stringify(next), req.household.id)]
+    );
+    await audit("ha_devices_organised", {
+      householdId: req.household.id, actorUserId: req.user.id,
+      meta: { rooms: next.rooms.length, overrides: Object.keys(next.overrides).length },
+    });
+    res.json({ ok: true, rooms: next.rooms });
+  })
+);
+
+/**
+ * The display's device view: the same rooms and names, read-only in structure.
+ *
+ * A screen shows what the household organised; it cannot reorganise it.
+ */
+displayRouter.get("/devices",
+  limit("display-ha-devices", { capacity: 120, perSecond: 1 }),
+  wrap(async (req, res) => {
+    if (!req.display.scopes.includes("home")) {
+      throw forbidden("This display is not permitted to show the home view");
+    }
+    const conn = required(await connectionFor(req.display.household_id));
+    const { rooms, overrides } = await readDevices(req.display.household_id);
+    const granted = Array.isArray(req.display.control_domains) ? req.display.control_domains : [];
+
+    const live = await ha.getStates(conn, req.display.household_id, conn.entities);
+    const merged = live
+      .map((e) => {
+        const o = overrides[e.entityId] || {};
+        return {
+          ...e,
+          name: o.name || e.name,
+          room: o.room || null,
+          order: Number.isFinite(o.order) ? o.order : 9999,
+          hidden: Boolean(o.hidden),
+          // What this screen may actually touch. Locks are never in `granted`,
+          // and routes/home.js refuses them regardless of what is stored.
+          controllable: conn.controlEnabled
+            && granted.includes(e.domain)
+            && !ha.MEMBER_ONLY_DOMAINS.includes(e.domain),
+        };
+      })
+      .filter((e) => !e.hidden)
+      .sort((a, b) => a.order - b.order || a.name.localeCompare(b.name));
+
+    const byRoom = [
+      ...rooms.map((r) => ({ room: r, entities: merged.filter((e) => e.room === r) })),
+      { room: null, entities: merged.filter((e) => !e.room || !rooms.includes(e.room)) },
+    ].filter((g) => g.entities.length);
+
+    res.json({ rooms, groups: byRoom, entities: merged });
+  })
+);
+
 /** Everything available, for the entity picker. */
 memberRouter.get("/entities/all",
   requireAuth, loadHousehold(), requireRole("admin"),

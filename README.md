@@ -45,6 +45,8 @@ else follows from it.
 - **Security cameras** — plug in your own [CamWatch](https://github.com/stevenglasford/security):
   live views, alerts and recordings, with nothing stored here.
   See [docs/CAMERAS.md](docs/CAMERAS.md)
+- **Devices** — name, group into rooms and reorder everything Home Assistant
+  exposes, so the wall display reads like a home rather than an entity registry
 
 ## What makes it different
 
@@ -102,8 +104,8 @@ Then put HTTPS in front (`deploy/Caddyfile`) and open your domain.
 > over HTTPS or on `localhost`. Over plain `http://` from another machine it
 > cannot decrypt anything.
 
-Full instructions, including running it for other families:
-**[docs/SELF-HOSTING.md](docs/SELF-HOSTING.md)**
+**[docs/INSTALL.md](docs/INSTALL.md)** is the full walkthrough — one household,
+a server for several families, or everything switched on.
 
 ## Privacy and your data
 
@@ -137,7 +139,7 @@ panels. Removing a member requires a key rotation to be complete.
 Verify the claims:
 
 ```bash
-cd server && npm test           # 90 tests: crypto, SSRF, archives, end-to-end
+cd server && npm test           # 93 tests: crypto, SSRF, archives, end-to-end
 node security/pentest/run.js    # 90+ attack probes; exits non-zero on HIGH+
 ```
 
@@ -163,7 +165,8 @@ web/
     lib/session.js keys in memory, sealed load/save
     api.js         the seam: same six functions the UI always used
     App.jsx        the household UI, unchanged by encryption
-docs/              self-hosting, threat model
+docs/              install, self-hosting, threat model, privacy,
+                   home assistant, cameras
 security/pentest/  the attack suite
 deploy/            Dockerfile, compose, Caddy, nginx, systemd
 ```

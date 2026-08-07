@@ -636,6 +636,15 @@ export const homeControl = (entityId, action = "toggle") =>
     ? request("POST", "api/display/home/control", { entityId, action })
     : request("POST", `api/households/${state.householdId}/home/control`, { entityId, action });
 
+/** Devices with this household's own names, rooms and ordering applied. */
+export const homeDevices = () =>
+  state.display
+    ? request("GET", "api/display/home/devices")
+    : request("GET", `api/households/${state.householdId}/home/devices`);
+
+export const saveHomeDevices = (body) =>
+  request("PUT", `api/households/${state.householdId}/home/devices`, body);
+
 export const cameraUrl = (entityId) =>
   state.display
     ? `api/display/home/camera/${encodeURIComponent(entityId)}.jpg?token=${encodeURIComponent(state.display.token)}`

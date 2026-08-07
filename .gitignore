@@ -1,10 +1,79 @@
-node_modules/
+# --------------------------------------------------------------- secrets ---
+#
+# Everything here is either a live credential or something that turns into one.
+# The rules are broad on purpose: a public repository is not the place to find
+# out that a pattern was slightly too narrow.
+
 .env
 .env.*
 !deploy/env.example
+
+# The server's root secret. Seals email addresses, TOTP secrets, calendar URLs,
+# Home Assistant and CamWatch credentials, and wallet configuration.
 .secret-key
-server/public/
-server/.secret-key
+*.secret-key
+secret.env
+secrets/
+
+# Anything that looks like a key or certificate.
+*.pem
+*.key
+!**/package.json
+*.p12
+*.pfx
+id_rsa*
+*.gpg
+
+# --------------------------------------------------------------- editors ---
+#
+# Swap files are the sneaky one: a .swp of .env can contain the whole file, and
+# the leading dot means a careless `git add .` picks it up. One was committed
+# during development and had to be purged from history.
+*.swp
+*.swo
+*.swn
+.*.swp
+.*.sw?
+*~
+.vscode/
+.idea/
+*.sublime-*
+
+# ------------------------------------------------------------- artefacts ---
+node_modules/
 dist/
+build/
+server/public/          # built by web/; regenerate with `npm run build`
+coverage/
+.turbo/
+.cache/
+*.tsbuildinfo
+
+# ------------------------------------------------------------- runtime ----
 *.log
+logs/
+pids/
+*.pid
+*.seed
+uploads/
+tmp/
+.tmp/
+
+# Upgrade pipeline scratch space: uploaded zips and cloned worktrees.
+var/
+/upgrades/
+server/upgrades/
+
+# Database dumps. Encrypted vaults, but also emails and tokens under the
+# server key -- not something to drop into a repository by accident.
+*.sql.gz
+*.dump
+*.sqlite
+*.sqlite3
+*.db
+!server/src/db/migrations/*.sql
+
+# --------------------------------------------------------------- systems ---
 .DS_Store
+Thumbs.db
+desktop.ini

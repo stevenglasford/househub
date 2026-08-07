@@ -1158,3 +1158,73 @@ test("the camera plugin is listed as an integration", async () => {
   // The manifest must be explicit that no footage is kept here.
   assert.ok(cw.holds.some((h) => /No footage/i.test(h)));
 });
+
+/* --------------------------------------------------- device management --- */
+
+test("device names and rooms are sealed, not readable by the server", async () => {
+  const owner = await register(`dev-${Date.now()}@example.com`, "devices-passphrase");
+  const house = await createHousehold(owner, { householdName: "Organised" });
+
+  // Connect a stub Home Assistant row directly: the point under test is the
+  // storage of the household's own labels, not the upstream connection.
+  await q(
+    `INSERT INTO household_home_assistant (household_id, url_enc, token_enc, entities)
+     VALUES ($1, $2, $3, '["light.kitchen"]'::jsonb)`,
+    [house.id, Buffer.from("x"), Buffer.from("y")]
+  );
+
+  const res = await api("PUT", `/api/households/${house.id}/home/devices`, {
+    token: owner.token,
+    body: {
+      rooms: ["Kitchen", "Bedroom"],
+      overrides: { "light.kitchen": { name: "Reading lamp", room: "Kitchen", order: 0 } },
+    },
+  });
+  assert.equal(res.status, 200);
+  assert.deepEqual(res.body.rooms, ["Kitchen", "Bedroom"]);
+
+  // A map of somebody's home is not something the operator needs to read.
+  const { rows } = await q(
+    "SELECT devices_enc FROM household_home_assistant WHERE household_id = $1", [house.id]
+  );
+  const raw = Buffer.from(rows[0].devices_enc).toString("utf8");
+  assert.ok(!raw.includes("Reading lamp"), "device names must not be readable in the database");
+  assert.ok(!raw.includes("Kitchen"));
+});
+
+test("organising devices needs at least adult access", async () => {
+  const owner = await register(`devo-${Date.now()}@example.com`, "devices-owner-pass");
+  const outsider = await register(`devx-${Date.now()}@example.com`, "devices-outsider-pass");
+  const house = await createHousehold(owner, { householdName: "Locked devices" });
+
+  const res = await api("PUT", `/api/households/${house.id}/home/devices`, {
+    token: outsider.token, body: { rooms: ["Nowhere"] },
+  });
+  assert.equal(res.status, 404);
+});
+
+test("an override merge does not wipe the others", async () => {
+  const owner = await register(`devm-${Date.now()}@example.com`, "devices-merge-pass");
+  const house = await createHousehold(owner, { householdName: "Merged" });
+  await q(
+    `INSERT INTO household_home_assistant (household_id, url_enc, token_enc)
+     VALUES ($1, $2, $3)`,
+    [house.id, Buffer.from("x"), Buffer.from("y")]
+  );
+
+  await api("PUT", `/api/households/${house.id}/home/devices`, {
+    token: owner.token, body: { overrides: { "light.a": { name: "A" } } },
+  });
+  await api("PUT", `/api/households/${house.id}/home/devices`, {
+    token: owner.token, body: { overrides: { "light.b": { name: "B" } } },
+  });
+
+  // Renaming one lamp must not forget the other.
+  const { openText } = await import("../src/crypto/seal.js");
+  const { rows } = await q(
+    "SELECT devices_enc FROM household_home_assistant WHERE household_id = $1", [house.id]
+  );
+  const stored = JSON.parse(openText("haDevices", rows[0].devices_enc, house.id));
+  assert.equal(stored.overrides["light.a"].name, "A");
+  assert.equal(stored.overrides["light.b"].name, "B");
+});

@@ -25,6 +25,7 @@ import SuperAdminPanel from "./components/SuperAdminPanel.jsx";
 import HomeAssistantPanel from "./components/HomeAssistantPanel.jsx";
 import DisplaysPanel from "./components/DisplaysPanel.jsx";
 import CamerasPanel from "./components/CamerasPanel.jsx";
+import DevicesPanel from "./components/DevicesPanel.jsx";
 import AiPanel from "./components/AiPanel.jsx";
 import SecondBlock, { SecondBlockSettings } from "./components/SecondBlock.jsx";
 import PrivacyPanel from "./components/PrivacyPanel.jsx";
@@ -3673,6 +3674,7 @@ const HOME_SNAP_MS = 2000;
  */
 function useHomeAssistant() {
   const [entities, setEntities] = useState([]);
+  const [groups, setGroups] = useState([]);
   const [conn, setConn] = useState(null);
   const [err, setErr] = useState(null);
 
@@ -3692,8 +3694,15 @@ function useHomeAssistant() {
 
     const load = async () => {
       try {
-        const list = await session.homeEntities();
-        if (!dead) { setEntities(Array.isArray(list) ? list : []); setErr(null); }
+        // The devices endpoint applies the household's own names, rooms and
+        // ordering, so the wall display shows "Greenhouse" rather than
+        // sensor.0x00158d0004a1b2c3_temperature.
+        const d = await session.homeDevices();
+        if (!dead) {
+          setEntities(Array.isArray(d.entities) ? d.entities : []);
+          setGroups(Array.isArray(d.groups) ? d.groups : []);
+          setErr(null);
+        }
       } catch (e) {
         if (!dead) setErr(e.status === 503 ? null : (e.message || "unavailable"));
       }
@@ -3709,14 +3718,15 @@ function useHomeAssistant() {
       e.entityId === entity.entityId ? { ...e, state: isOn(e) ? "off" : "on", _pending: true } : e));
     try {
       await session.homeControl(entity.entityId, "toggle");
-      setEntities(await session.homeEntities());
+      const d = await session.homeDevices();
+      setEntities(d.entities || []);
+      setGroups(d.groups || []);
     } catch (e) {
       setErr(e.message);
-      setEntities(await session.homeEntities().catch(() => []));
     }
   }, []);
 
-  return { entities, conn, err, toggle };
+  return { entities, groups, conn, err, toggle };
 }
 
 const ON_STATES = new Set(["on", "open", "unlocked", "playing", "home", "detected"]);
@@ -3761,7 +3771,7 @@ function CameraTile({ entity }) {
 
 function HomeView({ data }) {
   const isMobile = useMobile();
-  const { entities, conn, err, toggle } = useHomeAssistant();
+  const { entities, groups, conn, err, toggle } = useHomeAssistant();
   const cameras = entities.filter((e) => e.domain === "camera");
   const rest = entities.filter((e) => e.domain !== "camera");
   const alerts = rest.filter(isAlert);
@@ -3857,15 +3867,35 @@ function HomeView({ data }) {
         <div className="mb-4">
           <div style={{ color: "#E86A4C", fontSize: 11, fontWeight: 800, letterSpacing: 1 }} className="uppercase mb-1.5">Needs a look</div>
           <div className="grid gap-2" style={{ gridTemplateColumns: isMobile ? "1fr" : "repeat(auto-fill, minmax(210px, 1fr))" }}>
-            {alerts.map((e) => <Tile key={e.id} e={e} alert />)}
+            {alerts.map((e) => <Tile key={e.entityId} e={e} alert />)}
           </div>
         </div>
       )}
 
+      {/* Grouped by the household's own rooms when they have set any up, and a
+          single list when they have not -- nobody should have to invent a room
+          taxonomy before their lights show up. */}
       {others.length > 0 && (
-        <div className="grid gap-2" style={{ gridTemplateColumns: isMobile ? "1fr" : "repeat(auto-fill, minmax(210px, 1fr))" }}>
-          {others.map((e) => <Tile key={e.id} e={e} />)}
-        </div>
+        groups.filter((g) => g.room).length ? (
+          groups.map((g) => {
+            const items = g.entities.filter((e) => others.some((o) => o.entityId === e.entityId));
+            if (!items.length) return null;
+            return (
+              <div key={g.room || "_none"} className="mb-3">
+                <h3 style={{ fontSize: 12.5, fontWeight: 700, color: T.faint, letterSpacing: 0.3, marginBottom: 6 }}>
+                  {(g.room || "Elsewhere").toUpperCase()}
+                </h3>
+                <div className="grid gap-2" style={{ gridTemplateColumns: isMobile ? "1fr" : "repeat(auto-fill, minmax(210px, 1fr))" }}>
+                  {items.map((e) => <Tile key={e.entityId} e={e} />)}
+                </div>
+              </div>
+            );
+          })
+        ) : (
+          <div className="grid gap-2" style={{ gridTemplateColumns: isMobile ? "1fr" : "repeat(auto-fill, minmax(210px, 1fr))" }}>
+            {others.map((e) => <Tile key={e.entityId} e={e} />)}
+          </div>
+        )
       )}
     </div>
   );
@@ -5072,6 +5102,9 @@ function SettingsModal({ data, update, syncCalendars, close, currentUser }) {
       </Field>
       <Field label="Home Assistant">
         <HomeAssistantPanel theme={T} />
+      </Field>
+      <Field label="Devices">
+        <DevicesPanel theme={T} />
       </Field>
       <Field label="Cameras">
         <CamerasPanel theme={T} />
