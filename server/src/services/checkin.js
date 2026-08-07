@@ -16,7 +16,47 @@
 //    ever sees what the client decided to send for this one request, and the
 //    default sends counts rather than content.
 
-import { generateJSON, OllamaError } from "./ollama.js";
+import { generateJSON, AIError } from "./ai-providers.js";
+
+/* -------------------------------------------------- household steering ----- */
+
+/**
+ * A household's own instructions for the model.
+ *
+ * The same app serves platonic flatmates, co-parents, and couples who want
+ * something a good deal more intimate, and no single default serves all three.
+ * "Team building for platonic roommates" and "sexual discovery for partners" are
+ * both legitimate here, and the household is the only party who knows which it
+ * is. So they say.
+ *
+ * The instructions are appended AFTER the base rules rather than replacing them,
+ * which matters for two reasons. They cannot delete the rules above them -- a
+ * pasted "ignore all previous instructions" steers tone at most. And the rule
+ * that survives regardless is the one about not assuming who these people are
+ * to each other, which is the whole reason the base prompt exists.
+ *
+ * The instructions themselves live in the encrypted document. The server sees
+ * them only for the duration of one request, like the rest of the context.
+ */
+function withInstructions(base, instructions, { audience } = {}) {
+  const clean = String(instructions || "").trim().slice(0, 1200);
+  if (!clean) return base;
+
+  return `${base}
+
+The household has asked for questions in this vein:
+"""
+${clean}
+"""
+
+Follow that steer for subject and tone. It does not override the rules above:
+still one question, still under 20 words, still no assumptions about who these
+people are to each other.${
+  audience === "shared"
+    ? "\nThis may be displayed on a screen other people in the home can see, so keep it suitable for that."
+    : ""
+}`;
+}
 
 /* ------------------------------------------------------------ personas ----- */
 
@@ -145,20 +185,26 @@ export const KIND_NAMES = Object.keys(KINDS);
  * hostile author, but a model that has just been fed household notes is exactly
  * the place a prompt injection would surface.
  */
-export async function runGeneration(kind, context, { model, temperature } = {}) {
+export async function runGeneration(kind, context, { provider, instructions, audience, temperature } = {}) {
   const spec = KINDS[kind];
-  if (!spec) throw new OllamaError(`Unknown generation kind: ${kind}`, { status: 400 });
+  if (!spec) throw new AIError(`Unknown generation kind: ${kind}`, { status: 400 });
 
-  const { data, model: used } = await generateJSON({
-    system: spec.system,
+  const result = await generateJSON(provider, {
+    system: withInstructions(spec.system, instructions, { audience }),
     prompt: spec.build(context || {}),
-    model,
     temperature: temperature ?? 0.85,
     maxTokens: kind === "checkin_batch" || kind === "grocery_categorize" ? 900 : 200,
   });
 
-  const picked = spec.pick(data);
-  return { ...clampStrings(picked), model: used };
+  const picked = spec.pick(result.data);
+  return {
+    ...clampStrings(picked),
+    model: result.model,
+    provider: result.provider,
+    // Surfaced so the UI can say where this came from. A household that has
+    // chosen a hosted provider should be reminded, not left to remember.
+    isLocal: result.isLocal,
+  };
 }
 
 // A model told to write 20 words occasionally writes 2000. Cap rather than

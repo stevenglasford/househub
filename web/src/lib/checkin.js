@@ -121,7 +121,14 @@ export async function questionForDate(doc, dateKey, { onCache } = {}) {
       privacy: settings.aiPrivacy || "signals",
       tone: settings.tone || "warm",
     });
-    const res = await session.generate("checkin_question", context);
+    const res = await session.generate("checkin_question", context, {
+      // The household's own steer, from the encrypted document.
+      instructions: settings.instructions || undefined,
+      // A check-in question can land on a wall display, so the model is told to
+      // keep it suitable for a screen other people can see unless the household
+      // has said this hub is private.
+      audience: settings.audience || "shared",
+    });
     if (!res?.question) throw new Error("empty");
 
     // The server returns a fallback question with fallback:true when Ollama is
@@ -142,6 +149,32 @@ export async function refillBank(doc, count = 10) {
   const context = buildContext(doc, new Date().toISOString().slice(0, 10), {
     privacy: doc.checkin?.aiPrivacy || "signals",
   });
-  const res = await session.generate("checkin_batch", { ...context, count });
+  const res = await session.generate("checkin_batch", { ...context, count }, {
+    instructions: doc.checkin?.instructions || undefined,
+    audience: doc.checkin?.audience || "shared",
+  });
   return res?.questions || [];
+}
+
+/**
+ * A date-night idea, steered by the household's own instructions.
+ *
+ * This is the other place where "platonic flatmates" and "partners exploring
+ * intimacy" want genuinely different output from the same button, and where the
+ * app has no business guessing which.
+ */
+export async function suggestDateIdea(doc, { jar, existing } = {}) {
+  const season = ["winter", "winter", "spring", "spring", "spring", "summer",
+                  "summer", "summer", "autumn", "autumn", "autumn", "winter"][new Date().getMonth()];
+  const res = await session.generate("date_idea", {
+    jar: jar || "any",
+    season,
+    existing: (existing || []).slice(0, 10),
+    householdSize: (doc.people || []).length || 2,
+  }, {
+    instructions: doc.dateIdeaInstructions || doc.checkin?.instructions || undefined,
+    // Drawn deliberately by a person, so it is not held to display standards.
+    audience: "private",
+  });
+  return res?.idea || null;
 }

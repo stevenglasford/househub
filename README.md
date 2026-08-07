@@ -39,9 +39,12 @@ else follows from it.
   a fixed list that goes stale in a fortnight
 - **Displays** — permanent links for always-on screens, each showing only what
   the admins chose
-- **Home Assistant** — plug your own instance into your household: cameras,
-  lights, sensors, and optional control. Lights and blinds work from a shared
-  display; locks never do. See [docs/HOME-ASSISTANT.md](docs/HOME-ASSISTANT.md)
+- **Home Assistant** — plug your own instance into your household: lights,
+  sensors, and optional control. Lights and blinds work from a shared display;
+  locks never do. See [docs/HOME-ASSISTANT.md](docs/HOME-ASSISTANT.md)
+- **Security cameras** — plug in your own [CamWatch](https://github.com/stevenglasford/security):
+  live views, alerts and recordings, with nothing stored here.
+  See [docs/CAMERAS.md](docs/CAMERAS.md)
 
 ## What makes it different
 
@@ -68,9 +71,15 @@ others sign off. This is enforced by the fact that activation requires a key
 wrap only a member device can perform — not by an `if` statement someone could
 patch out.
 
-**All AI is local.** Inference goes to Ollama on the same machine. There is no
-remote provider in the codebase and the server refuses to start if `OLLAMA_URL`
-is not local — the constraint is structural, not a setting.
+**AI is local by default, and the choice is the household's.** Inference goes to
+Ollama on your own machine unless a household deliberately picks something else.
+An operator may offer Claude, ChatGPT or a remote Ollama — but offering one
+routes nobody to it: each household chooses, and a non-local choice needs that
+household's recorded consent, because their context would leave the machine.
+
+**Tell it what kind of home this is.** "Team-building for platonic housemates"
+and "sexual discovery for partners" produce very different check-in questions,
+and the app has no business guessing which you are.
 
 **Open source, MIT.** Host it for your family, or for a hundred.
 
@@ -128,7 +137,7 @@ panels. Removing a member requires a key rotation to be complete.
 Verify the claims:
 
 ```bash
-cd server && npm test           # 82 tests: crypto, SSRF, archives, end-to-end
+cd server && npm test           # 90 tests: crypto, SSRF, archives, end-to-end
 node security/pentest/run.js    # 90+ attack probes; exits non-zero on HIGH+
 ```
 

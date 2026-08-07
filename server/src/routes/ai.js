@@ -11,7 +11,12 @@
 //     fixed list and supply structured fields (services/checkin.js assembles the
 //     actual prompt), so this cannot be used as a general-purpose LLM proxy and
 //     a malicious client cannot rewrite the system prompt.
-//   - Inference is local. See services/ollama.js, which refuses a non-local host.
+//   - Inference is local BY DEFAULT. A household may now select a hosted
+//     provider instead (Claude, ChatGPT, a remote Ollama), and if it does, the
+//     context for each request leaves this machine. That choice belongs to the
+//     household, not the operator: offering a provider does not route anybody to
+//     it, and using a non-local one requires consent recorded against a person
+//     and a time. See services/ai-providers.js.
 //
 // The honest caveat, which docs/THREAT-MODEL.md repeats: an operator who
 // modifies this file could log what passes through it. The protection against
@@ -24,11 +29,13 @@ import { z } from "zod";
 
 import { wrap, badRequest, ApiError } from "../middleware/errors.js";
 import { limit } from "../middleware/ratelimit.js";
-import { requireAuth, loadHousehold, atLeast } from "../middleware/auth.js";
+import { requireAuth, loadHousehold, requireRole, atLeast } from "../middleware/auth.js";
 import { runGeneration, fallbackQuestion, KIND_NAMES } from "../services/checkin.js";
-import { isAvailable, listModels, OllamaError } from "../services/ollama.js";
+import {
+  providerForHousehold, setHouseholdProvider, listProviders, listModels, AIError,
+} from "../services/ai-providers.js";
 import { audit } from "../services/audit.js";
-import { AI_ENABLED, AI_RATE_PER_HOUR, OLLAMA_MODEL } from "../config.js";
+import { AI_ENABLED, AI_RATE_PER_HOUR } from "../config.js";
 
 export const router = express.Router();
 
@@ -70,7 +77,13 @@ const contextSchema = z.object({
 const generateSchema = z.object({
   kind: z.enum(KIND_NAMES),
   context: contextSchema.default({}),
-  model: z.string().max(120).optional(),
+  // The household's own steer, from their encrypted document. Capped, and
+  // appended after the base rules rather than replacing them -- see
+  // services/checkin.js.
+  instructions: z.string().max(1200).optional(),
+  // 'shared' when the result may land on a screen others can see, which tightens
+  // what the model is asked for.
+  audience: z.enum(["private", "shared"]).optional(),
   temperature: z.number().min(0).max(2).optional(),
 }).strict();
 
@@ -94,17 +107,64 @@ const parse = (schema, body) => {
 
 router.get("/status", requireAuth, wrap(async (req, res) => {
   if (!AI_ENABLED) return res.json({ enabled: false, reason: "disabled_by_operator" });
-  const up = await isAvailable();
   res.json({
     enabled: true,
-    available: up,
-    defaultModel: OLLAMA_MODEL,
-    models: up ? await listModels() : [],
     ratePerHour: AI_RATE_PER_HOUR,
-    // Stated in the API, not just the docs, so a client can show it in the UI.
-    privacy: "Inference runs on this server against a local model. Prompts and completions are never stored.",
+    providers: (await listProviders()).filter((p) => p.enabled)
+      .map(({ id, label, kind, isLocal, defaultModel }) => ({ id, label, kind, isLocal, defaultModel })),
   });
 }));
+
+/* ------------------------------------------------- per-household choice --- */
+
+/**
+ * Which provider this household uses.
+ *
+ * `isLocal` is computed on the server from the provider's kind and address, so
+ * the warning a household sees cannot be wrong about whether their context
+ * leaves the machine.
+ */
+router.get("/households/:householdId/provider",
+  requireAuth, loadHousehold(),
+  wrap(async (req, res) => {
+    const p = await providerForHousehold(req.household.id);
+    const models = await listModels(p).catch(() => []);
+    res.json({
+      providerId: p.id,
+      label: p.label,
+      kind: p.kind,
+      isLocal: p.isLocal,
+      model: p.model,
+      models,
+      blocked: p.blocked || null,
+      selectedLabel: p.selectedLabel || null,
+      available: (await listProviders()).filter((x) => x.enabled)
+        .map(({ id, label, kind, isLocal, defaultModel }) => ({ id, label, kind, isLocal, defaultModel })),
+      privacy: p.isLocal
+        ? "Inference runs on hardware you control. Nothing leaves your network, and prompts are never stored."
+        : `Context for each request is sent to ${p.label}. It is not stored by HouseHub, but it does leave this machine and is subject to that provider's terms.`,
+    });
+  })
+);
+
+router.put("/households/:householdId/provider",
+  requireAuth, loadHousehold(), requireRole("admin"),
+  wrap(async (req, res) => {
+    const body = parse(z.object({
+      providerId: z.string().uuid().nullable(),
+      model: z.string().max(120).optional(),
+      // Required for anything not local. Recorded with who agreed and when.
+      consent: z.boolean().default(false),
+    }).strict(), req.body);
+
+    const out = await setHouseholdProvider(req.household.id, body, req.user.id);
+    await audit("ai_provider_changed", {
+      householdId: req.household.id, actorUserId: req.user.id,
+      meta: { providerId: body.providerId, isLocal: out.isLocal, consented: out.consented },
+    });
+    res.json(out);
+  })
+);
 
 /* ------------------------------------------------------------ generate ----- */
 
@@ -123,22 +183,34 @@ router.post("/households/:householdId/generate",
 
     const body = parse(generateSchema, req.body);
 
+    const provider = await providerForHousehold(req.household.id);
+    if (provider.blocked === "consent_required") {
+      throw new ApiError(409, "consent_required",
+        `This household selected ${provider.selectedLabel}, which is not on this server. ` +
+        "An admin needs to confirm that context may leave the machine before it can be used.");
+    }
+
     try {
       const result = await runGeneration(body.kind, body.context, {
-        model: body.model,
+        provider,
+        instructions: body.instructions,
+        audience: body.audience,
         temperature: body.temperature,
       });
 
       // Records that a generation happened and of what kind. Never the context,
       // never the output -- an audit trail of check-in questions would be a
       // slow-motion leak of exactly what the encryption protects.
+      // Which provider handled it is recorded; the prompt and the answer are
+      // not. A household should be able to see that something went offsite.
       await audit("ai_generated", {
-        householdId: req.household.id, actorUserId: req.user.id, meta: { kind: body.kind },
+        householdId: req.household.id, actorUserId: req.user.id,
+        meta: { kind: body.kind, provider: result.provider, offsite: !result.isLocal },
       });
 
       res.json(result);
     } catch (err) {
-      if (err instanceof OllamaError) {
+      if (err instanceof AIError) {
         // A down model should degrade the feature, not break the evening. The
         // client shows the fallback and a quiet note.
         if (body.kind === "checkin_question") {

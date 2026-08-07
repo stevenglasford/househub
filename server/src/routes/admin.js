@@ -23,7 +23,7 @@ import { audit, verifyChain } from "../services/audit.js";
 import { getWalletConfig, setWalletConfig, getRates, createInvoice, checkPendingInvoices } from "../services/billing.js";
 import { parseExtendedPublicKey, deriveAddress } from "../services/wallets.js";
 import { runUpgradeJob, publishUpgrade, bundleHash } from "../services/upgrades.js";
-import { isAvailable, listModels } from "../services/ollama.js";
+import { listProviders, upsertProvider, getProvider, listModels, computeIsLocal } from "../services/ai-providers.js";
 import {
   UPGRADES_ENABLED, UPGRADE_WORK_DIR, UPGRADE_MAX_ZIP_MB, UPGRADE_REPO_URL,
   UPGRADE_DIRECT_PUSH, GITHUB_TOKEN, BILLING_ENABLED,
@@ -60,7 +60,7 @@ router.get("/overview", wrap(async (req, res) => {
     // and nothing whatsoever about what is in it.
     storageBytes: Number(vault.rows[0].bytes),
     subscriptions: Object.fromEntries(subs.rows.map((r) => [r.status, r.n])),
-    ai: { available: await isAvailable(), models: (await listModels()).map((m) => m.name) },
+    ai: { providers: (await listProviders()).map((p) => ({ label: p.label, kind: p.kind, isLocal: p.isLocal, enabled: p.enabled })) },
     billingEnabled: BILLING_ENABLED,
     upgradesEnabled: UPGRADES_ENABLED,
   });
@@ -242,6 +242,69 @@ router.post("/households/:id/invoice", wrap(async (req, res) => {
   } catch (err) {
     throw badRequest(err.message);
   }
+}));
+
+/* ---------------------------------------------------------- AI providers ---
+ *
+ * The "advanced" surface: which models households may choose from.
+ *
+ * Adding a hosted provider here does NOT route anybody to it. Each household
+ * selects its own, and a non-local one additionally needs that household's
+ * recorded consent -- so an operator cannot decide on a family's behalf that
+ * their evenings get summarised by a company in another country.
+ */
+
+router.get("/ai/providers", wrap(async (req, res) => {
+  // API keys are never returned, on any path.
+  res.json(await listProviders());
+}));
+
+router.put("/ai/providers", wrap(async (req, res) => {
+  const body = parse(z.object({
+    id: z.string().uuid().optional(),
+    label: z.string().trim().min(1).max(80),
+    kind: z.enum(["ollama", "openai", "anthropic"]),
+    baseUrl: z.string().url().max(500).nullable().optional(),
+    // Write-only. Omit to keep the stored one.
+    apiKey: z.string().min(8).max(400).optional(),
+    defaultModel: z.string().max(120).optional(),
+    enabled: z.boolean().optional(),
+  }), req.body);
+
+  if (body.kind !== "ollama" && !body.apiKey && !body.id) {
+    throw badRequest("Hosted providers need an API key");
+  }
+
+  const id = await upsertProvider(body, req.user.id);
+  const isLocal = computeIsLocal(body.kind, body.baseUrl);
+
+  // Verified before it is offered to anyone: a provider that looks configured
+  // and does not work fails at the moment somebody wants a check-in question.
+  let models = [];
+  try {
+    models = await listModels(await getProvider(id));
+  } catch { /* reported below as an empty list */ }
+
+  await audit("ai_provider_configured", {
+    actorUserId: req.user.id, target: id,
+    meta: { kind: body.kind, isLocal, label: body.label },
+  });
+
+  res.json({
+    id, isLocal, models,
+    warning: isLocal ? null :
+      "Households that select this will have their check-in context sent to a third party. " +
+      "Each household must consent before anything is sent.",
+  });
+}));
+
+router.delete("/ai/providers/:id", wrap(async (req, res) => {
+  const { rows } = await q("SELECT is_local FROM ai_providers WHERE id = $1", [req.params.id]);
+  if (!rows[0]) throw notFound();
+  // Households pointing at it fall back to local, which is the safe direction.
+  await q("DELETE FROM ai_providers WHERE id = $1", [req.params.id]);
+  await audit("ai_provider_removed", { actorUserId: req.user.id, target: req.params.id });
+  res.json({ ok: true, note: "Households using it fall back to the local model." });
 }));
 
 /* ------------------------------------------------------------- upgrades ---- */

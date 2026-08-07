@@ -76,7 +76,7 @@ export default function SuperAdminPanel({ theme: T }) {
   }
   if (!overview) return <p style={{ color: T.faint }}>Loading server status…</p>;
 
-  const TABS = [["overview", "Server"], ["households", "Households"], ["audit", "Audit"]];
+  const TABS = [["overview", "Server"], ["households", "Households"], ["audit", "Audit"], ["advanced", "Advanced"]];
 
   return (
     <div>
@@ -107,11 +107,15 @@ export default function SuperAdminPanel({ theme: T }) {
           </div>
 
           <div style={card}>
-            <div style={{ fontWeight: 600, color: T.ink, marginBottom: 4 }}>Local AI</div>
+            <div style={{ fontWeight: 600, color: T.ink, marginBottom: 4 }}>AI providers</div>
             <div style={{ fontSize: 13, color: T.faint }}>
-              {overview.ai.available
-                ? `Reachable · ${overview.ai.models.length} model(s) installed`
-                : "Not reachable — check that Ollama is running"}
+              {(overview.ai?.providers || []).length
+                ? (overview.ai.providers).map((p) =>
+                    `${p.label}${p.isLocal ? "" : " (offsite)"}`).join(" · ")
+                : "None configured"}
+            </div>
+            <div style={{ fontSize: 12, color: T.faint, marginTop: 4 }}>
+              Manage them under Advanced. Each household chooses its own.
             </div>
           </div>
 
@@ -154,6 +158,8 @@ export default function SuperAdminPanel({ theme: T }) {
         </>
       )}
 
+      {tab === "advanced" && <AiProviders theme={T} card={card} btn={btn} />}
+
       {tab === "audit" && (
         <>
           <div style={card}>
@@ -175,6 +181,130 @@ export default function SuperAdminPanel({ theme: T }) {
           </div>
         </>
       )}
+    </div>
+  );
+}
+
+
+/* ------------------------------------------------------- AI providers ----- */
+
+/**
+ * Models households may choose from.
+ *
+ * Adding one here does NOT route anybody to it. Each household picks its own,
+ * and a non-local provider additionally needs that household's recorded
+ * consent -- so an operator cannot decide on a family's behalf that their
+ * evenings get summarised by a company in another country.
+ */
+function AiProviders({ theme: T, card, btn }) {
+  const [providers, setProviders] = useState(null);
+  const [error, setError] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [form, setForm] = useState({ label: "", kind: "ollama", baseUrl: "", apiKey: "", defaultModel: "" });
+  const [result, setResult] = useState(null);
+
+  const load = useCallback(async () => {
+    try { setProviders(await session.request("GET", "api/admin/ai/providers")); }
+    catch (err) { setError(err.message); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  async function save(e) {
+    e.preventDefault();
+    setBusy(true); setError(null); setResult(null);
+    try {
+      const out = await session.request("PUT", "api/admin/ai/providers", {
+        label: form.label.trim(),
+        kind: form.kind,
+        baseUrl: form.baseUrl.trim() || null,
+        ...(form.apiKey.trim() ? { apiKey: form.apiKey.trim() } : {}),
+        defaultModel: form.defaultModel.trim() || undefined,
+      });
+      setResult(out);
+      setForm({ label: "", kind: "ollama", baseUrl: "", apiKey: "", defaultModel: "" });
+      await load();
+    } catch (err) { setError(err.message); } finally { setBusy(false); }
+  }
+
+  async function remove(p) {
+    if (!confirm(`Remove "${p.label}"?\n\nHouseholds using it fall back to the local model.`)) return;
+    setBusy(true);
+    try { await session.request("DELETE", `api/admin/ai/providers/${p.id}`); await load(); }
+    catch (err) { setError(err.message); } finally { setBusy(false); }
+  }
+
+  const input = {
+    width: "100%", padding: "9px 11px", borderRadius: 10, marginBottom: 8,
+    border: `1px solid ${T.line}`, background: T.panel, color: T.ink,
+  };
+
+  if (!providers) return <p style={{ color: T.faint }}>Loading…</p>;
+
+  return (
+    <div>
+      {error && <div style={{ ...card, background: "#fdecea", borderColor: "#f0b4ae", color: "#7a1c12" }}>{error}</div>}
+
+      {providers.map((p) => (
+        <div key={p.id} style={{ ...card, display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+          <div>
+            <div style={{ fontWeight: 600, color: T.ink }}>{p.label}</div>
+            <div style={{ fontSize: 12, color: p.isLocal ? "#1e4620" : "#8a5b00" }}>
+              {p.kind}{p.baseUrl ? ` · ${p.baseUrl}` : ""}
+              {p.hasKey ? " · key stored" : ""}
+              {p.isLocal ? " · stays on your hardware" : " · context leaves your network"}
+            </div>
+          </div>
+          {!p.isLocal && <button style={btn(false)} disabled={busy} onClick={() => remove(p)}>Remove</button>}
+        </div>
+      ))}
+
+      <form onSubmit={save} style={card}>
+        <div style={{ fontWeight: 600, color: T.ink, marginBottom: 8 }}>Add a provider</div>
+
+        <input style={input} placeholder="Name households will see" required maxLength={80}
+               value={form.label} onChange={(e) => setForm((f) => ({ ...f, label: e.target.value }))} />
+
+        <select style={input} value={form.kind}
+                onChange={(e) => setForm((f) => ({ ...f, kind: e.target.value }))}>
+          <option value="ollama">Ollama (local or on your network)</option>
+          <option value="anthropic">Claude (Anthropic)</option>
+          <option value="openai">OpenAI, or anything with its API</option>
+        </select>
+
+        <input style={input} placeholder={form.kind === "ollama"
+          ? "http://192.168.1.20:11434 (blank = this server)"
+          : "Base URL (blank = the provider's default)"}
+               value={form.baseUrl} onChange={(e) => setForm((f) => ({ ...f, baseUrl: e.target.value }))} />
+
+        {form.kind !== "ollama" && (
+          <input style={input} type="password" autoComplete="off" placeholder="API key"
+                 value={form.apiKey} onChange={(e) => setForm((f) => ({ ...f, apiKey: e.target.value }))} />
+        )}
+
+        <input style={input} placeholder="Default model (optional)"
+               value={form.defaultModel} onChange={(e) => setForm((f) => ({ ...f, defaultModel: e.target.value }))} />
+
+        <button style={btn(true)} disabled={busy || !form.label.trim()}>
+          {busy ? "Checking…" : "Add provider"}
+        </button>
+
+        {result && (
+          <div style={{ marginTop: 8, fontSize: 13, color: result.isLocal ? "#1e4620" : "#8a5b00" }}>
+            Added.{result.models?.length ? ` ${result.models.length} models available.` : " No model list returned — households can type one in."}
+            {result.warning && <span style={{ display: "block", marginTop: 4 }}>{result.warning}</span>}
+          </div>
+        )}
+      </form>
+
+      <div style={{ ...card, background: "#eef4ee", borderColor: "#bcd4bc" }}>
+        <div style={{ fontWeight: 600, color: "#1e4620", marginBottom: 4 }}>What adding one does</div>
+        <div style={{ fontSize: 13, color: "#3a6b3c" }}>
+          It offers a choice. It does not move anybody's data. Each household selects its own
+          provider, and choosing a non-local one requires that household to confirm that
+          context may leave this machine — recorded against a person and a time. You cannot
+          make that choice for them, deliberately.
+        </div>
+      </div>
     </div>
   );
 }

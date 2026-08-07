@@ -27,6 +27,7 @@ import adminRoutes from "./routes/admin.js";
 import calendarRoutes from "./routes/calendars.js";
 import proposalRoutes from "./routes/proposals.js";
 import homeRoutes from "./routes/home.js";
+import cameraRoutes from "./routes/cameras.js";
 import privacyRoutes from "./routes/privacy.js";
 import integrationRoutes from "./routes/integrations.js";
 import { loadDisplay } from "./routes/displays.js";
@@ -74,10 +75,12 @@ export function createApp() {
   app.use("/api/households", displayRoutes.householdRouter);
   app.use("/api/households/:householdId/integrations", integrationRoutes);
   app.use("/api/households/:householdId/home", homeRoutes.memberRouter);
+  app.use("/api/households/:householdId/cameras", cameraRoutes.memberRouter);
   app.use("/api/display", displayRoutes.publicRouter);
   // The display side of the Home Assistant bridge authenticates with the same
   // permanent token as the rest of /api/display.
   app.use("/api/display/home", loadDisplay, homeRoutes.displayRouter);
+  app.use("/api/display/cameras", loadDisplay, cameraRoutes.displayRouter);
   app.use("/api/ai", aiRoutes);
   app.use("/api/admin", adminRoutes);
 

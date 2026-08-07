@@ -1030,3 +1030,131 @@ test("a non-member cannot enumerate another household's integrations", async () 
   const res = await api("GET", `/api/households/${house.id}/integrations`, { token: other.token });
   assert.equal(res.status, 404);
 });
+
+/* --------------------------------------------------- AI provider choice --- */
+
+test("a household defaults to the local model", async () => {
+  const owner = await register(`aip-${Date.now()}@example.com`, "ai-provider-passphrase");
+  const house = await createHousehold(owner, { householdName: "AI House" });
+
+  const res = await api("GET", `/api/ai/households/${house.id}/provider`, { token: owner.token });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.isLocal, true, "local must be the default");
+  assert.match(res.body.privacy, /nothing leaves/i);
+});
+
+test("choosing a hosted provider without consent falls back to local", async () => {
+  // The property that matters: selecting a provider is not the same as agreeing
+  // that household context may leave the machine.
+  const owner = await register(`aic-${Date.now()}@example.com`, "ai-consent-passphrase");
+  const house = await createHousehold(owner, { householdName: "Consent House" });
+
+  const { rows } = await q(
+    `INSERT INTO ai_providers (label, kind, default_model, is_local, enabled)
+     VALUES ('Test Cloud', 'openai', 'gpt-test', FALSE, TRUE) RETURNING id`
+  );
+  const providerId = rows[0].id;
+
+  // Selected, but consent withheld.
+  const set = await api("PUT", `/api/ai/households/${house.id}/provider`, {
+    token: owner.token, body: { providerId, consent: false },
+  });
+  assert.equal(set.status, 200);
+  assert.equal(set.body.consented, false);
+
+  const after = await api("GET", `/api/ai/households/${house.id}/provider`, { token: owner.token });
+  assert.equal(after.body.isLocal, true, "must fall back to local without consent");
+  assert.equal(after.body.blocked, "consent_required");
+  assert.equal(after.body.selectedLabel, "Test Cloud");
+
+  // With consent it is actually used, and the warning changes.
+  const consented = await api("PUT", `/api/ai/households/${house.id}/provider`, {
+    token: owner.token, body: { providerId, consent: true },
+  });
+  assert.equal(consented.body.consented, true);
+  const live = await api("GET", `/api/ai/households/${house.id}/provider`, { token: owner.token });
+  assert.equal(live.body.isLocal, false);
+  assert.match(live.body.privacy, /leave this machine/i);
+});
+
+test("switching provider clears an earlier consent", async () => {
+  // Agreeing that one company may see your evenings is not agreeing that the
+  // next one somebody picks may.
+  const owner = await register(`ais-${Date.now()}@example.com`, "ai-switch-passphrase");
+  const house = await createHousehold(owner, { householdName: "Switch House" });
+
+  const a = await q(`INSERT INTO ai_providers (label, kind, is_local, enabled)
+                     VALUES ('Cloud A', 'openai', FALSE, TRUE) RETURNING id`);
+  const b = await q(`INSERT INTO ai_providers (label, kind, is_local, enabled)
+                     VALUES ('Cloud B', 'anthropic', FALSE, TRUE) RETURNING id`);
+
+  await api("PUT", `/api/ai/households/${house.id}/provider`, {
+    token: owner.token, body: { providerId: a.rows[0].id, consent: true },
+  });
+  // Switching without re-consenting.
+  await api("PUT", `/api/ai/households/${house.id}/provider`, {
+    token: owner.token, body: { providerId: b.rows[0].id, consent: false },
+  });
+
+  const after = await api("GET", `/api/ai/households/${house.id}/provider`, { token: owner.token });
+  assert.equal(after.body.blocked, "consent_required");
+  assert.equal(after.body.isLocal, true);
+});
+
+test("a non-admin cannot change the household's AI provider", async () => {
+  const owner = await register(`aia-${Date.now()}@example.com`, "ai-admin-passphrase");
+  const outsider = await register(`aio-${Date.now()}@example.com`, "ai-outsider-passphrase");
+  const house = await createHousehold(owner, { householdName: "Locked AI" });
+
+  const res = await api("PUT", `/api/ai/households/${house.id}/provider`, {
+    token: outsider.token, body: { providerId: null, consent: true },
+  });
+  assert.equal(res.status, 404);
+});
+
+test("localness is computed, never taken from the client", async () => {
+  const { computeIsLocal } = await import("../src/services/ai-providers.js");
+  // A hosted API is never local, whatever URL is claimed.
+  assert.equal(computeIsLocal("openai", "http://127.0.0.1:1234"), false);
+  assert.equal(computeIsLocal("anthropic", "http://192.168.1.5"), false);
+  // Ollama on your own network is.
+  assert.equal(computeIsLocal("ollama", "http://192.168.1.20:11434"), true);
+  assert.equal(computeIsLocal("ollama", null), true);
+  // Ollama somewhere on the internet is not.
+  assert.equal(computeIsLocal("ollama", "https://ollama.example.com"), false);
+});
+
+/* ------------------------------------------------------------- cameras --- */
+
+test("cameras are per household and start disconnected", async () => {
+  const a = await register(`cam-a-${Date.now()}@example.com`, "camera-passphrase-a");
+  const b = await register(`cam-b-${Date.now()}@example.com`, "camera-passphrase-b");
+  const houseA = await createHousehold(a, { householdName: "Camera House" });
+
+  const res = await api("GET", `/api/households/${houseA.id}/cameras`, { token: a.token });
+  assert.equal(res.status, 200);
+  assert.equal(res.body.connected, false);
+
+  const cross = await api("GET", `/api/households/${houseA.id}/cameras`, { token: b.token });
+  assert.equal(cross.status, 404);
+});
+
+test("a CamWatch URL pointing at the HouseHub server itself is refused", async () => {
+  const { assertReachableTarget } = await import("../src/services/camwatch.js");
+  for (const url of ["http://127.0.0.1:8000", "http://localhost:4000", "http://169.254.169.254/"]) {
+    await assert.rejects(() => assertReachableTarget(url), /server itself|resolve/i, url);
+  }
+  await assert.doesNotReject(() => assertReachableTarget("http://192.168.1.60:8000"));
+});
+
+test("the camera plugin is listed as an integration", async () => {
+  const owner = await register(`camint-${Date.now()}@example.com`, "camera-integration-pass");
+  const house = await createHousehold(owner, { householdName: "Integrated" });
+
+  const res = await api("GET", `/api/households/${house.id}/integrations`, { token: owner.token });
+  const cw = res.body.integrations.find((i) => i.id === "camwatch");
+  assert.ok(cw, "CamWatch should be offered");
+  assert.equal(cw.status.connected, false);
+  // The manifest must be explicit that no footage is kept here.
+  assert.ok(cw.holds.some((h) => /No footage/i.test(h)));
+});

@@ -24,6 +24,9 @@ import ArchivePanel from "./components/ArchivePanel.jsx";
 import SuperAdminPanel from "./components/SuperAdminPanel.jsx";
 import HomeAssistantPanel from "./components/HomeAssistantPanel.jsx";
 import DisplaysPanel from "./components/DisplaysPanel.jsx";
+import CamerasPanel from "./components/CamerasPanel.jsx";
+import AiPanel from "./components/AiPanel.jsx";
+import SecondBlock, { SecondBlockSettings } from "./components/SecondBlock.jsx";
 import PrivacyPanel from "./components/PrivacyPanel.jsx";
 import * as COMPLETION from "./lib/completion.js";
 
@@ -909,6 +912,7 @@ export default function HouseholdHub() {
       <main className={`flex-1 min-h-0 px-3 md:px-5 ${tab === "today" && !isMobile ? "overflow-hidden pb-3" : "overflow-y-auto pb-6"}`}
         style={{ background: T.bg }}>
         {tab === "today" && (
+          <>
           <TodayView data={data} allEvents={allEvents} now={now} personById={personById}
             todayKey={todayKey} viewKey={viewKey} viewOffset={viewOffset} setViewOffset={setViewOffset}
             filter={filter} inFilter={inFilter} colorFor={colorFor} update={update}
@@ -919,6 +923,11 @@ export default function HouseholdHub() {
             openNote={(n) => setModal({ type: "note", payload: n || {} })}
             gotoBoard={() => setTab("board")}
             openProject={(pr) => setModal({ type: "project", payload: pr || {} })} />
+          {/* Whatever this household actually looks at on the way out of the
+              door: the shopping list, the back garden, the date jar. Chosen per
+              person filter -- see components/SecondBlock.jsx. */}
+          <SecondBlock data={data} update={update} filter={filter} theme={T} />
+          </>
         )}
         {tab === "calendar" && (
           <CalendarView weekDays={weekDays} allEvents={allEvents} personById={personById} colorFor={colorFor}
@@ -5063,6 +5072,15 @@ function SettingsModal({ data, update, syncCalendars, close, currentUser }) {
       </Field>
       <Field label="Home Assistant">
         <HomeAssistantPanel theme={T} />
+      </Field>
+      <Field label="Cameras">
+        <CamerasPanel theme={T} />
+      </Field>
+      <Field label="AI">
+        <AiPanel theme={T} data={data} update={update} />
+      </Field>
+      <Field label="Extra row on Today">
+        <SecondBlockSettings data={data} update={update} theme={T} people={data.people} />
       </Field>
       <Field label="Your data">
         <PrivacyPanel theme={T} data={data} me={currentUser} />

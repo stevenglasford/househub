@@ -79,6 +79,53 @@ export const INTEGRATIONS = [
       };
     },
   },
+  {
+    id: "camwatch",
+    name: "Security cameras (CamWatch)",
+    summary: "Live cameras, alerts and recordings from your own CamWatch instance.",
+
+    grants: [
+      "This server can fetch live streams and snapshots and pass them to your screens",
+      "It can read your alert history, if you enable it",
+      "It can read enrolled faces and recordings, each switched on separately",
+    ],
+    holds: [
+      "The address of your CamWatch, encrypted",
+      "Its password, encrypted — never sent back to a browser",
+      "No footage, no snapshots, no faces, no recordings. Everything is proxied " +
+      "on demand and nothing is written to this server's disk.",
+    ],
+    notes: [
+      "Face data is biometric information and stays on the machine that already " +
+      "holds it. Surfacing it here is off by default and switched on separately.",
+      "A wall display can be shown live cameras but never alerts, faces or " +
+      "recordings — a screen in a hallway listing who came to the door is a " +
+      "different thing from one showing the garden right now.",
+    ],
+
+    basePath: "cameras",
+    settingsComponent: "CamerasPanel",
+    docs: "https://github.com/stevenglasford/househub/blob/main/docs/CAMERAS.md",
+
+    async status(householdId) {
+      const { rows } = await q(
+        `SELECT last_ok_at, last_error, show_faces, show_recordings,
+                jsonb_array_length(cameras) AS camera_count
+           FROM household_cameras WHERE household_id = $1`,
+        [householdId]
+      );
+      if (!rows[0]) return { connected: false };
+      return {
+        connected: true,
+        healthy: !rows[0].last_error,
+        lastOkAt: rows[0].last_ok_at,
+        lastError: rows[0].last_error,
+        cameraCount: rows[0].camera_count,
+        facesSurfaced: rows[0].show_faces,
+        recordingsSurfaced: rows[0].show_recordings,
+      };
+    },
+  },
 ];
 
 export const byId = (id) => INTEGRATIONS.find((i) => i.id === id) || null;

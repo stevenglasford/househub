@@ -462,6 +462,53 @@ export async function generate(kind, context, opts = {}) {
 
 export const aiStatus = () => request("GET", "api/ai/status");
 
+/** Which model this household uses, and whether its context stays local. */
+export const aiProvider = () =>
+  request("GET", `api/ai/households/${state.householdId}/provider`);
+
+export const setAiProvider = (body) =>
+  request("PUT", `api/ai/households/${state.householdId}/provider`, body);
+
+/* -------------------------------------------------------------- cameras --- */
+
+const camBase = () =>
+  state.display ? "api/display/cameras" : `api/households/${state.householdId}/cameras`;
+
+export const cameraConfig = () =>
+  request("GET", `api/households/${state.householdId}/cameras`);
+
+export const testCameras = (body) =>
+  request("POST", `api/households/${state.householdId}/cameras/test`, body);
+
+export const saveCameras = (body) =>
+  request("PUT", `api/households/${state.householdId}/cameras`, body);
+
+export const disconnectCameras = () =>
+  request("DELETE", `api/households/${state.householdId}/cameras`);
+
+export const availableCameras = () =>
+  request("GET", `api/households/${state.householdId}/cameras/available`);
+
+export const listCameras = () => request("GET", `${camBase()}/cameras`);
+export const cameraAlerts = (limit = 50) =>
+  request("GET", `api/households/${state.householdId}/cameras/alerts?limit=${limit}`);
+
+/** Image and stream URLs, carrying the display token when this is a screen. */
+export const cameraSnapshotUrl = (id) =>
+  state.display
+    ? `api/display/cameras/snapshot/${encodeURIComponent(id)}.jpg?token=${encodeURIComponent(state.display.token)}`
+    : `api/households/${state.householdId}/cameras/snapshot/${encodeURIComponent(id)}.jpg`;
+
+export const cameraStreamUrl = (id) =>
+  state.display
+    ? `api/display/cameras/stream/${encodeURIComponent(id)}?token=${encodeURIComponent(state.display.token)}`
+    : `api/households/${state.householdId}/cameras/stream/${encodeURIComponent(id)}`;
+
+/* --------------------------------------------------------- integrations --- */
+
+export const listIntegrations = () =>
+  request("GET", `api/households/${state.householdId}/integrations`);
+
 /* -------------------------------------------------------------- privacy --- */
 
 export const erasurePreview = () => request("GET", "api/privacy/erasure-preview");
