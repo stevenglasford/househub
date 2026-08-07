@@ -27,6 +27,33 @@ export async function loadState() {
   // used to label every one of them "Household". Opening one fixes it.
   session.syncHouseholdName(normalized.householdName);
 
+  // Reconcile the document's calendar list against what the server actually
+  // holds. The two can drift in both directions: a feed added on another device
+  // is not in this document yet, and a feed deleted server-side would otherwise
+  // linger in the list forever.
+  try {
+    const feeds = await listCalendars();
+    const byId = new Map(feeds.map((f) => [f.id, f]));
+    const known = new Map((normalized.calendars || []).map((c) => [c.id, c]));
+
+    normalized.calendars = feeds.map((f) => ({
+      // Names and colours are the household's own and live only here.
+      name: `Calendar`,
+      color: null,
+      personId: "",
+      ...(known.get(f.id) || {}),
+      id: f.id,
+      // Sync state belongs to the server and is refreshed on every load.
+      lastSync: f.last_sync_at,
+      error: f.last_error,
+    }));
+
+    // Anything the document knew about that the server no longer has is gone.
+    for (const c of known.keys()) if (!byId.has(c)) { /* dropped above */ }
+  } catch {
+    // A calendar listing failure must not stop the household loading.
+  }
+
   return normalized;
 }
 
@@ -94,8 +121,36 @@ export const loadCalendarEvents = () =>
     ? session.request("GET", "api/display/calendar-events")
     : session.request("GET", `api/households/${session.householdId()}/calendar-events`);
 
-export const addCalendar = (body) =>
-  session.request("POST", `api/households/${session.householdId()}/calendars`, body);
+/**
+ * Add a calendar feed.
+ *
+ * The split is the important bit. The server holds the subscription URL and the
+ * fetched .ics -- both secrets, both sealed under the server key, because a
+ * browser cannot fetch them itself (CORS). The *name, colour and person* are
+ * household content and stay in the encrypted document, keyed by the id the
+ * server hands back.
+ *
+ * That split was the bug behind "it says it added the calendar but it never
+ * shows up": storage moved to the server, the UI kept reading `data.calendars`
+ * from the document, and nothing ever wrote to it.
+ */
+export async function addCalendar(body) {
+  const res = await session.request(
+    "POST", `api/households/${session.householdId()}/calendars`,
+    body.icsText ? { icsText: body.icsText } : { url: body.url }
+  );
+  return {
+    id: res.id,
+    name: body.name || (body.url ? hostOf(body.url) : "Imported calendar"),
+    color: body.color || null,
+    personId: body.personId || "",
+    imported: Boolean(body.icsText),
+  };
+}
+
+const hostOf = (url) => {
+  try { return new URL(url).hostname.replace(/^www\./, ""); } catch { return "Calendar"; }
+};
 
 export const refreshCalendar = (id) =>
   session.request("POST", `api/households/${session.householdId()}/calendars/${id}/refresh`);

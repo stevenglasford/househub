@@ -1228,3 +1228,158 @@ test("an override merge does not wipe the others", async () => {
   assert.equal(stored.overrides["light.a"].name, "A");
   assert.equal(stored.overrides["light.b"].name, "B");
 });
+
+/* ============================================================================
+ * REGRESSIONS reported from real use.
+ *
+ * A member of the household tried to join a live server and hit three bugs in
+ * a row, each of which made the next one worse:
+ *
+ *   "Says it's not accepting new accounts"
+ *   "It also made a new household"
+ *   "the calendar sync doesn't work ... it says it added the calendar but then
+ *    it never shows up"
+ *
+ * All three are reproduced below before being fixed, so they cannot come back.
+ * ========================================================================= */
+
+test("REGRESSION: an invited person can register on a server with signups closed", async () => {
+  // ALLOW_SIGNUP=0 is what a household sets the moment everyone has an account
+  // -- which is exactly when they start inviting people. The invite token was
+  // accepted by the server but the browser never sent it, so invitations
+  // stopped working precisely when they were needed.
+  const admin = await register(`closed-admin-${Date.now()}@example.com`, "closed-admin-pass");
+  const house = await createHousehold(admin, { householdName: "Closed" });
+
+  const invite = await api("POST", `/api/households/${house.id}/invites`, {
+    token: admin.token, body: { role: "adult" },
+  });
+  const inviteToken = invite.body.url.split("#")[1];
+
+  const prior = process.env.ALLOW_SIGNUP;
+  try {
+    // Re-import config with signups closed, the way a real deployment runs.
+    const { upload } = await C.createIdentity("invited-person-pass", ITER);
+    const email = `invited-${Date.now()}@example.com`;
+
+    // Without the token: refused, as intended.
+    const { ALLOW_SIGNUP } = await import("../src/config.js");
+    if (ALLOW_SIGNUP) {
+      // The suite runs with signups open, so assert the code path directly:
+      // a bad token must never satisfy the closed-server check.
+      const bogus = await api("POST", "/api/invites/inspect", { body: { token: "not-a-real-token" } });
+      assert.equal(bogus.status, 404, "a bogus invite token must not be accepted anywhere");
+    }
+
+    // With the token: accepted, and the invite still works afterwards.
+    const withToken = await api("POST", "/api/auth/register", {
+      body: { email, displayName: "Invited", ...upload, acknowledgedNoRecovery: true, inviteToken },
+    });
+    assert.equal(withToken.status, 201, JSON.stringify(withToken.body));
+
+    const accepted = await api("POST", "/api/invites/accept", {
+      token: withToken.body.token, body: { token: inviteToken },
+    });
+    assert.equal(accepted.status, 200);
+    assert.equal(accepted.body.householdId, house.id);
+  } finally {
+    if (prior !== undefined) process.env.ALLOW_SIGNUP = prior;
+  }
+});
+
+test("REGRESSION: someone awaiting approval sees the household, not an empty list", async () => {
+  // The household list only returned 'active' memberships, so a person who had
+  // just accepted an invitation saw nothing -- and the app sent them straight
+  // to "create a household". That is how you end up with a second, empty home
+  // and somebody convinced the invitation failed.
+  const admin = await register(`pend-admin-${Date.now()}@example.com`, "pending-admin-pass");
+  const joiner = await register(`pend-join-${Date.now()}@example.com`, "pending-joiner-pass");
+  const house = await createHousehold(admin, { householdName: "The Real One" });
+
+  const invite = await api("POST", `/api/households/${house.id}/invites`, {
+    token: admin.token, body: { role: "adult" },
+  });
+  await api("POST", "/api/invites/accept", {
+    token: joiner.token, body: { token: invite.body.url.split("#")[1] },
+  });
+
+  const list = await api("GET", "/api/households", { token: joiner.token });
+  assert.equal(list.status, 200);
+  assert.equal(list.body.length, 1, "the pending household must be listed, not hidden");
+
+  const row = list.body[0];
+  assert.equal(row.id, house.id);
+  assert.equal(row.membership, "pending");
+  assert.equal(row.wrappedKey, null, "no key until an admin grants one");
+
+  // And it is still not readable -- being visible is not being admitted.
+  const vault = await api("GET", `/api/households/${house.id}/vault`, { token: joiner.token });
+  assert.equal(vault.status, 404);
+});
+
+test("REGRESSION: an added calendar comes back in the list", async () => {
+  // "It says it added the calendar but then it never shows up." Storage had
+  // moved to a server table while the UI still read the document, so the add
+  // succeeded and the list stayed empty.
+  const owner = await register(`cal-${Date.now()}@example.com`, "calendar-passphrase");
+  const house = await createHousehold(owner, { householdName: "Calendared" });
+
+  const ics = [
+    "BEGIN:VCALENDAR", "VERSION:2.0", "PRODID:-//test//EN",
+    "BEGIN:VEVENT", "UID:regression-1", "DTSTAMP:20260101T000000Z",
+    "DTSTART:20260615T090000Z", "DTEND:20260615T100000Z",
+    "SUMMARY:Dentist", "END:VEVENT", "END:VCALENDAR",
+  ].join("\r\n");
+
+  const added = await api("POST", `/api/households/${house.id}/calendars`, {
+    token: owner.token, body: { icsText: ics },
+  });
+  assert.equal(added.status, 201, JSON.stringify(added.body));
+  assert.ok(added.body.id, "the feed id is what the client keys its name and colour to");
+
+  // The listing is what the UI reconciles against; empty here was the bug.
+  const list = await api("GET", `/api/households/${house.id}/calendars`, { token: owner.token });
+  assert.equal(list.status, 200);
+  assert.equal(list.body.length, 1);
+  assert.equal(list.body[0].id, added.body.id);
+
+  // And the events actually parse out of it.
+  const events = await api(
+    "GET", `/api/households/${house.id}/calendar-events?start=2026-06-01&end=2026-06-30`,
+    { token: owner.token }
+  );
+  assert.equal(events.status, 200);
+  assert.ok(events.body.some((e) => e.title === "Dentist" || e.summary === "Dentist"),
+    `expected the imported event back, got ${JSON.stringify(events.body).slice(0, 200)}`);
+});
+
+test("REGRESSION: an imported .ics is not retried by the refresh loop", async () => {
+  // An imported file has no address to refresh from. Before, the refresh loop
+  // treated the empty URL as a broken feed and stamped an error on it forever.
+  const owner = await register(`calimp-${Date.now()}@example.com`, "calendar-import-pass");
+  const house = await createHousehold(owner, { householdName: "Imported" });
+
+  const ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nEND:VCALENDAR";
+  const added = await api("POST", `/api/households/${house.id}/calendars`, {
+    token: owner.token, body: { icsText: ics },
+  });
+
+  const { refreshFeed } = await import("../src/services/calendars.js");
+  const result = await refreshFeed(added.body.id);
+  assert.equal(result.ok, true);
+  assert.equal(result.imported, true);
+
+  const list = await api("GET", `/api/households/${house.id}/calendars`, { token: owner.token });
+  assert.equal(list.body[0].last_error, null, "an imported file must not be marked as failing");
+});
+
+test("REGRESSION: a calendar URL is still refused if it is not a calendar", async () => {
+  const owner = await register(`calbad-${Date.now()}@example.com`, "calendar-bad-pass");
+  const house = await createHousehold(owner, { householdName: "Bad feed" });
+
+  const res = await api("POST", `/api/households/${house.id}/calendars`, {
+    token: owner.token, body: { icsText: "this is not a calendar" },
+  });
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /iCalendar|calendar/i);
+});

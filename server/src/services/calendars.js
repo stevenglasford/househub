@@ -16,6 +16,27 @@ import { safeFetch, BlockedRequestError } from "./safe-fetch.js";
 import { parseICS, expandEvents } from "./ics.js";
 import { REFRESH_MINUTES } from "../config.js";
 
+/**
+ * Add a feed from raw iCalendar text.
+ *
+ * The original app let people import a downloaded .ics file, which is the only
+ * option for a calendar that has no subscribable address. There is nothing to
+ * refresh, so it is stored once and never re-fetched.
+ */
+export async function addFeedFromText(householdId, icsText) {
+  if (!/BEGIN:VCALENDAR/i.test(icsText)) {
+    throw new Error("That file is not an iCalendar (.ics) file");
+  }
+  const { rows } = await q(
+    `INSERT INTO calendar_feeds (household_id, url_enc, ics_enc, last_sync_at)
+     VALUES ($1, $2, $3, now()) RETURNING id`,
+    // No URL to store: an imported file has nowhere to refresh from. The empty
+    // marker is what refreshDueFeeds uses to skip it.
+    [householdId, seal("calendarUrl", "", householdId), seal("calendarIcs", icsText, householdId)]
+  );
+  return rows[0].id;
+}
+
 /** Add a feed. Returns the row id; the URL is never echoed back. */
 export async function addFeed(householdId, url) {
   // Fetch once before storing, so a typo or an unreachable host is an immediate
@@ -56,6 +77,8 @@ export async function refreshFeed(id) {
   if (!rows[0]) return { ok: false, error: "not found" };
 
   const url = openText("calendarUrl", rows[0].url_enc, rows[0].household_id);
+  // Imported files have no address to refresh from.
+  if (!url) return { ok: true, imported: true };
   try {
     const text = await safeFetch(url);
     await q(

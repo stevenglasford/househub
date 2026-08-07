@@ -27,7 +27,7 @@ function HouseholdRow({ hh, onOpen, onArchive, onDelete, busy }) {
   const [menu, setMenu] = useState(false);
 
   const subtitle = hh.pendingApproval
-    ? "Waiting for an admin to grant you access"
+    ? "Waiting for an admin to let you in — ask them to check your key fingerprint"
     : [
         hh.role,
         `${hh.memberCount} ${hh.memberCount === 1 ? "person" : "people"}`,
@@ -212,6 +212,9 @@ export default function Shell() {
         await session.openHousehold(usable[0].id);
         return setStage("ready");
       }
+      // Somebody waiting on an admin has a household -- they just cannot open
+      // it yet. Sending them to "create a household" is how you end up with a
+      // second, empty home and a confused person.
       setStage(list.length ? "pick" : "create");
     } catch (err) {
       if (err.status === 401) setStage("signin");

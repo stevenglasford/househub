@@ -56,7 +56,7 @@ export const Problem = ({ children }) =>
  * `chrome={false}` renders just the form, for embedding inside another card --
  * which is how the invite page uses it.
  */
-export function SignIn({ onDone, allowSignup = true, chrome = true, startMode = "in", intro }) {
+export function SignIn({ onDone, allowSignup = true, chrome = true, startMode = "in", intro, inviteToken }) {
   const [mode, setMode] = useState(startMode);
   const [form, setForm] = useState({ email: "", password: "", confirm: "", displayName: "", totp: "" });
   const [needsTotp, setNeedsTotp] = useState(false);
@@ -88,7 +88,12 @@ export function SignIn({ onDone, allowSignup = true, chrome = true, startMode = 
     setBusy(true);
     try {
       if (mode === "up") {
-        await session.register({ email: form.email, password: form.password, displayName: form.displayName });
+        await session.register({
+          email: form.email, password: form.password, displayName: form.displayName,
+          // Present when signing up from an invitation, which is what lets this
+          // work on a server that has closed public registration.
+          inviteToken,
+        });
       } else {
         await session.signIn({ email: form.email, password: form.password, totp: form.totp || undefined });
       }

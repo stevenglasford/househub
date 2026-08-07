@@ -124,7 +124,7 @@ router.post("/",
 router.get("/", requireAuth, wrap(async (req, res) => {
   const { rows } = await q(
     `SELECT h.id, h.name_enc, h.key_epoch, h.status, h.created_at,
-            m.role, m.joined_at, m.archived_at,
+            m.role, m.joined_at, m.archived_at, m.status AS member_status,
             k.wrapped_key, k.wrap_epk,
             v.version, v.updated_at AS vault_updated_at,
             (SELECT count(*)::int FROM household_members mm
@@ -135,7 +135,7 @@ router.get("/", requireAuth, wrap(async (req, res) => {
          ON k.household_id = h.id AND k.subject_type = 'user'
         AND k.subject_id = m.user_id AND k.key_epoch = h.key_epoch
        LEFT JOIN vault_documents v ON v.household_id = h.id
-      WHERE m.user_id = $1 AND m.status = 'active' AND h.status <> 'closed'
+      WHERE m.user_id = $1 AND m.status IN ('active', 'pending') AND h.status <> 'closed'
       ORDER BY m.archived_at NULLS FIRST, v.updated_at DESC NULLS LAST`,
     [req.user.id]
   );
@@ -143,6 +143,11 @@ router.get("/", requireAuth, wrap(async (req, res) => {
   res.json(rows.map((r) => ({
     id: r.id,
     role: r.role,
+    // Pending members are included deliberately. Excluding them meant somebody
+    // who had just accepted an invitation saw an empty list and was pushed
+    // straight into "create a household" -- so they made a second, empty home
+    // instead of waiting to be admitted to the one they were invited to.
+    membership: r.member_status,
     keyEpoch: r.key_epoch,
     status: r.status,
     archived: Boolean(r.archived_at),

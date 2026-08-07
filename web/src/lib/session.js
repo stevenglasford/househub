@@ -86,7 +86,7 @@ export async function request(method, path, body) {
 
 /* --------------------------------------------------------------- signing --- */
 
-export async function register({ email, password, displayName }) {
+export async function register({ email, password, displayName, inviteToken }) {
   const cfg = await request("GET", "api/config");
   const { upload, keys } = await C.createIdentity(password, cfg.kdfIterations || 650000);
   const res = await request("POST", "api/auth/register", {
@@ -94,6 +94,10 @@ export async function register({ email, password, displayName }) {
     // The form will not submit without this ticked; sent so the server can
     // record when they were told.
     acknowledgedNoRecovery: true,
+    // A closed server still admits somebody holding a valid invitation. Without
+    // this the invite flow was unusable the moment ALLOW_SIGNUP was turned off,
+    // which is exactly when a household starts inviting people.
+    ...(inviteToken ? { inviteToken } : {}),
   });
 
   state.token = res.token;
@@ -169,8 +173,10 @@ export async function listHouseholds() {
       ...h,
       name,
       unlockable,
-      // No wrapped key at all means an admin has not finished admitting us yet.
-      pendingApproval: !h.wrappedKey,
+      // Either the membership is still pending, or it is active but no admin
+      // has wrapped the household key to us yet. Both mean "you cannot open
+      // this one, and that is not your fault".
+      pendingApproval: h.membership === "pending" || !h.wrappedKey,
     };
   }));
 }
@@ -294,6 +300,34 @@ export async function saveVault(doc, { onConflict } = {}) {
     return saveVault(await onConflict(doc, theirs), { onConflict });
   }
 }
+
+/**
+ * Restore an earlier revision.
+ *
+ * Done here rather than on the server because the document's version is bound
+ * into its AEAD associated data: ciphertext sealed at version 8 cannot simply be
+ * stored as version 11, and only something holding the key can re-seal it. That
+ * binding is what prevents a silent rollback by anybody with database access.
+ *
+ * The result is an ordinary forward write, so restoring is itself undoable.
+ */
+export async function restoreRevision(version) {
+  if (!state.householdKey) throw new Error("The household is locked.");
+
+  const rev = await request("GET", `api/households/${state.householdId}/vault/revisions/${version}`);
+  const doc = await C.openDocument(state.householdKey, {
+    ciphertext: rev.ciphertext,
+    compression: rev.compression,
+    ...docContext(Number(rev.version)),
+  });
+
+  // Saved as the next version, through the normal path -- which also means the
+  // current document is archived as a revision first.
+  return saveVault(doc);
+}
+
+export const listRevisions = () =>
+  request("GET", `api/households/${state.householdId}/vault/revisions`);
 
 /** Cheap poll for other devices' changes. */
 export async function remoteVersion() {

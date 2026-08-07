@@ -7,7 +7,7 @@ import { z } from "zod";
 import { wrap, badRequest, notFound } from "../middleware/errors.js";
 import { limit } from "../middleware/ratelimit.js";
 import { requireAuth, loadHousehold, atLeast, requireWritable } from "../middleware/auth.js";
-import { addFeed, removeFeed, listFeeds, refreshFeed, eventsFor } from "../services/calendars.js";
+import { addFeed, addFeedFromText, removeFeed, listFeeds, refreshFeed, eventsFor } from "../services/calendars.js";
 import { BlockedRequestError } from "../services/safe-fetch.js";
 import { audit } from "../services/audit.js";
 
@@ -29,10 +29,22 @@ router.post("/:householdId/calendars",
   // endpoint an attacker would use to turn the server into a port scanner.
   limit("calendar-add", { capacity: 10, perSecond: 0.05, by: "household" }),
   wrap(async (req, res) => {
-    const { url } = parse(z.object({ url: z.string().url().max(2048) }), req.body);
+    // Either a subscription URL or the contents of a downloaded .ics file.
+    const body = parse(z.object({
+      url: z.string().url().max(2048).optional(),
+      icsText: z.string().max(5_000_000).optional(),
+    }).refine((v) => v.url || v.icsText, { message: "Give a calendar URL or an .ics file" }), req.body);
+
     try {
-      const id = await addFeed(req.household.id, url);
-      await audit("calendar_added", { householdId: req.household.id, actorUserId: req.user.id, target: id });
+      const id = body.url
+        ? await addFeed(req.household.id, body.url)
+        : await addFeedFromText(req.household.id, body.icsText);
+      await audit("calendar_added", {
+        householdId: req.household.id, actorUserId: req.user.id, target: id,
+        meta: { kind: body.url ? "url" : "file" },
+      });
+      // The id is what the client stores alongside its own name and colour for
+      // this feed, inside the encrypted document.
       res.status(201).json({ id });
     } catch (err) {
       if (err instanceof BlockedRequestError) throw badRequest(err.message);

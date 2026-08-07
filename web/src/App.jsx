@@ -5553,7 +5553,10 @@ function CalendarSettings({ data, update, syncCalendars }) {
       const text = String(reader.result || "");
       setBusy(true); setMsg(null);
       try {
-        await addCalendar({ icsText: text, name: file.name.replace(/\.ics$/i, "") });
+        const added = await addCalendar({ icsText: text, name: file.name.replace(/\.ics$/i, "") });
+        // The server owns the feed; its name and colour are household content
+        // and belong in the encrypted document.
+        update((d) => ({ ...d, calendars: [...(d.calendars || []), added] }));
         await syncCalendars();
         setMsg({ ok: true, t: "Calendar imported." });
       } catch (err) {
@@ -5569,7 +5572,8 @@ function CalendarSettings({ data, update, syncCalendars }) {
     if (!url.trim()) return;
     setBusy(true); setMsg(null);
     try {
-      await addCalendar({ url: url.trim() });
+      const added = await addCalendar({ url: url.trim() });
+      update((d) => ({ ...d, calendars: [...(d.calendars || []), added] }));
       await syncCalendars();
       setUrl("");
       setMsg({ ok: true, t: "Subscribed. The server re-checks this feed every 15 minutes." });
@@ -5595,6 +5599,7 @@ function CalendarSettings({ data, update, syncCalendars }) {
     setBusy(true);
     try {
       await deleteCalendar(id);
+      update((d) => ({ ...d, calendars: (d.calendars || []).filter((c) => c.id !== id) }));
       await syncCalendars();
     } catch (err) {
       setMsg({ ok: false, t: err.message });

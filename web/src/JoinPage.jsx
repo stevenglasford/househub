@@ -111,6 +111,7 @@ export default function JoinPage() {
           chrome={false}
           startMode="up"
           onDone={afterAuth}
+          inviteToken={token}
           intro={
             <p className="text-sm text-slate-400 mb-5">
               You would join as <strong className="text-slate-200">{invite.role}</strong>.

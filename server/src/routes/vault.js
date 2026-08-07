@@ -221,47 +221,31 @@ router.get("/:householdId/vault/revisions/:version",
 );
 
 /**
- * Restore is a forward write, not a rewind: it copies an old revision to a new
- * version. Nothing is destroyed, so an accidental restore is itself undoable.
+ * Restoring an old revision is a CLIENT operation, deliberately.
+ *
+ * There used to be a server-side endpoint here that copied an old revision's
+ * ciphertext to a new version number. It produced a document nobody could open.
+ *
+ * The reason is the rollback protection: `sealDocument` binds the version into
+ * the AEAD's associated data, so ciphertext sealed at version 8 fails its
+ * integrity check the moment it is stored as version 11. That binding is what
+ * stops somebody with database access silently reverting a household to an
+ * earlier state, and it is worth keeping -- so the fix is not to loosen it.
+ *
+ * Instead the client does what only it can:
+ *
+ *   1. GET /vault/revisions/:version   -- the old ciphertext
+ *   2. open it, using that version in the AAD
+ *   3. re-seal it at the current version + 1
+ *   4. PUT it as an ordinary write
+ *
+ * The result is a normal forward write: nothing is destroyed, the restore is
+ * itself undoable, and the version binding holds throughout. lib/session.js
+ * exposes this as `restoreRevision`.
+ *
+ * Found by test/journeys.test.js, which restored a revision and then tried to
+ * read it back -- which is the only way this surfaces, since the write itself
+ * succeeds perfectly happily.
  */
-router.post("/:householdId/vault/revisions/:version/restore",
-  requireAuth, loadHousehold(), requireRole("admin"), requireWritable,
-  wrap(async (req, res) => {
-    const result = await tx(async ({ q: query }) => {
-      const { rows } = await query(
-        `SELECT ciphertext, compression, key_epoch FROM vault_revisions
-          WHERE household_id = $1 AND version = $2`,
-        [req.household.id, req.params.version]
-      );
-      if (!rows[0]) throw notFound();
-      if (rows[0].key_epoch !== req.household.keyEpoch) {
-        throw conflict("That revision predates the current household key.");
-      }
-
-      await query(
-        `INSERT INTO vault_revisions (household_id, key_epoch, version, ciphertext, compression, updated_by)
-         SELECT household_id, key_epoch, version, ciphertext, compression, updated_by
-           FROM vault_documents WHERE household_id = $1
-         ON CONFLICT (household_id, version) DO NOTHING`,
-        [req.household.id]
-      );
-
-      const { rows: updated } = await query(
-        `UPDATE vault_documents
-            SET version = version + 1, ciphertext = $2, compression = $3,
-                updated_by = $4, updated_at = now()
-          WHERE household_id = $1 RETURNING version`,
-        [req.household.id, rows[0].ciphertext, rows[0].compression, req.user.id]
-      );
-      return { version: Number(updated[0].version) };
-    });
-
-    await audit("vault_restored", {
-      householdId: req.household.id, actorUserId: req.user.id,
-      meta: { from: Number(req.params.version), to: result.version },
-    });
-    res.json(result);
-  })
-);
 
 export default router;

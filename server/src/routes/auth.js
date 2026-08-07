@@ -162,8 +162,23 @@ router.post("/register",
 
     // A closed instance still accepts registrations that carry a valid invite,
     // so a family can be added to a private server without opening it up.
-    if (!ALLOW_SIGNUP && !body.inviteToken) {
-      throw badRequest("This server is not accepting new accounts");
+    //
+    // The token is verified here rather than merely being present: otherwise
+    // "closed registration" would be defeated by sending any string at all.
+    if (!ALLOW_SIGNUP) {
+      const valid = body.inviteToken && (await q(
+        `SELECT 1 FROM invites
+          WHERE token_hash = $1 AND revoked_at IS NULL
+            AND claimed_by IS NULL AND expires_at > now()`,
+        [hashToken(body.inviteToken)]
+      )).rowCount > 0;
+
+      if (!valid) {
+        throw badRequest(
+          "This server is not accepting new accounts. If you were invited, open the " +
+          "invitation link you were sent rather than signing up directly."
+        );
+      }
     }
 
     // X25519 public keys are exactly 32 bytes. Anything else is a client bug or
