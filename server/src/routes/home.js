@@ -1,30 +1,37 @@
-// home.js — the Home Assistant bridge, for members and for displays.
+// home.js — the Home Assistant bridge: setup, reading, and control.
 //
-// Reading state is uncontroversial and available to both. Controlling something
-// is split by consequence, which is the part worth being deliberate about:
+// Configuration is per household. It used to be two server-wide environment
+// variables, which meant every household on a shared server saw the same house.
+//
+// Control is split by consequence rather than switched on wholesale:
 //
 //   light, switch, fan, cover   a display may operate these, if granted
 //   lock                        signed-in members only, always, no exceptions
 //
-// The lock rule is enforced here against the caller rather than by the
-// display's capability list, so there is no configuration -- and no future
-// well-meaning patch to that list -- that can put the front door on a screen in
-// the hallway. A wall tablet that can unlock the front door is a keypad with no
-// code, mounted next to the thing it opens.
+// The lock rule is checked against the *caller*, not against the display's
+// stored capability list, so no configuration -- and no future well-meaning
+// patch to that list -- can put the front door on a screen mounted next to it.
+// A wall tablet that can unlock the front door is a keypad with no code.
 //
-// Everything a display can do is still bounded by its granted domains, its
-// expiry, and revocation.
+// Authorisation is always decided before configuration is consulted. Otherwise
+// the lock refusal quietly becomes "Home Assistant is not set up" on a server
+// without it, and the rule looks like it is working while never being reached.
 
 import express from "express";
 import { z } from "zod";
 
+import { q } from "../db/pool.js";
 import { wrap, badRequest, forbidden, notFound, ApiError } from "../middleware/errors.js";
 import { limit } from "../middleware/ratelimit.js";
-import { requireAuth, loadHousehold, atLeast } from "../middleware/auth.js";
+import { requireAuth, loadHousehold, requireRole, atLeast, requireWritable } from "../middleware/auth.js";
+import { seal, openText } from "../crypto/seal.js";
 import * as ha from "../services/homeassistant.js";
 import { audit } from "../services/audit.js";
 
-export const memberRouter = express.Router();
+// mergeParams, because this router is mounted under
+// /api/households/:householdId/home -- without it, loadHousehold() sees no
+// householdId and every request 404s.
+export const memberRouter = express.Router({ mergeParams: true });
 export const displayRouter = express.Router();
 
 const parse = (schema, body) => {
@@ -38,89 +45,242 @@ const controlSchema = z.object({
   action: z.enum(["on", "off", "toggle"]).default("toggle"),
 });
 
-function ensureConfigured() {
-  if (!ha.isConfigured()) {
-    throw new ApiError(503, "ha_unconfigured", "Home Assistant is not set up on this server");
+/**
+ * Load a household's connection and unseal it.
+ *
+ * Returns null when the household has not connected Home Assistant, which is
+ * the ordinary case and not an error -- the Home tab simply does not appear.
+ */
+async function connectionFor(householdId) {
+  const { rows } = await q(
+    `SELECT url_enc, token_enc, dashboard_enc, entities, control_enabled
+       FROM household_home_assistant WHERE household_id = $1`,
+    [householdId]
+  );
+  if (!rows[0]) return null;
+  try {
+    return {
+      url: openText("haUrl", rows[0].url_enc, householdId),
+      token: openText("haToken", rows[0].token_enc, householdId),
+      dashboard: rows[0].dashboard_enc ? openText("haDashboard", rows[0].dashboard_enc, householdId) : null,
+      entities: rows[0].entities || [],
+      controlEnabled: rows[0].control_enabled,
+    };
+  } catch {
+    // Sealed under a server key that no longer opens it. Treat as unconfigured
+    // rather than failing every request in the household.
+    return null;
   }
 }
 
-/* =============================================================== members === */
+const required = (conn) => {
+  if (!conn) throw new ApiError(503, "ha_unconfigured", "Home Assistant is not connected for this household");
+  return conn;
+};
 
-memberRouter.get("/status", requireAuth, wrap(async (req, res) => {
-  if (!ha.isConfigured()) return res.json({ configured: false });
-  try {
-    await ha.ping();
-    res.json({ configured: true, reachable: true, memberOnlyDomains: ha.MEMBER_ONLY_DOMAINS });
-  } catch (err) {
-    res.json({ configured: true, reachable: false, error: err.message });
-  }
-}));
+/* ============================================================ setup ======= */
 
-memberRouter.get("/entities", requireAuth, loadHousehold(), wrap(async (req, res) => {
-  ensureConfigured();
-  const only = req.query.only ? String(req.query.only).split(",").slice(0, 200) : null;
-  res.json(await ha.getStates({ only, allDomains: req.query.all === "1" }));
-}));
+/** Whether it is connected, and what the household chose to show. */
+memberRouter.get("/", requireAuth, loadHousehold(), wrap(async (req, res) => {
+  const { rows } = await q(
+    `SELECT entities, control_enabled, last_ok_at, last_error, dashboard_enc, url_enc
+       FROM household_home_assistant WHERE household_id = $1`,
+    [req.household.id]
+  );
+  if (!rows[0]) return res.json({ connected: false });
 
-memberRouter.get("/camera/:entityId.jpg", requireAuth, loadHousehold(), wrap(async (req, res) => {
-  ensureConfigured();
-  const snap = await ha.getSnapshot(req.params.entityId);
-  if (!snap) throw notFound("No image from that camera");
-  res.type(snap.type || "image/jpeg").send(snap.buf);
+  res.json({
+    connected: true,
+    // The URL is shown back so somebody can see which instance is connected;
+    // the token never is, under any circumstances.
+    url: (() => { try { return openText("haUrl", rows[0].url_enc, req.household.id); } catch { return null; } })(),
+    dashboardUrl: rows[0].dashboard_enc
+      ? (() => { try { return openText("haDashboard", rows[0].dashboard_enc, req.household.id); } catch { return null; } })()
+      : null,
+    entities: rows[0].entities || [],
+    controlEnabled: rows[0].control_enabled,
+    lastOkAt: rows[0].last_ok_at,
+    lastError: rows[0].last_error,
+    memberOnlyDomains: ha.MEMBER_ONLY_DOMAINS,
+    displayControllable: ha.DISPLAY_CONTROLLABLE,
+  });
 }));
 
 /**
- * Control anything Home Assistant exposes, including locks.
+ * Try a URL and token without saving them.
  *
- * A signed-in member with at least adult access. Dependants and viewers are
- * excluded: a child's account should not be unlocking the front door, and a
- * read-only member is read-only.
+ * Setup fails often -- wrong port, wrong protocol, a token pasted with a
+ * newline -- and a "test" button that reports what it actually found turns a
+ * frustrating half hour into thirty seconds.
+ */
+memberRouter.post("/test",
+  requireAuth, loadHousehold(), requireRole("admin"),
+  limit("ha-test", { capacity: 20, perSecond: 0.1, by: "household" }),
+  wrap(async (req, res) => {
+    const body = parse(z.object({
+      url: z.string().url().max(500),
+      token: z.string().min(20).max(4000),
+    }), req.body);
+
+    try {
+      res.json(await ha.testConnection({ url: body.url.trim(), token: body.token.trim() }));
+    } catch (err) {
+      // A failed test is expected, not exceptional. 200 with ok:false so the UI
+      // can show the reason inline instead of an error page.
+      res.json({ ok: false, error: err.message });
+    }
+  })
+);
+
+memberRouter.put("/",
+  requireAuth, loadHousehold(), requireRole("admin"), requireWritable,
+  limit("ha-configure", { capacity: 20, perSecond: 0.05, by: "household" }),
+  wrap(async (req, res) => {
+    const body = parse(z.object({
+      url: z.string().url().max(500),
+      // Omitted when only the entity selection is changing, so nobody has to
+      // paste a long-lived token again to tick a checkbox.
+      token: z.string().min(20).max(4000).optional(),
+      dashboardUrl: z.string().url().max(500).nullable().optional(),
+      entities: z.array(z.string().max(120)).max(200).optional(),
+      controlEnabled: z.boolean().optional(),
+    }), req.body);
+
+    const url = body.url.trim();
+    await ha.assertReachableTarget(url).catch((e) => { throw badRequest(e.message); });
+
+    const existing = await connectionFor(req.household.id);
+    const token = body.token?.trim() || existing?.token;
+    if (!token) throw badRequest("An access token is needed the first time you connect");
+
+    // Verified before storing: a saved-but-broken integration is worse than no
+    // integration, because it looks connected.
+    try {
+      await ha.testConnection({ url, token });
+    } catch (err) {
+      throw badRequest(`Could not connect: ${err.message}`);
+    }
+
+    await q(
+      `INSERT INTO household_home_assistant
+         (household_id, url_enc, token_enc, dashboard_enc, entities, control_enabled,
+          configured_by, last_ok_at, last_error, updated_at)
+       VALUES ($1,$2,$3,$4,$5::jsonb,$6,$7, now(), NULL, now())
+       ON CONFLICT (household_id) DO UPDATE SET
+         url_enc        = EXCLUDED.url_enc,
+         token_enc      = EXCLUDED.token_enc,
+         dashboard_enc  = COALESCE(EXCLUDED.dashboard_enc, household_home_assistant.dashboard_enc),
+         entities       = COALESCE(EXCLUDED.entities, household_home_assistant.entities),
+         control_enabled = EXCLUDED.control_enabled,
+         configured_by  = EXCLUDED.configured_by,
+         last_ok_at     = now(), last_error = NULL, updated_at = now()`,
+      [
+        req.household.id,
+        seal("haUrl", url, req.household.id),
+        seal("haToken", token, req.household.id),
+        body.dashboardUrl ? seal("haDashboard", body.dashboardUrl, req.household.id) : null,
+        body.entities ? JSON.stringify(body.entities) : null,
+        body.controlEnabled ?? false,
+        req.user.id,
+      ]
+    );
+    ha.invalidate(req.household.id);
+
+    await audit("ha_configured", {
+      householdId: req.household.id, actorUserId: req.user.id,
+      meta: { entities: body.entities?.length ?? null, control: body.controlEnabled ?? false },
+    });
+    res.json({ ok: true });
+  })
+);
+
+memberRouter.delete("/",
+  requireAuth, loadHousehold(), requireRole("admin"),
+  wrap(async (req, res) => {
+    await q("DELETE FROM household_home_assistant WHERE household_id = $1", [req.household.id]);
+    ha.invalidate(req.household.id);
+    await audit("ha_disconnected", { householdId: req.household.id, actorUserId: req.user.id });
+    res.json({
+      ok: true,
+      note: "The access token has been deleted from this server. Revoke it in Home Assistant too.",
+    });
+  })
+);
+
+/** Everything available, for the entity picker. */
+memberRouter.get("/entities/all",
+  requireAuth, loadHousehold(), requireRole("admin"),
+  limit("ha-list", { capacity: 30, perSecond: 0.2, by: "household" }),
+  wrap(async (req, res) => {
+    const conn = required(await connectionFor(req.household.id));
+    res.json(await ha.listEntities(conn, { all: req.query.all === "1" }));
+  })
+);
+
+/* =========================================================== members ====== */
+
+memberRouter.get("/entities", requireAuth, loadHousehold(), wrap(async (req, res) => {
+  const conn = required(await connectionFor(req.household.id));
+  res.json(await ha.getStates(conn, req.household.id, conn.entities));
+}));
+
+memberRouter.get("/camera/:entityId.jpg", requireAuth, loadHousehold(), wrap(async (req, res) => {
+  const conn = required(await connectionFor(req.household.id));
+  if (conn.entities.length && !conn.entities.includes(req.params.entityId)) {
+    throw forbidden("That camera is not one this household has chosen to show");
+  }
+  const snap = await ha.getSnapshot(conn, req.household.id, req.params.entityId);
+  if (!snap) throw notFound("No image from that camera");
+  res.type(snap.type).send(snap.buf);
+}));
+
+/**
+ * Control anything, including locks.
+ *
+ * Adult or admin only. A dependant's account should not be unlocking the front
+ * door, and a viewer is read-only.
  */
 memberRouter.post("/control",
-  requireAuth, loadHousehold(), atLeast("adult"),
+  requireAuth, loadHousehold(), atLeast("adult"), requireWritable,
   limit("ha-control", { capacity: 60, perSecond: 0.5, by: "user" }),
   wrap(async (req, res) => {
     const body = parse(controlSchema, req.body);
     if (!ha.isControllable(body.entityId)) {
       throw badRequest("That kind of device cannot be switched from HouseHub");
     }
-    ensureConfigured();
+
+    const conn = required(await connectionFor(req.household.id));
+    if (!conn.controlEnabled) {
+      throw forbidden("Control is switched off for this household. An admin can enable it.");
+    }
 
     try {
-      const out = await ha.callService(body.entityId, body.action);
-      // Locks are logged individually: who opened the door and when is worth
+      const out = await ha.callService(conn, req.household.id, body.entityId, body.action);
+      // Locks get their own action name: who opened the door and when is worth
       // being able to answer later.
-      await audit(
-        ha.MEMBER_ONLY_DOMAINS.includes(out.domain) ? "ha_lock_operated" : "ha_controlled",
-        {
-          householdId: req.household.id, actorUserId: req.user.id,
-          target: body.entityId, meta: { action: body.action, via: "member" },
-        }
-      );
+      await audit(ha.MEMBER_ONLY_DOMAINS.includes(out.domain) ? "ha_lock_operated" : "ha_controlled", {
+        householdId: req.household.id, actorUserId: req.user.id,
+        target: body.entityId, meta: { action: body.action, via: "member" },
+      });
       res.json(out);
     } catch (err) {
+      await q("UPDATE household_home_assistant SET last_error = $2 WHERE household_id = $1",
+        [req.household.id, err.message.slice(0, 300)]);
       throw new ApiError(502, "ha_failed", err.message);
     }
   })
 );
 
-/* ============================================================== displays === */
+/* ========================================================== displays ====== */
 
-/**
- * The read side for a screen: state and camera stills.
- *
- * Deliberately open to anyone standing in front of the tablet -- checking
- * whether the dogs are in the garden is the ordinary use, and requiring a login
- * for it would mean nobody ever uses the screen.
- */
 displayRouter.get("/entities",
   limit("display-ha-entities", { capacity: 120, perSecond: 1 }),
   wrap(async (req, res) => {
     if (!req.display.scopes.includes("home")) {
       throw forbidden("This display is not permitted to show the home view");
     }
-    ensureConfigured();
-    res.json(await ha.getStates({ only: null }));
+    const conn = required(await connectionFor(req.display.household_id));
+    res.json(await ha.getStates(conn, req.display.household_id, conn.entities));
   })
 );
 
@@ -128,32 +288,25 @@ displayRouter.get("/camera/:entityId.jpg",
   limit("display-camera", { capacity: 300, perSecond: 3 }),
   wrap(async (req, res) => {
     if (!req.display.scopes.includes("home")) throw forbidden("Not permitted on this display");
-    ensureConfigured();
-    const snap = await ha.getSnapshot(req.params.entityId);
+    const conn = required(await connectionFor(req.display.household_id));
+    if (conn.entities.length && !conn.entities.includes(req.params.entityId)) {
+      throw forbidden("That camera is not one this household has chosen to show");
+    }
+    const snap = await ha.getSnapshot(conn, req.display.household_id, req.params.entityId);
     if (!snap) throw notFound("No image from that camera");
-    res.type(snap.type || "image/jpeg").send(snap.buf);
+    res.type(snap.type).send(snap.buf);
   })
 );
 
 /**
  * Control, from a display.
  *
- * Two independent gates, and the second is the one that matters:
- *
- *   1. the domain must be in this display's granted list
- *   2. the domain must not be member-only -- checked here rather than trusting
- *      the granted list, so a lock can never be reachable from a screen even if
- *      one is somehow written into the database
+ * Three gates, and the first is the one that matters most: a lock is refused
+ * before anything else is even looked at.
  */
 displayRouter.post("/control",
   limit("display-ha-control", { capacity: 60, perSecond: 0.5 }),
   wrap(async (req, res) => {
-    // Authorisation first, configuration second. Deciding "may this caller do
-    // this at all" must not depend on whether Home Assistant happens to be set
-    // up -- otherwise the lock refusal silently becomes a 503 on a server
-    // without HA, and the rule looks like it is working when it is not being
-    // reached. It also avoids telling an unauthorised caller anything about how
-    // the server is configured.
     const body = parse(controlSchema, req.body);
     const domain = ha.domainOf(body.entityId);
 
@@ -170,13 +323,14 @@ displayRouter.post("/control",
     if (!ha.isControllable(body.entityId)) {
       throw badRequest("That kind of device cannot be switched from HouseHub");
     }
-    ensureConfigured();
+
+    const conn = required(await connectionFor(req.display.household_id));
+    if (!conn.controlEnabled) throw forbidden("Control is switched off for this household");
 
     try {
-      const out = await ha.callService(body.entityId, body.action);
+      const out = await ha.callService(conn, req.display.household_id, body.entityId, body.action);
       await audit("ha_controlled", {
-        householdId: req.display.household_id,
-        target: body.entityId,
+        householdId: req.display.household_id, target: body.entityId,
         meta: { action: body.action, via: "display", display: req.display.name },
       });
       res.json(out);

@@ -27,6 +27,7 @@ import adminRoutes from "./routes/admin.js";
 import calendarRoutes from "./routes/calendars.js";
 import proposalRoutes from "./routes/proposals.js";
 import homeRoutes from "./routes/home.js";
+import privacyRoutes from "./routes/privacy.js";
 import { loadDisplay } from "./routes/displays.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -64,6 +65,7 @@ export function createApp() {
 
   app.use("/api/auth", authRoutes);
   app.use("/api/invites", inviteRoutes);
+  app.use("/api/privacy", privacyRoutes);
   app.use("/api/households", householdRoutes);
   app.use("/api/households", vaultRoutes);
   app.use("/api/households", calendarRoutes);

@@ -22,6 +22,8 @@ import { useCheckinPrompt } from "./lib/useCheckinPrompt.js";
 import HouseholdPanel from "./components/HouseholdPanel.jsx";
 import ArchivePanel from "./components/ArchivePanel.jsx";
 import SuperAdminPanel from "./components/SuperAdminPanel.jsx";
+import HomeAssistantPanel from "./components/HomeAssistantPanel.jsx";
+import PrivacyPanel from "./components/PrivacyPanel.jsx";
 import * as COMPLETION from "./lib/completion.js";
 
 /* ---------------------------------------------------------------
@@ -5091,6 +5093,12 @@ function SettingsModal({ data, update, syncCalendars, close, currentUser }) {
       </Field>
       <Field label="Archive">
         <ArchivePanel theme={T} data={data} update={update} me={currentUser} />
+      </Field>
+      <Field label="Home Assistant">
+        <HomeAssistantPanel theme={T} />
+      </Field>
+      <Field label="Your data">
+        <PrivacyPanel theme={T} data={data} me={currentUser} />
       </Field>
       {currentUser?.isSuperAdmin && (
         <Field label="Server (super admin)">

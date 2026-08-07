@@ -62,6 +62,9 @@ export function SignIn({ onDone, allowSignup = true, chrome = true, startMode = 
   const [needsTotp, setNeedsTotp] = useState(false);
   const [error, setError] = useState(null);
   const [busy, setBusy] = useState(false);
+  // Deliberately not remembered between renders of the form. Somebody creating
+  // a second account should read it again.
+  const [acceptedLoss, setAcceptedLoss] = useState(false);
 
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
 
@@ -70,6 +73,9 @@ export function SignIn({ onDone, allowSignup = true, chrome = true, startMode = 
     setError(null);
 
     if (mode === "up") {
+      if (!acceptedLoss) {
+        return setError("Please confirm you understand that a forgotten password cannot be recovered.");
+      }
       if (form.password.length < 12) {
         return setError(
           "Use at least 12 characters. This password is the only thing that can decrypt " +
@@ -129,7 +135,35 @@ export function SignIn({ onDone, allowSignup = true, chrome = true, startMode = 
         <Field label="Two-factor code" value={form.totp} onChange={set("totp")}
                inputMode="numeric" autoComplete="one-time-code" />
       )}
-      <Button busy={busy}>{mode === "up" ? "Create account" : "Sign in"}</Button>
+
+      {/* The single most important thing anybody signing up needs to understand,
+          and the one most likely to be skimmed. It is a blocking checkbox rather
+          than a line of small print because the consequence is total and
+          permanent: nobody -- not us, not whoever runs this server, not a court
+          order -- can decrypt a household without a member's password. */}
+      {mode === "up" && (
+        <label className="flex gap-3 items-start mb-4 rounded-lg bg-amber-950/40 border border-amber-800/60 p-3">
+          <input
+            type="checkbox"
+            checked={acceptedLoss}
+            onChange={(e) => setAcceptedLoss(e.target.checked)}
+            className="mt-0.5 h-4 w-4 flex-none accent-amber-500"
+          />
+          <span className="text-sm text-amber-100">
+            <strong>I understand there is no password reset.</strong> My household is
+            encrypted with a key derived from this password, and it is never sent to the
+            server. If I forget it, my data cannot be recovered — not by me, not by whoever
+            runs this server, not by anyone. There is no backup that would help.
+            <span className="block mt-1 text-amber-200/80">
+              Write it down, or use a password manager.
+            </span>
+          </span>
+        </label>
+      )}
+
+      <Button busy={busy} disabled={mode === "up" && !acceptedLoss}>
+        {mode === "up" ? "Create account" : "Sign in"}
+      </Button>
       {!chrome && toggle && <div className="mt-3 text-sm text-slate-400">{toggle}</div>}
     </form>
   );

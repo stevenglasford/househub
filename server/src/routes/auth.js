@@ -54,6 +54,12 @@ const registerSchema = identitySchema.extend({
   email: emailSchema,
   displayName: z.string().trim().min(1).max(80).optional(),
   inviteToken: z.string().max(256).optional(),
+  // Required, and required to be true. The consequence of a forgotten password
+  // here is total and permanent, so "I was never told" should not be a thing
+  // anybody can honestly say. Recorded with a timestamp.
+  acknowledgedNoRecovery: z.literal(true, {
+    errorMap: () => ({ message: "You must confirm you understand that a forgotten password cannot be recovered." }),
+  }),
 });
 
 const loginSchema = z.object({
@@ -179,8 +185,9 @@ router.post("/register",
         `INSERT INTO users (
            email_bidx, email_enc, password_hash,
            kdf_algo, kdf_iterations, kdf_salt,
-           wrapped_master_key, public_key, enc_private_key, display_name_enc
-         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+           wrapped_master_key, public_key, enc_private_key, display_name_enc,
+           no_recovery_ack_at
+         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now())
          RETURNING id`,
         [
           bidx, seal("email", body.email), hashPassword(body.authProof),

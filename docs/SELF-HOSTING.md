@@ -157,6 +157,26 @@ better. The first generation after a reboot takes 15–30 seconds while the mode
 loads; `OLLAMA_KEEP_WARM=1` keeps it resident so the evening check-in is
 instant.
 
+### Home Assistant
+
+**Settings → Home Assistant**, per household — not a server setting. Paste your
+Home Assistant address and a long-lived access token, press **Test connection**,
+then pick which entities appear.
+
+> Create a **separate Home Assistant user** for HouseHub rather than using your
+> owner account. This server stores a token that can control your house; it is
+> sealed with `SECRET_KEY`, but the smaller the blast radius the better.
+
+Lights, switches, fans, blinds and cameras can be used from a shared display if
+you grant those domains. **Locks always require a signed-in member with adult
+access and can never be operated from a display**, whatever else is configured —
+a wall tablet by the front door that can unlock the front door is a keypad with
+no code.
+
+If you previously set `HA_URL` and `HA_TOKEN` in the environment, those are no
+longer used. They were server-wide, so every household on a shared server saw
+the same house. The server logs a warning if they are still set.
+
 ### Backups
 
 ```bash

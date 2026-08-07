@@ -406,8 +406,9 @@ router.post("/:householdId/members/managed",
 
       const ins = await query(
         `INSERT INTO users (email_bidx, email_enc, password_hash, kdf_algo, kdf_iterations,
-                            kdf_salt, wrapped_master_key, public_key, enc_private_key, display_name_enc)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`,
+                            kdf_salt, wrapped_master_key, public_key, enc_private_key, display_name_enc,
+                            no_recovery_ack_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now()) RETURNING id`,
         [bidx, seal("email", body.email), hashPassword(body.identity.authProof),
          body.identity.kdfAlgo, body.identity.kdfIterations, bin(body.identity.kdfSalt),
          bin(body.identity.wrappedMasterKey), bin(body.identity.publicKey),

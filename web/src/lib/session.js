@@ -86,7 +86,12 @@ export async function request(method, path, body) {
 export async function register({ email, password, displayName }) {
   const cfg = await request("GET", "api/config");
   const { upload, keys } = await C.createIdentity(password, cfg.kdfIterations || 650000);
-  const res = await request("POST", "api/auth/register", { email, displayName, ...upload });
+  const res = await request("POST", "api/auth/register", {
+    email, displayName, ...upload,
+    // The form will not submit without this ticked; sent so the server can
+    // record when they were told.
+    acknowledgedNoRecovery: true,
+  });
 
   state.token = res.token;
   state.user = res.user;
@@ -453,6 +458,36 @@ export async function generate(kind, context, opts = {}) {
 }
 
 export const aiStatus = () => request("GET", "api/ai/status");
+
+/* -------------------------------------------------------------- privacy --- */
+
+export const erasurePreview = () => request("GET", "api/privacy/erasure-preview");
+
+/** Everything the server holds about this account, as a downloadable file. */
+export async function downloadAccountExport() {
+  const res = await fetch("api/privacy/export", {
+    headers: { Authorization: `Bearer ${currentToken()}` },
+    credentials: "same-origin",
+  });
+  if (!res.ok) throw new ApiError(res.status, await res.json().catch(() => null));
+  return res.blob();
+}
+
+/**
+ * Delete this account.
+ *
+ * The password is re-derived here into an auth proof rather than sent, exactly
+ * as at login -- so even erasing an account does not put a password on the wire.
+ */
+export async function eraseAccount(password, { deleteEmptyHouseholds = true } = {}) {
+  const me = await request("GET", "api/auth/me");
+  const authProof = await C.loginProof(password, me.identity);
+  const out = await request("DELETE", "api/privacy/me", {
+    authProof, confirm: "DELETE", deleteEmptyHouseholds,
+  });
+  wipe();
+  return out;
+}
 
 /* --------------------------------------------------------------- actor ---- */
 

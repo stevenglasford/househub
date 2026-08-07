@@ -146,9 +146,16 @@ export const UPGRADE_DIRECT_PUSH = bool(env.UPGRADE_DIRECT_PUSH, false);
 export const UPGRADE_MAX_ZIP_MB = int(env.UPGRADE_MAX_ZIP_MB, 50);
 export const UPGRADE_TIMEOUT_MS = int(env.UPGRADE_TIMEOUT_MS, 30 * 60 * 1000);
 
-/* ------------------------------------------------------------ home assist -- */
-export const HA_URL = env.HA_URL || "";
-export const HA_TOKEN = env.HA_TOKEN || "";
+/* ------------------------------------------------------------ home assist --
+ * Home Assistant is configured per household in the app, not here. It used to
+ * be HA_URL/HA_TOKEN environment variables, which on a server hosting more than
+ * one family showed all of them the same house. See migrations/007.
+ *
+ * These two remain only so an existing single-household install is told where
+ * its settings went rather than silently losing its Home tab.
+ */
+export const LEGACY_HA_URL = env.HA_URL || "";
+export const LEGACY_HA_TOKEN = env.HA_TOKEN || "";
 
 /* ---------------------------------------------------------------- billing -- */
 export const BILLING_ENABLED = bool(env.BILLING_ENABLED, false);
@@ -170,7 +177,9 @@ export function clientConfig() {
     aiModel: OLLAMA_MODEL,
     billingEnabled: BILLING_ENABLED,
     kdfIterations: CLIENT_KDF_ITERATIONS,
-    homeAssistant: Boolean(HA_URL && HA_TOKEN),
+    // Whether Home Assistant is connected is now a per-household fact,
+    // answered by GET /api/households/:id/home.
+    homeAssistant: "per-household",
   };
 }
 
@@ -185,6 +194,9 @@ export function startupWarnings() {
     w.push("UPGRADES_ENABLED without GITHUB_TOKEN: jobs will build and verify but cannot open a PR.");
   if (UPGRADES_ENABLED && UPGRADE_DIRECT_PUSH)
     w.push("UPGRADE_DIRECT_PUSH is on: AI-authored changes will land on the base branch unreviewed.");
+  if (LEGACY_HA_URL || LEGACY_HA_TOKEN)
+    w.push("HA_URL/HA_TOKEN are no longer used. Connect Home Assistant per household in " +
+           "Settings -> Home; a server-wide token showed every household the same house.");
   if (BILLING_ENABLED && !PRICE_FEED_URL)
     w.push("BILLING_ENABLED without PRICE_FEED_URL: invoices need a manually supplied exchange rate.");
   return w;

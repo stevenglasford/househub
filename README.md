@@ -39,7 +39,8 @@ else follows from it.
   a fixed list that goes stale in a fortnight
 - **Displays** — permanent links for always-on screens, each showing only what
   the admins chose
-- **Home Assistant** — optional, read-only
+- **Home Assistant** — per household: cameras, lights, sensors, and optional
+  control. Lights and blinds work from a shared display; locks never do
 
 ## What makes it different
 
@@ -93,6 +94,18 @@ Then put HTTPS in front (`deploy/Caddyfile`) and open your domain.
 
 Full instructions, including running it for other families:
 **[docs/SELF-HOSTING.md](docs/SELF-HOSTING.md)**
+
+## Privacy and your data
+
+**[docs/PRIVACY.md](docs/PRIVACY.md)** covers what is stored, for how long, and
+how to get it out or delete it. In short: export your account data or your whole
+household from **Settings → Your data**, and delete your own account from the
+same place — every role can, because a right only some people can exercise is
+not a right.
+
+The awkward part, stated there rather than buried: deleting your account cannot
+remove your name from a shared household's calendar, because the server cannot
+read that calendar. A member has to.
 
 ## Security
 

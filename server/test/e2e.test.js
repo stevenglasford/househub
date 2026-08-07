@@ -70,7 +70,8 @@ async function register(email, password) {
   await q("DELETE FROM rate_limits");
   const { upload, keys } = await C.createIdentity(password, ITER);
   const res = await api("POST", "/api/auth/register", {
-    body: { email, displayName: email.split("@")[0], ...upload },
+    // The acknowledgement is mandatory, exactly as it is in the browser.
+    body: { email, displayName: email.split("@")[0], ...upload, acknowledgedNoRecovery: true },
   });
   assert.equal(res.status, 201, `register ${email}: ${JSON.stringify(res.body)}`);
   return { email, password, token: res.body.token, userId: res.body.userId, keys, upload };
@@ -815,4 +816,188 @@ test("control domains a display was not granted are refused", async () => {
   });
   assert.equal(covers.status, 403);
   assert.match(covers.body.error, /has not been given control/i);
+});
+
+/* ------------------------------------------------------ privacy rights --- */
+
+test("signing up requires acknowledging that a password cannot be recovered", async () => {
+  await q("DELETE FROM rate_limits");
+  const { upload } = await C.createIdentity("ack-test-passphrase", ITER);
+  const without = await api("POST", "/api/auth/register", {
+    body: { email: `noack-${Date.now()}@example.com`, displayName: "N", ...upload },
+  });
+  assert.equal(without.status, 400);
+  assert.match(without.body.error, /cannot be recovered/i);
+
+  const withAck = await api("POST", "/api/auth/register", {
+    body: {
+      email: `ack-${Date.now()}@example.com`, displayName: "A", ...upload,
+      acknowledgedNoRecovery: true,
+    },
+  });
+  assert.equal(withAck.status, 201);
+
+  // Recorded with a timestamp, so "nobody told me" is answerable.
+  const { rows } = await q("SELECT no_recovery_ack_at FROM users WHERE id = $1", [withAck.body.userId]);
+  assert.ok(rows[0].no_recovery_ack_at, "the acknowledgement must be recorded");
+});
+
+test("a subject access export contains personal data and no household content", async () => {
+  const owner = await register(`export-${Date.now()}@example.com`, "export-passphrase-x");
+  const house = await createHousehold(owner, { householdName: "Very Secret House", note: "CANARY-77" });
+
+  const res = await api("GET", "/api/privacy/export", { token: owner.token });
+  assert.equal(res.status, 200);
+
+  assert.equal(res.body.account.email, owner.email);
+  assert.ok(res.body.households.some((h) => h.householdId === house.id));
+  assert.ok(Array.isArray(res.body.activity));
+
+  // The critical property: an export the server produces cannot contain what the
+  // server cannot read.
+  const blob = JSON.stringify(res.body);
+  assert.ok(!blob.includes("Very Secret House"), "household content must not appear in a server-side export");
+  assert.ok(!blob.includes("CANARY-77"));
+  // And no key material that would be dangerous in a downloaded file.
+  assert.ok(!blob.includes("wrappedMasterKey"));
+  assert.ok(!blob.includes("encPrivateKey"));
+});
+
+test("anyone can erase their own account, whatever their role", async () => {
+  // A right of erasure only some people can exercise is not a right. A viewer --
+  // the least privileged role there is -- must be able to leave.
+  const admin = await register(`era-admin-${Date.now()}@example.com`, "erasure-passphrase-a");
+  const viewer = await register(`era-view-${Date.now()}@example.com`, "erasure-passphrase-v");
+  const house = await createHousehold(admin, { householdName: "Shared" });
+
+  const invite = await api("POST", `/api/households/${house.id}/invites`, {
+    token: admin.token, body: { role: "viewer" },
+  });
+  await api("POST", "/api/invites/accept", { token: viewer.token, body: { token: invite.body.url.split("#")[1] } });
+  const members = await api("GET", `/api/households/${house.id}/members`, { token: admin.token });
+  const vRow = members.body.find((m) => m.userId === viewer.userId);
+  await api("POST", `/api/households/${house.id}/members/${viewer.userId}/key`, {
+    token: admin.token,
+    body: {
+      wrappedKey: await C.wrapHouseholdKey(house.hk, C.fromB64(vRow.publicKey)),
+      publicKey: vRow.publicKey,
+    },
+  });
+
+  const params = await api("POST", "/api/auth/kdf-params", { body: { email: viewer.email } });
+  const proof = await C.loginProof("erasure-passphrase-v", params.body);
+  const gone = await api("DELETE", "/api/privacy/me", {
+    token: viewer.token, body: { authProof: proof, confirm: "DELETE" },
+  });
+  assert.equal(gone.status, 200, JSON.stringify(gone.body));
+
+  const { rows } = await q("SELECT 1 FROM users WHERE id = $1", [viewer.userId]);
+  assert.equal(rows.length, 0);
+
+  // The shared household survives: it is not the viewer's to destroy.
+  const still = await q("SELECT 1 FROM households WHERE id = $1", [house.id]);
+  assert.equal(still.rows.length, 1);
+});
+
+test("erasure needs the account's own password", async () => {
+  const user = await register(`era-pw-${Date.now()}@example.com`, "erasure-passphrase-p");
+  const res = await api("DELETE", "/api/privacy/me", {
+    token: user.token,
+    body: { authProof: Buffer.alloc(32).toString("base64"), confirm: "DELETE" },
+  });
+  assert.equal(res.status, 401);
+  const { rows } = await q("SELECT 1 FROM users WHERE id = $1", [user.userId]);
+  assert.equal(rows.length, 1, "a wrong password must not delete an account");
+});
+
+test("the last admin of a shared household cannot erase themselves into a dead end", async () => {
+  const { a, b, house } = await twoAdminHousehold("erasure");
+  // Demote b so a is the only admin, with b still living there.
+  await api("PUT", `/api/households/${house.id}/members/${b.userId}/role`, {
+    token: a.token, body: { role: "adult" },
+  });
+
+  const params = await api("POST", "/api/auth/kdf-params", { body: { email: a.email } });
+  const proof = await C.loginProof("erasure-passphrase-a", params.body);
+  const blocked = await api("DELETE", "/api/privacy/me", {
+    token: a.token, body: { authProof: proof, confirm: "DELETE" },
+  });
+  assert.equal(blocked.status, 409);
+  assert.match(blocked.body.error, /only admin/i);
+
+  // And the request is recorded, so the statutory clock runs from a date.
+  const { rows } = await q("SELECT blocked_on FROM erasure_requests WHERE user_id = $1", [a.userId]);
+  assert.equal(rows.length, 1);
+});
+
+test("deleting an account leaves behind an audit id that names nobody", async () => {
+  const user = await register(`era-audit-${Date.now()}@example.com`, "erasure-passphrase-z");
+  await createHousehold(user, { householdName: "Solo" });
+
+  const before = await q("SELECT count(*)::int AS n FROM audit_log WHERE actor_user_id = $1", [user.userId]);
+  assert.ok(before.rows[0].n > 0);
+
+  const params = await api("POST", "/api/auth/kdf-params", { body: { email: user.email } });
+  const proof = await C.loginProof("erasure-passphrase-z", params.body);
+  await api("DELETE", "/api/privacy/me", {
+    token: user.token, body: { authProof: proof, confirm: "DELETE" },
+  });
+
+  // Entries remain, chain intact, but the id resolves to no person -- which is
+  // what makes an immutable log compatible with erasure rather than opposed to it.
+  const after = await q("SELECT count(*)::int AS n FROM audit_log WHERE actor_user_id = $1", [user.userId]);
+  assert.equal(after.rows[0].n, before.rows[0].n);
+  const resolves = await q("SELECT 1 FROM users WHERE id = $1", [user.userId]);
+  assert.equal(resolves.rows.length, 0);
+
+  const { verifyChain } = await import("../src/services/audit.js");
+  assert.equal((await verifyChain()).ok, true);
+});
+
+/* ------------------------------------------------- home assistant setup --- */
+
+test("Home Assistant is per household, not server-wide", async () => {
+  const a = await register(`ha-a-${Date.now()}@example.com`, "ha-passphrase-a");
+  const b = await register(`ha-b-${Date.now()}@example.com`, "ha-passphrase-b");
+  const houseA = await createHousehold(a, { householdName: "House A" });
+  const houseB = await createHousehold(b, { householdName: "House B" });
+
+  // Neither is connected, and one household's answer says nothing about another's.
+  for (const [user, house] of [[a, houseA], [b, houseB]]) {
+    const res = await api("GET", `/api/households/${house.id}/home`, { token: user.token });
+    assert.equal(res.status, 200);
+    assert.equal(res.body.connected, false);
+  }
+
+  // A member of one household cannot read another's integration.
+  const cross = await api("GET", `/api/households/${houseA.id}/home`, { token: b.token });
+  assert.equal(cross.status, 404);
+});
+
+test("a Home Assistant URL pointing at the HouseHub server itself is refused", async () => {
+  // Otherwise a household could aim its "integration" at the server's own
+  // internals and read the response back through the entity list.
+  const { assertReachableTarget } = await import("../src/services/homeassistant.js");
+  for (const url of ["http://127.0.0.1:4000", "http://localhost:5432", "http://169.254.169.254/"]) {
+    await assert.rejects(() => assertReachableTarget(url), /server itself|resolve/i, url);
+  }
+  // A normal private address is fine -- that is where Home Assistant lives.
+  await assert.doesNotReject(() => assertReachableTarget("http://192.168.1.50:8123"));
+});
+
+test("saving a Home Assistant connection requires it to actually work", async () => {
+  const owner = await register(`ha-save-${Date.now()}@example.com`, "ha-passphrase-s");
+  const house = await createHousehold(owner, { householdName: "HA House" });
+
+  const res = await api("PUT", `/api/households/${house.id}/home`, {
+    token: owner.token,
+    body: { url: "http://192.0.2.10:8123", token: "x".repeat(40) },   // TEST-NET-1, nothing there
+  });
+  assert.equal(res.status, 400);
+  assert.match(res.body.error, /could not connect/i);
+
+  // Nothing half-saved: a connection that looks configured but does not work is
+  // worse than none.
+  const { rows } = await q("SELECT 1 FROM household_home_assistant WHERE household_id = $1", [house.id]);
+  assert.equal(rows.length, 0);
 });
