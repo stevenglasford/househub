@@ -304,6 +304,54 @@ export function forgetDisplay() {
   wipe();
 }
 
+/* ------------------------------------------------------------ membership --- */
+
+/**
+ * Wrap the household key to somebody else's public key.
+ *
+ * The household key itself never leaves this module -- callers hand in a
+ * recipient and get back a sealed blob they can upload. This is the operation
+ * the server cannot perform on its own, and the reason admitting a member needs
+ * an admin's device rather than just a row in a table.
+ */
+export async function wrapForRecipient(publicKeyB64, context = "user") {
+  if (!state.householdKey) throw new Error("The household is locked.");
+  return C.wrapHouseholdKey(state.householdKey, C.fromB64(publicKeyB64), context);
+}
+
+/** Members of the current household, including those awaiting a key. */
+export const listMembers = () =>
+  request("GET", `api/households/${state.householdId}/members`);
+
+export const createInvite = (body) =>
+  request("POST", `api/households/${state.householdId}/invites`, body);
+
+export const listInvites = () =>
+  request("GET", `api/households/${state.householdId}/invites`);
+
+export const revokeInvite = (id) =>
+  request("DELETE", `api/households/${state.householdId}/invites/${id}`);
+
+/**
+ * Admit a pending member: wrap the household key to them and upload it.
+ *
+ * `publicKey` is echoed back to the server so it can reject the request if the
+ * key changed between the member list being loaded and this call -- which is
+ * what a server swapping in its own key mid-flow would look like.
+ */
+export async function grantAccess(userId, publicKeyB64) {
+  const wrappedKey = await wrapForRecipient(publicKeyB64);
+  return request("POST", `api/households/${state.householdId}/members/${userId}/key`, {
+    wrappedKey, publicKey: publicKeyB64,
+  });
+}
+
+export const setMemberRole = (userId, role) =>
+  request("PUT", `api/households/${state.householdId}/members/${userId}/role`, { role });
+
+export const removeMember = (userId) =>
+  request("DELETE", `api/households/${state.householdId}/members/${userId}`);
+
 /* -------------------------------------------------------------------- ai --- */
 
 /**

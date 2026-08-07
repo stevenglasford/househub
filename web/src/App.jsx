@@ -15,9 +15,11 @@ import {
 import {
   loadState, saveState, loadCalendarEvents,
   addCalendar, refreshCalendar, deleteCalendar,
+  session,
 } from "./api.js";
 import { getConfig } from "./config.js";
 import { useCheckinPrompt } from "./lib/useCheckinPrompt.js";
+import HouseholdPanel from "./components/HouseholdPanel.jsx";
 
 /* ---------------------------------------------------------------
    Theme — warm "kitchen paper" palette, pine-green brand.
@@ -675,6 +677,11 @@ export default function HouseholdHub() {
   const [weekAnchor, setWeekAnchor] = useState(ymd(startOfWeek(new Date())));
   const [filter, setFilter] = useState("all"); // 'all' | personId
   const [viewOffset, setViewOffset] = useState(0); // days from today, for the Today screen
+  // Who is signed in. Held by lib/session.js, not by the document -- a member
+  // is an account on this server, not a "person" row in the household.
+  const [sessionUser, setSessionUser] = useState(() => session.snapshot().user);
+  useEffect(() => session.onChange((s) => setSessionUser(s.user)), []);
+
   const [modal, setModal] = useState(null);
   const width = useWindowWidth();
   const vp = useViewportMetrics();
@@ -937,7 +944,7 @@ export default function HouseholdHub() {
           todayKey={todayKey} onOpenMeal={(k) => setModal({ type: "meal", key: k, slot: "dinner" })}
           close={() => setModal(null)} />
       )}
-      {modal?.type === "settings" && <SettingsModal data={data} update={update} syncCalendars={syncCalendars} close={() => setModal(null)} />}
+      {modal?.type === "settings" && <SettingsModal data={data} update={update} syncCalendars={syncCalendars} close={() => setModal(null)} currentUser={sessionUser} />}
     </div>
     </ViewportCtx.Provider>
     </MobileCtx.Provider>
@@ -5066,7 +5073,7 @@ function PersonPicker({ people, value, onChange }) {
 }
 
 /* ---------------- Settings ---------------- */
-function SettingsModal({ data, update, syncCalendars, close }) {
+function SettingsModal({ data, update, syncCalendars, close, currentUser }) {
   const [name, setName] = useState(data.householdName || "Our Home");
   const [tab, setTab] = useState("people");
   const saveName = () => update((d) => { d.householdName = name.trim() || "Our Home"; return d; });
@@ -5086,6 +5093,11 @@ function SettingsModal({ data, update, syncCalendars, close }) {
       <ModalHead title="Settings" close={close} />
       <Field label="Household name">
         <input value={name} onChange={(e) => setName(e.target.value)} onBlur={saveName} className="w-full px-4 py-3.5 rounded-xl text-lg outline-none" style={inputStyle} />
+      </Field>
+      {/* Who is in this household, and letting new people in. The key wrap that
+          admits someone happens in the browser, so it has to live in the UI. */}
+      <Field label="People">
+        <HouseholdPanel theme={T} me={currentUser} />
       </Field>
       <Field label="Display mode">
         <div className="flex gap-2">

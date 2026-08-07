@@ -342,6 +342,29 @@ export function newDisplayKeypair() {
 /** Recover the public half of a stored device key. */
 export const publicKeyFromPrivate = (privateKey) => x25519.getPublicKey(privateKey);
 
+/**
+ * A short, human-readable fingerprint of a public key.
+ *
+ * This is what two people read to each other -- out loud, in the same room --
+ * before one admits the other to a household. The server supplies the public key
+ * an admin wraps the household key to, so a malicious server could substitute
+ * its own and be admitted. Comparing six words' worth of hex closes that, and it
+ * is the only step in the whole design that depends on a human doing something.
+ *
+ * Truncated to 10 bytes / 80 bits: far beyond what anyone can forge by grinding
+ * keypairs, and still short enough to actually be read aloud.
+ */
+export function keyFingerprint(publicKey) {
+  const bytes = typeof publicKey === "string" ? fromB64(publicKey) : publicKey;
+  const digest = sha256(new Uint8Array([...enc.encode("househub/fingerprint/v1"), ...bytes]));
+  return Array.from(digest.subarray(0, 10))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("")
+    .toUpperCase()
+    .match(/.{1,4}/g)
+    .join(" ");
+}
+
 /** Seal the display's private key at rest under a key derived from its own token. */
 export async function sealDisplayKey(privateKey, token) {
   const keyRaw = hkdf(sha256, enc.encode(token), enc.encode("househub/display/v1"), enc.encode("at-rest"), 32);
