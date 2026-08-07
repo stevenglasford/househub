@@ -127,7 +127,7 @@ panels. Removing a member requires a key rotation to be complete.
 Verify the claims:
 
 ```bash
-cd server && npm test           # 58 tests: crypto, SSRF, archives, end-to-end
+cd server && npm test           # 80 tests: crypto, SSRF, archives, end-to-end
 node security/pentest/run.js    # 90+ attack probes; exits non-zero on HIGH+
 ```
 
