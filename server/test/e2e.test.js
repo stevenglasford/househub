@@ -1001,3 +1001,32 @@ test("saving a Home Assistant connection requires it to actually work", async ()
   const { rows } = await q("SELECT 1 FROM household_home_assistant WHERE household_id = $1", [house.id]);
   assert.equal(rows.length, 0);
 });
+
+/* ------------------------------------------------------- integrations --- */
+
+test("integrations are listed per household and start disconnected", async () => {
+  const owner = await register(`integ-${Date.now()}@example.com`, "integration-passphrase");
+  const house = await createHousehold(owner, { householdName: "Plugged" });
+
+  const res = await api("GET", `/api/households/${house.id}/integrations`, { token: owner.token });
+  assert.equal(res.status, 200);
+
+  const ha = res.body.integrations.find((i) => i.id === "home-assistant");
+  assert.ok(ha, "Home Assistant should be offered as an integration");
+  assert.equal(ha.status.connected, false);
+
+  // The manifest tells a household what it is agreeing to before they connect.
+  assert.ok(ha.grants.length > 0);
+  assert.ok(ha.holds.some((h) => /encrypted/i.test(h)));
+  // And it is explicit that this is a separate system, not a way into the vault.
+  assert.match(res.body.about, /never touch/i);
+});
+
+test("a non-member cannot enumerate another household's integrations", async () => {
+  const owner = await register(`integ-a-${Date.now()}@example.com`, "integration-passphrase-a");
+  const other = await register(`integ-b-${Date.now()}@example.com`, "integration-passphrase-b");
+  const house = await createHousehold(owner, { householdName: "Private" });
+
+  const res = await api("GET", `/api/households/${house.id}/integrations`, { token: other.token });
+  assert.equal(res.status, 404);
+});

@@ -39,8 +39,9 @@ else follows from it.
   a fixed list that goes stale in a fortnight
 - **Displays** — permanent links for always-on screens, each showing only what
   the admins chose
-- **Home Assistant** — per household: cameras, lights, sensors, and optional
-  control. Lights and blinds work from a shared display; locks never do
+- **Home Assistant** — plug your own instance into your household: cameras,
+  lights, sensors, and optional control. Lights and blinds work from a shared
+  display; locks never do. See [docs/HOME-ASSISTANT.md](docs/HOME-ASSISTANT.md)
 
 ## What makes it different
 
@@ -127,7 +128,7 @@ panels. Removing a member requires a key rotation to be complete.
 Verify the claims:
 
 ```bash
-cd server && npm test           # 80 tests: crypto, SSRF, archives, end-to-end
+cd server && npm test           # 82 tests: crypto, SSRF, archives, end-to-end
 node security/pentest/run.js    # 90+ attack probes; exits non-zero on HIGH+
 ```
 
@@ -145,7 +146,8 @@ server/
     middleware/    auth, CSP and CSRF, DB-backed rate limits, errors
     routes/        auth, households, vault, invites, displays, ai, admin
     services/      ollama, check-in prompts, calendars, SSRF-safe fetch,
-                   wallets, billing, upgrades, safe unzip, audit
+                   home assistant, wallets, billing, upgrades, safe unzip, audit
+    integrations/  the registry a household plugs its own systems into
 web/
   src/
     lib/crypto.js  the end-to-end layer  <-- read this one first

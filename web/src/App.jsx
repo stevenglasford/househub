@@ -23,6 +23,7 @@ import HouseholdPanel from "./components/HouseholdPanel.jsx";
 import ArchivePanel from "./components/ArchivePanel.jsx";
 import SuperAdminPanel from "./components/SuperAdminPanel.jsx";
 import HomeAssistantPanel from "./components/HomeAssistantPanel.jsx";
+import DisplaysPanel from "./components/DisplaysPanel.jsx";
 import PrivacyPanel from "./components/PrivacyPanel.jsx";
 import * as COMPLETION from "./lib/completion.js";
 
@@ -692,6 +693,19 @@ export default function HouseholdHub() {
   // Who is signed in. Held by lib/session.js, not by the document -- a member
   // is an account on this server, not a "person" row in the household.
   const [sessionUser, setSessionUser] = useState(() => session.snapshot().user);
+  // The Home tab appears only once this household has plugged in its own Home
+  // Assistant -- it is per household, not a property of the server.
+  const [homeConnected, setHomeConnected] = useState(false);
+  useEffect(() => {
+    if (session.isDisplay()) {
+      setHomeConnected((session.snapshot().displayScopes || []).includes("home"));
+      return;
+    }
+    if (!session.householdId()) return;
+    session.request("GET", `api/households/${session.householdId()}/home`)
+      .then((c) => setHomeConnected(Boolean(c.connected)))
+      .catch(() => setHomeConnected(false));
+  }, []);
   useEffect(() => session.onChange((s) => setSessionUser(s.user)), []);
 
   const [modal, setModal] = useState(null);
@@ -889,7 +903,7 @@ export default function HouseholdHub() {
       <GlanceStrip data={data} allEvents={allEvents} now={now} viewKey={viewKey} personById={personById} weather={weather}
         inFilter={inFilter} filter={filter} todosLeft={todosLeftToday} overdueTotal={overdueTotal} onGoto={setTab} hidden={isMobile} />
 
-      <TabBar tab={tab} setTab={setTab} todosLeft={todosLeftToday} groceryLeft={groceryLeft} noteCount={noteCount} agendaOpen={agendaOpen} homeOn={!!data.homeAvailable}
+      <TabBar tab={tab} setTab={setTab} todosLeft={todosLeftToday} groceryLeft={groceryLeft} noteCount={noteCount} agendaOpen={agendaOpen} homeOn={homeConnected}
         people={people} filter={filter} setFilter={setFilter} />
 
       <main className={`flex-1 min-h-0 px-3 md:px-5 ${tab === "today" && !isMobile ? "overflow-hidden pb-3" : "overflow-y-auto pb-6"}`}
@@ -3640,26 +3654,60 @@ function BoardView({ data, update, personById, todayKey, openNote, openDate }) {
 const HOME_STATE_MS = 5000;
 const HOME_SNAP_MS = 2000;
 
-function useHomeEntities() {
+/**
+ * One household's Home Assistant: what it is showing, and whether it can be
+ * touched.
+ *
+ * Routed through lib/session, so the same component works for a signed-in
+ * member and for a wall display -- session picks the right endpoints and, for a
+ * display, applies the domains that screen was granted.
+ */
+function useHomeAssistant() {
   const [entities, setEntities] = useState([]);
+  const [conn, setConn] = useState(null);
   const [err, setErr] = useState(null);
+
   useEffect(() => {
     let dead = false;
+
+    // A display cannot read the setup endpoint; it learns what it may do from
+    // its own bootstrap instead.
+    if (session.isDisplay()) {
+      const snap = session.snapshot();
+      setConn({ connected: true, controlEnabled: true, displayDomains: snap.displayControlDomains || [] });
+    } else {
+      session.request("GET", `api/households/${session.householdId()}/home`)
+        .then((c) => { if (!dead) setConn(c); })
+        .catch(() => { if (!dead) setConn({ connected: false }); });
+    }
+
     const load = async () => {
       try {
-        const r = await fetch("api/home/entities");
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        const j = await r.json();
-        if (!dead) { setEntities(Array.isArray(j) ? j : []); setErr(null); }
+        const list = await session.homeEntities();
+        if (!dead) { setEntities(Array.isArray(list) ? list : []); setErr(null); }
       } catch (e) {
-        if (!dead) setErr(e.message || "unavailable");
+        if (!dead) setErr(e.status === 503 ? null : (e.message || "unavailable"));
       }
     };
     load();
     const t = setInterval(load, HOME_STATE_MS);
     return () => { dead = true; clearInterval(t); };
   }, []);
-  return { entities, err };
+
+  /** Switch something, optimistically, and re-read on the next poll. */
+  const toggle = useCallback(async (entity) => {
+    setEntities((list) => list.map((e) =>
+      e.entityId === entity.entityId ? { ...e, state: isOn(e) ? "off" : "on", _pending: true } : e));
+    try {
+      await session.homeControl(entity.entityId, "toggle");
+      setEntities(await session.homeEntities());
+    } catch (e) {
+      setErr(e.message);
+      setEntities(await session.homeEntities().catch(() => []));
+    }
+  }, []);
+
+  return { entities, conn, err, toggle };
 }
 
 const ON_STATES = new Set(["on", "open", "unlocked", "playing", "home", "detected"]);
@@ -3681,7 +3729,7 @@ function CameraTile({ entity }) {
     <div className="rounded-xl overflow-hidden relative" style={{ background: "#1B1720", aspectRatio: "16/9" }}>
       {!failed ? (
         <img
-          src={`api/home/camera/${entity.id}.jpg?t=${tick}`}
+          src={`${session.cameraUrl(entity.entityId)}${session.cameraUrl(entity.entityId).includes("?") ? "&" : "?"}t=${tick}`}
           alt={entity.name}
           onError={() => setFailed(true)}
           onLoad={() => setFailed(false)}
@@ -3704,12 +3752,12 @@ function CameraTile({ entity }) {
 
 function HomeView({ data }) {
   const isMobile = useMobile();
-  const { entities, err } = useHomeEntities();
+  const { entities, conn, err, toggle } = useHomeAssistant();
   const cameras = entities.filter((e) => e.domain === "camera");
   const rest = entities.filter((e) => e.domain !== "camera");
   const alerts = rest.filter(isAlert);
   const others = rest.filter((e) => !isAlert(e));
-  const dash = data.homeDashboardUrl;
+  const dash = conn?.dashboardUrl || data.homeDashboardUrl;
 
   const label = (e) => {
     if (e.domain === "sensor") return `${e.state}${e.unit ? ` ${e.unit}` : ""}`;
@@ -3724,29 +3772,44 @@ function HomeView({ data }) {
           : e.domain === "sensor" ? <Thermometer size={17} />
             : <Sofa size={17} />;
 
+  // What this viewer may switch. A display gets only the domains it was
+  // granted; locks are never in that list and the server refuses them anyway.
+  const SWITCHABLE = ["light", "switch", "fan", "cover"];
+  const canSwitch = (e) => {
+    if (!conn?.controlEnabled) return false;
+    if (e.domain === "lock") return !session.isDisplay();   // and adult+, enforced server-side
+    if (!SWITCHABLE.includes(e.domain)) return false;
+    if (session.isDisplay()) return (conn.displayDomains || []).includes(e.domain);
+    return true;
+  };
+
   const Tile = ({ e, alert }) => {
     const on = isOn(e);
     const accent = alert ? "#E86A4C" : on ? T.gold : T.faint;
+    const tappable = canSwitch(e);
+    const Wrapper = tappable ? "button" : "div";
     return (
-      <div className="rounded-xl px-3 py-2.5 flex items-center gap-2.5 min-w-0"
-        style={{ background: alert ? "#E86A4C10" : T.panelAlt, border: `1px solid ${alert ? "#E86A4C55" : "transparent"}` }}>
+      <Wrapper
+        {...(tappable ? { onClick: () => toggle(e), type: "button" } : {})}
+        className={`rounded-xl px-3 py-2.5 flex items-center gap-2.5 min-w-0 ${tappable ? "tapfade text-left w-full" : ""}`}
+        style={{ background: alert ? "#E86A4C10" : T.panelAlt, border: `1px solid ${alert ? "#E86A4C55" : "transparent"}`, opacity: e._pending ? 0.6 : 1 }}>
         <span className="rounded-lg p-1.5 shrink-0" style={{ background: accent + "22", color: accent }}>{iconFor(e)}</span>
         <div className="min-w-0 flex-1">
           <div style={{ fontSize: 14.5, fontWeight: 600 }} className="truncate">{e.name}</div>
           <div style={{ fontSize: 12.5, fontWeight: 700, color: alert ? "#C2542F" : on ? T.sub : T.faint }} className="truncate">{label(e)}</div>
         </div>
-      </div>
+      </Wrapper>
     );
   };
 
-  if (!data.homeAvailable) {
+  if (conn && !conn.connected) {
     return (
       <div className="pt-6 max-w-lg mx-auto text-center flex flex-col items-center gap-3">
         <Sofa size={34} style={{ color: T.faint }} />
         <h2 style={{ fontFamily: DISPLAY, fontSize: 22, fontWeight: 600 }}>Home Assistant isn't connected</h2>
         <p style={{ color: T.sub, fontSize: 14.5, lineHeight: 1.6 }}>
-          Set <code>HA_URL</code> and <code>HA_TOKEN</code> in the server environment, then restart.
-          See the README for where to generate the token.
+          Connect your household's own Home Assistant in <strong>Settings → Home Assistant</strong>.
+          Each household connects its own; this server does not have one of its own to share.
         </p>
       </div>
     );
@@ -3800,110 +3863,11 @@ function HomeView({ data }) {
 }
 
 /* ---------------- Home settings: pick what appears ---------------- */
-function HomeSettings({ data, update }) {
-  const [all, setAll] = useState(null);
-  const [status, setStatus] = useState(null);
-  const [q, setQ] = useState("");
-  const chosen = data.homeEntities || [];
-
-  useEffect(() => {
-    (async () => {
-      try {
-        setStatus(await (await fetch("api/home/status")).json());
-        const r = await fetch("api/home/all-entities");
-        setAll(r.ok ? await r.json() : []);
-      } catch (e) {
-        setStatus({ configured: false, reachable: false, error: e.message });
-        setAll([]);
-      }
-    })();
-  }, []);
-
-  const toggle = (id) => update((d) => {
-    const cur = [...(d.homeEntities || [])];
-    const i = cur.indexOf(id);
-    if (i >= 0) cur.splice(i, 1); else cur.push(id);
-    d.homeEntities = cur;
-    return d;
-  });
-
-  const filtered = (all || []).filter((e) => {
-    if (!q.trim()) return true;
-    const t = q.toLowerCase();
-    return e.name.toLowerCase().includes(t) || e.id.toLowerCase().includes(t);
-  });
-  const byDomain = {};
-  filtered.forEach((e) => { (byDomain[e.domain] = byDomain[e.domain] || []).push(e); });
-
-  return (
-    <div>
-      <div className="rounded-2xl p-4 mb-4" style={{ background: status?.reachable ? T.brandSoft : "#E86A4C12" }}>
-        <p style={{ fontSize: 14, color: status?.reachable ? T.brandInk : "#B4442A", lineHeight: 1.55 }}>
-          {status === null ? "Checking connection…"
-            : !status.configured ? "Not configured. Set HA_URL and HA_TOKEN in the server environment, then restart the server."
-              : status.reachable ? "Connected. Tick what should appear on the Home tab — cameras show as live stills."
-                : `Configured, but not reachable: ${status.error || "no response"}`}
-        </p>
-      </div>
-
-      <Field label="Link to full controls (optional)">
-        <input value={data.homeDashboardUrl || ""}
-          onChange={(e) => update((d) => { d.homeDashboardUrl = e.target.value; return d; })}
-          placeholder="http://homeassistant.local:8123/lovelace/0"
-          className="w-full px-4 py-3.5 rounded-xl text-base outline-none" style={inputStyle} />
-        <p style={{ color: T.faint, fontSize: 13 }} className="mt-2">
-          Adds a “Full controls” button on the Home tab that opens Home Assistant's own dashboard,
-          where you can actually change things.
-        </p>
-      </Field>
-
-      {all && all.length > 0 && (
-        <>
-          <div className="flex items-center justify-between mb-2 gap-2">
-            <span style={{ color: T.sub, fontSize: 13, fontWeight: 700 }} className="uppercase">
-              Show on Home ({chosen.length})
-            </span>
-            {chosen.length > 0 && (
-              <button onClick={() => update((d) => { d.homeEntities = []; return d; })}
-                className="tapfade px-3 py-1.5 rounded-full font-semibold" style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.sub, fontSize: 13 }}>
-                Clear all
-              </button>
-            )}
-          </div>
-          <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search lights, cameras, sensors…"
-            className="w-full px-4 py-3 rounded-xl text-base outline-none mb-3" style={inputStyle} />
-          <div className="flex flex-col gap-3 max-h-96 overflow-y-auto pr-1">
-            {Object.entries(byDomain).map(([domain, list]) => (
-              <div key={domain}>
-                <div style={{ color: T.faint, fontSize: 11, fontWeight: 800, letterSpacing: 1 }} className="uppercase mb-1.5">{domain}</div>
-                <div className="flex flex-col gap-1.5">
-                  {list.map((e) => {
-                    const on = chosen.includes(e.id);
-                    return (
-                      <button key={e.id} onClick={() => toggle(e.id)}
-                        className="tapfade text-left px-3 py-2.5 rounded-xl flex items-center gap-2.5"
-                        style={{ background: on ? T.brandSoft : T.panelAlt, border: `1px solid ${on ? T.brand : T.line}` }}>
-                        <span className="w-5 h-5 rounded flex items-center justify-center shrink-0"
-                          style={{ background: on ? T.brand : "transparent", border: `2px solid ${on ? T.brand : T.faint}` }}>
-                          {on && <CheckCircle2 size={13} style={{ color: "#fff" }} />}
-                        </span>
-                        <span className="min-w-0 flex-1">
-                          <span style={{ fontSize: 14.5, fontWeight: 600 }} className="block truncate">{e.name}</span>
-                          <span style={{ fontSize: 12, color: T.faint }} className="block truncate">{e.id}</span>
-                        </span>
-                        <span style={{ fontSize: 12.5, fontWeight: 700, color: T.sub }} className="shrink-0">{e.state}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
-            ))}
-            {filtered.length === 0 && <p style={{ color: T.faint, fontSize: 14 }}>No matches.</p>}
-          </div>
-        </>
-      )}
-    </div>
-  );
+// Home Assistant settings now live in components/HomeAssistantPanel.jsx: the
+// connection is per household and stored on the server, not a list of entity
+// ids inside the document. This shim keeps the Settings tab wiring unchanged.
+function HomeSettings() {
+  return <HomeAssistantPanel theme={T} />;
 }
 
 /* ---------------- Nightly check-in ----------------
@@ -5093,6 +5057,9 @@ function SettingsModal({ data, update, syncCalendars, close, currentUser }) {
       </Field>
       <Field label="Archive">
         <ArchivePanel theme={T} data={data} update={update} me={currentUser} />
+      </Field>
+      <Field label="Displays">
+        <DisplaysPanel theme={T} me={currentUser} />
       </Field>
       <Field label="Home Assistant">
         <HomeAssistantPanel theme={T} />

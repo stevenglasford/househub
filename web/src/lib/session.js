@@ -43,6 +43,9 @@ export const snapshot = () => ({
   version: state.version,
   isDisplay: Boolean(state.display),
   displayScopes: state.display?.scopes || null,
+  displayControlDomains: state.display?.controlDomains || [],
+  displayName: state.display?.name || null,
+  displayCanWrite: Boolean(state.display?.canWrite),
 });
 
 export const currentToken = () => state.token || state.display?.token || null;
@@ -518,6 +521,44 @@ export function currentActor(doc) {
     role: state.role,
   };
 }
+
+/* ------------------------------------------------------------- displays --- */
+
+export const listDisplays = () =>
+  request("GET", `api/households/${state.householdId}/displays`);
+
+export const createDisplay = (body) =>
+  request("POST", `api/households/${state.householdId}/displays`, body);
+
+/** A proof only this admin's key can produce, so the server cannot forge consent. */
+export async function approvalProofFor(displayId, displayPublicKeyB64) {
+  if (!state.keys) throw new Error("Sign in first.");
+  return C.approvalProof(state.keys, displayId, C.fromB64(displayPublicKeyB64));
+}
+
+export const approveDisplay = (id, decision, proof) =>
+  request("POST", `api/households/${state.householdId}/displays/${id}/approve`, { decision, proof });
+
+/**
+ * Wrap the household key to a display and collect its permanent link.
+ *
+ * The wrap happens here because the household key is here and nowhere else --
+ * which is what makes the multi-admin sign-off a real constraint rather than a
+ * server-side `if` somebody could patch out.
+ */
+export async function activateDisplay(displayId, displayPublicKey) {
+  if (!state.householdKey) throw new Error("The household is locked.");
+  const wrappedKey = await C.wrapHouseholdKey(state.householdKey, displayPublicKey, "display");
+  return request("POST", `api/households/${state.householdId}/displays/${displayId}/activate`, {
+    wrappedKey, publicKey: C.toB64(displayPublicKey),
+  });
+}
+
+export const updateDisplay = (id, patch) =>
+  request("PATCH", `api/households/${state.householdId}/displays/${id}`, patch);
+
+export const revokeDisplay = (id) =>
+  request("DELETE", `api/households/${state.householdId}/displays/${id}`);
 
 /* ------------------------------------------------------------ proposals --- */
 

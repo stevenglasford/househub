@@ -28,6 +28,7 @@ import calendarRoutes from "./routes/calendars.js";
 import proposalRoutes from "./routes/proposals.js";
 import homeRoutes from "./routes/home.js";
 import privacyRoutes from "./routes/privacy.js";
+import integrationRoutes from "./routes/integrations.js";
 import { loadDisplay } from "./routes/displays.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -71,6 +72,7 @@ export function createApp() {
   app.use("/api/households", calendarRoutes);
   app.use("/api/households", proposalRoutes);
   app.use("/api/households", displayRoutes.householdRouter);
+  app.use("/api/households/:householdId/integrations", integrationRoutes);
   app.use("/api/households/:householdId/home", homeRoutes.memberRouter);
   app.use("/api/display", displayRoutes.publicRouter);
   // The display side of the Home Assistant bridge authenticates with the same
