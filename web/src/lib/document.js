@@ -114,6 +114,19 @@ export function seed() {
     homeDashboardUrl: "",      // optional link out to HA's own dashboard
     upNextSources: null,       // null/empty = every source
     calendars: [],             // { id, name, color, personId, url, icsText, lastSync, error }
+    // Shared reminder snoozes: { "c<choreId>" | "t<taskId>": epochMs }.
+    //
+    // In the document rather than in each browser's local storage, because the
+    // document is what syncs. A snooze that lived on one device would leave the
+    // wall tablet still chiming after somebody silenced it on their phone, and
+    // the reminder would have to be dismissed once per screen in the house.
+    alertSnooze: {},
+    // Optional phone reminders, sent by the browser straight to a push service
+    // the household runs. Off unless somebody turns it on -- see lib/relay.js
+    // for what each party learns.
+    reminderRelay: { enabled: false, endpoint: "", priority: "default" },
+    alertRelayed: {},          // { alertKey: escalationStep } -- stops duplicate sends
+    noteDrift: false,          // gentle idle wander for the sticky notes
   };
 }
 
@@ -151,6 +164,12 @@ export function normalize(state) {
   if (!Array.isArray(state.homeEntities)) state.homeEntities = [];
   if (typeof state.homeDashboardUrl !== "string") state.homeDashboardUrl = "";
   if (!Array.isArray(state.calendars)) state.calendars = [];
+  if (!state.alertSnooze || typeof state.alertSnooze !== "object") state.alertSnooze = {};
+  if (!state.alertRelayed || typeof state.alertRelayed !== "object") state.alertRelayed = {};
+  if (!state.reminderRelay || typeof state.reminderRelay !== "object") {
+    state.reminderRelay = { ...d.reminderRelay };
+  }
+  if (state.noteDrift === undefined) state.noteDrift = d.noteDrift;
   // migrate the old single-source field to the multi-select list
   if (state.upNextSources === undefined) {
     state.upNextSources = (state.upNextSource && state.upNextSource !== "all")

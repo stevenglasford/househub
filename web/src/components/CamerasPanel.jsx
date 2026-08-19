@@ -12,6 +12,7 @@
 
 import React, { useState, useEffect, useCallback } from "react";
 import * as session from "../lib/session.js";
+import ActionButton from "./ActionButton.jsx";
 
 export default function CamerasPanel({ theme: T }) {
   const [state, setState] = useState(null);
@@ -22,6 +23,7 @@ export default function CamerasPanel({ theme: T }) {
   const [flags, setFlags] = useState({ showAlerts: true, showFaces: false, showRecordings: false });
   const [test, setTest] = useState(null);
   const [busy, setBusy] = useState(null);
+  const [note, setNote] = useState(null);
   const [error, setError] = useState(null);
 
   const load = useCallback(async () => {
@@ -54,44 +56,41 @@ export default function CamerasPanel({ theme: T }) {
     border: `1px solid ${T.line}`, background: T.panel, color: T.ink,
   };
 
+  /* None of these catch. ActionButton shows the failure beside the button and
+     withholds its success tick -- swallowing here would leave a button reporting
+     that it had connected to a camera system it never reached. */
   async function runTest() {
-    setBusy("test"); setError(null); setTest(null);
-    try { setTest(await session.testCameras({ url: url.trim(), password })); }
-    catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null); setTest(null);
+    setTest(await session.testCameras({ url: url.trim(), password }));
   }
 
   async function save() {
-    setBusy("save"); setError(null);
-    try {
-      await session.saveCameras({
-        url: url.trim(),
-        ...(password ? { password } : {}),
-        cameras: chosen,
-        ...flags,
-      });
-      setPassword("");
-      await load();
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null);
+    await session.saveCameras({
+      url: url.trim(),
+      ...(password ? { password } : {}),
+      cameras: chosen,
+      ...flags,
+    });
+    setPassword("");
+    await load();
   }
 
   async function loadAvailable() {
-    setBusy("list"); setError(null);
-    try { setAvailable(await session.availableCameras()); }
-    catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null);
+    setAvailable(await session.availableCameras());
   }
 
+  const DISCONNECT_WARNING =
+    "Disconnect CamWatch?\n\n" +
+    "The password is deleted from this server. Your footage, faces and recordings were " +
+    "never stored here and are untouched on your own machine.";
+
   async function disconnect() {
-    if (!confirm(
-      "Disconnect CamWatch?\n\n" +
-      "The password is deleted from this server. Your footage, faces and recordings were " +
-      "never stored here and are untouched on your own machine."
-    )) return;
-    setBusy("disconnect");
-    try {
-      const out = await session.disconnectCameras();
-      alert(out.note);
-      setState({ connected: false }); setUrl(""); setPassword(""); setChosen([]);
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null);
+    const out = await session.disconnectCameras();
+    setNote(out.note || null);
+    setState({ connected: false }); setUrl(""); setPassword(""); setChosen([]);
   }
 
   if (!state) return <p style={{ color: T.faint }}>Loading…</p>;
@@ -144,19 +143,26 @@ export default function CamerasPanel({ theme: T }) {
                placeholder={state.connected ? "•••••••• unchanged" : "your CamWatch password"} />
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button style={btn(false)} disabled={busy === "test" || !url || !password} onClick={runTest}>
-            {busy === "test" ? "Testing…" : "Test connection"}
-          </button>
-          <button style={btn(true)} disabled={busy === "save" || !url || (!password && !state.connected)}
-                  onClick={save}>
-            {busy === "save" ? "Saving…" : state.connected ? "Save changes" : "Connect"}
-          </button>
+          <ActionButton theme={T} onClick={runTest} disabled={!url || !password}
+            busyLabel="Testing…" doneLabel="Reached it">
+            Test connection
+          </ActionButton>
+          <ActionButton theme={T} variant="primary" onClick={save}
+            disabled={!url || (!password && !state.connected)}
+            busyLabel="Saving…" doneLabel={state.connected ? "Saved" : "Connected"}>
+            {state.connected ? "Save changes" : "Connect"}
+          </ActionButton>
           {state.connected && (
-            <button style={btn(false, true)} disabled={busy === "disconnect"} onClick={disconnect}>
+            <ActionButton theme={T} variant="danger" onClick={disconnect}
+              busyLabel="Disconnecting…" doneLabel="Disconnected" confirm={DISCONNECT_WARNING}>
               Disconnect
-            </button>
+            </ActionButton>
           )}
         </div>
+
+        {note && (
+          <div role="status" style={{ marginTop: 8, fontSize: 12.5, color: T.sub }}>{note}</div>
+        )}
 
         {test && (
           <div style={{ marginTop: 8, fontSize: 13, color: test.ok ? "#1e4620" : "#7a1c12" }}>
@@ -178,9 +184,10 @@ export default function CamerasPanel({ theme: T }) {
                   {chosen.length ? `${chosen.length} chosen` : "All of them"}
                 </div>
               </div>
-              <button style={btn(false)} disabled={busy === "list"} onClick={loadAvailable}>
-                {busy === "list" ? "Loading…" : available ? "Reload" : "Choose cameras"}
-              </button>
+              <ActionButton theme={T} onClick={loadAvailable}
+                busyLabel="Loading…" doneLabel="Loaded">
+                Refresh list
+              </ActionButton>
             </div>
 
             {available && (
@@ -212,7 +219,10 @@ export default function CamerasPanel({ theme: T }) {
             <Toggle id="showFaces" warn label="Enrolled faces"
                     hint="Biometric data — special category under GDPR. It stays on your own machine
                           and is only displayed here. Off unless you want it." />
-            <button style={btn(true)} disabled={busy === "save"} onClick={save}>Save</button>
+            <ActionButton theme={T} variant="primary" onClick={save}
+              busyLabel="Saving…" doneLabel="Saved">
+              Save
+            </ActionButton>
           </div>
 
           <div style={{ ...card, background: "#eef4ee", borderColor: "#bcd4bc" }}>

@@ -79,3 +79,16 @@ server/upgrades/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Test fixtures for the legacy importer are generated, not committed:
+#   python3 web/test/fixtures/make-legacy-db.py
+# They are real SQLite files written by SQLite itself, which is the point --
+# a fixture produced by our own reader would prove nothing.
+web/test/fixtures/*.db
+web/test/fixtures/*.db-wal
+web/test/fixtures/*.db-shm
+
+# Scratch bundles written by web/test/render.test.js, which must live inside
+# the project so Node can resolve `react` from them.
+web/node_modules/.hh-render-*
+web/node_modules/.hh-interact-*

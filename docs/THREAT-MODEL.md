@@ -95,8 +95,15 @@ Rotation cannot un-see what they already read. Nothing can.
 
 **Partially defended.** The display's link dies the moment it is revoked. But
 the device held the household key while it was running, and it renders from the
-full document — so a display "scoped" to three panels still had the whole
+full document — so a display "scoped" to three panels still has the whole
 document in memory.
+
+What the scopes do buy is navigation: a screen granted only the calendar shows
+only the calendar, and cannot be tapped through to the agenda or the check-in.
+That was documented from the start and, until recently, not actually
+implemented — every tab appeared on every display regardless of scope. It is
+enforced now, but it remains a passer-by control rather than a confidentiality
+boundary, and the paragraph below is the part that matters.
 
 This is a real limitation and it is not fixable without a redesign in which a
 member's device publishes pre-filtered projections for each display. That is a
@@ -137,6 +144,61 @@ fingerprint and asks the admin to confirm it. For a household this is easy —
 they are usually in the same room. The join flow says so explicitly rather than
 burying it.
 
+### Phone reminders, if a household turns them on
+
+Off by default, and it requires two separate deliberate acts to enable: the
+operator has to allowlist a host in `PUSH_HOSTS`, and a household has to switch
+it on and name a topic.
+
+When it is on, the **browser** — never this server — sends the reminder's title
+to the push service the household chose. That service sees the titles. HouseHub's
+server is not in the request path and learns nothing.
+
+This is the one place where plaintext deliberately leaves the browser for a third
+party, so it is stated plainly in the settings screen rather than in a footnote.
+Pointing it at an ntfy instance on your own machine keeps it inside the house.
+
+Two consequences worth being explicit about:
+
+- Every host in `PUSH_HOSTS` widens `connect-src`, and `connect-src` is part of
+  what stops injected script from posting key material somewhere useful. Exact
+  origins only; wildcards and plain `http` are refused at boot.
+- The reminder *evaluation* is unaffected. It happens in the browser against the
+  decrypted document, which is why there is no server endpoint listing what a
+  household has to do today. See [REMINDERS.md](REMINDERS.md) for why the
+  original app's `/api/alerts/due` could not be ported.
+
+### Display key escrow
+
+A display's private key, and its finished setup link, are stored sealed under
+the household key.
+
+They used to live only in the memory of the browser tab that proposed the
+display, which meant a screen every admin had approved could be activated by
+nobody but that person, on that device, before any refresh — and the link could
+never be shown twice, so the other people in the house could not set the screen
+up at all.
+
+Opening either requires the household key. Anyone holding that can already read
+everything the display will ever show, so this is not an escalation — a display
+link grants strictly less than the key that unseals it. Displays themselves are
+never served these fields, even though they hold the household key.
+
+The consequence worth stating: a former member who kept a copy of the household
+key could reconstruct display links. That is one more reason the UI presses for a
+key rotation when somebody is removed. Rotating makes this ciphertext unopenable
+and the display has to be recreated.
+
+### Household timezone
+
+A household's chosen timezone is stored **unencrypted**, because the server has
+to expand subscribed `.ics` feeds into calendar days and cannot do that blind.
+A zone name is coarse location data — roughly "which part of which continent".
+
+It is optional: leave it unset and the household falls back to the server
+default, at the cost of timed events sometimes landing on the wrong day. The
+calendar feeds themselves are sealed, as is their content.
+
 ### Traffic analysis
 
 The server sees when each household writes, and roughly how much. Over time that
@@ -171,6 +233,9 @@ an approximate location. Set `WEATHER_PROXY=1` to reverse the choice.
 | Calendar feed URL and body | Sealed under the server key | Browsers cannot fetch them (CORS) |
 | Member count, vault size | Plaintext | Quotas and billing |
 | Household name | Sealed under the *household* key | Shown in the member's list |
+| Household timezone | Plaintext, optional | Placing feed events on the right calendar day |
+| Display private key | Sealed under the *household* key | So any admin can finish a display, not only the tab that proposed it |
+| Display setup link | Sealed under the *household* key | So either partner can be shown the link without re-issuing it |
 
 Blind indexes are deterministic, so they leak "these two rows share an address"
 to anyone holding the pepper, and permit offline guess-and-check against a known

@@ -13,6 +13,7 @@
 
 import React, { useState, useEffect, useCallback, useMemo } from "react";
 import * as session from "../lib/session.js";
+import ActionButton from "./ActionButton.jsx";
 
 const DOMAIN_LABELS = {
   light: "Lights", switch: "Switches", fan: "Fans", cover: "Blinds & garage",
@@ -31,6 +32,7 @@ export default function HomeAssistantPanel({ theme: T }) {
   const [search, setSearch] = useState("");
   const [test, setTest] = useState(null);
   const [busy, setBusy] = useState(null);
+  const [note, setNote] = useState(null);
   const [error, setError] = useState(null);
 
   const load = useCallback(async () => {
@@ -62,29 +64,29 @@ export default function HomeAssistantPanel({ theme: T }) {
     border: `1px solid ${T.line}`, background: T.panel, color: T.ink,
   };
 
+  /* These three deliberately do not catch. ActionButton turns a rejection into
+     a message beside the button and keeps the button out of its success state --
+     whereas swallowing the error here would leave it reporting "Reached it"
+     after a connection that plainly failed. */
   async function runTest() {
-    setBusy("test"); setError(null); setTest(null);
-    try {
-      setTest(await session.request("POST", `api/households/${session.householdId()}/home/test`,
-        { url: url.trim(), token: token.trim() }));
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null); setTest(null);
+    setTest(await session.request("POST", `api/households/${session.householdId()}/home/test`,
+      { url: url.trim(), token: token.trim() }));
   }
 
   async function save(extra = {}) {
-    setBusy("save"); setError(null);
-    try {
-      await session.request("PUT", `api/households/${session.householdId()}/home`, {
-        url: url.trim(),
-        // Omitted when unchanged, so nobody re-pastes a token to tick a box.
-        ...(token.trim() ? { token: token.trim() } : {}),
-        dashboardUrl: dashboardUrl.trim() || null,
-        controlEnabled,
-        entities: chosen,
-        ...extra,
-      });
-      setToken("");
-      await load();
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null);
+    await session.request("PUT", `api/households/${session.householdId()}/home`, {
+      url: url.trim(),
+      // Omitted when unchanged, so nobody re-pastes a token to tick a box.
+      ...(token.trim() ? { token: token.trim() } : {}),
+      dashboardUrl: dashboardUrl.trim() || null,
+      controlEnabled,
+      entities: chosen,
+      ...extra,
+    });
+    setToken("");
+    await load();
   }
 
   async function loadEntities() {
@@ -95,17 +97,10 @@ export default function HomeAssistantPanel({ theme: T }) {
   }
 
   async function disconnect() {
-    if (!confirm(
-      "Disconnect Home Assistant?\n\n" +
-      "The access token is deleted from this server. Revoke it in Home Assistant too — " +
-      "deleting it here does not make it stop working there."
-    )) return;
-    setBusy("disconnect"); setError(null);
-    try {
-      const out = await session.request("DELETE", `api/households/${session.householdId()}/home`);
-      alert(out.note);
-      setState({ connected: false }); setUrl(""); setToken(""); setChosen([]);
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null);
+    const out = await session.request("DELETE", `api/households/${session.householdId()}/home`);
+    setNote(out.note || null);
+    setState({ connected: false }); setUrl(""); setToken(""); setChosen([]);
   }
 
   const grouped = useMemo(() => {
@@ -163,17 +158,21 @@ export default function HomeAssistantPanel({ theme: T }) {
                placeholder="http://192.168.1.50:8123/lovelace/0" />
 
         <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-          <button style={btn(false)} disabled={busy === "test" || !url || !token} onClick={runTest}>
-            {busy === "test" ? "Testing…" : "Test connection"}
-          </button>
-          <button style={btn(true)} disabled={busy === "save" || !url || (!token && !state.connected)}
-                  onClick={() => save()}>
-            {busy === "save" ? "Saving…" : state.connected ? "Save changes" : "Connect"}
-          </button>
+          <ActionButton theme={T} onClick={runTest} disabled={!url || !token}
+            busyLabel="Testing…" doneLabel="Reached it">
+            Test connection
+          </ActionButton>
+          <ActionButton theme={T} variant="primary" onClick={() => save()}
+            disabled={!url || (!token && !state.connected)}
+            busyLabel="Saving…" doneLabel={state.connected ? "Saved" : "Connected"}>
+            {state.connected ? "Save changes" : "Connect"}
+          </ActionButton>
           {state.connected && (
-            <button style={btn(false, true)} disabled={busy === "disconnect"} onClick={disconnect}>
+            <ActionButton theme={T} variant="danger" onClick={disconnect}
+              busyLabel="Disconnecting…" doneLabel="Disconnected"
+              confirm={"Disconnect Home Assistant?\n\nThe access token is deleted from this server. Revoke it in Home Assistant too — deleting it here does not make it stop working there."}>
               Disconnect
-            </button>
+            </ActionButton>
           )}
         </div>
 
@@ -212,9 +211,10 @@ export default function HomeAssistantPanel({ theme: T }) {
                 </span>
               </span>
             </label>
-            <button style={{ ...btn(true), marginTop: 8 }} disabled={busy === "save"} onClick={() => save()}>
+            <ActionButton theme={T} variant="primary" onClick={() => save()} style={{ marginTop: 8 }}
+              busyLabel="Saving…" doneLabel="Saved">
               Save
-            </button>
+            </ActionButton>
           </div>
 
           <div style={card}>
@@ -261,9 +261,10 @@ export default function HomeAssistantPanel({ theme: T }) {
                     </div>
                   ))}
                 </div>
-                <button style={{ ...btn(true), marginTop: 8 }} disabled={busy === "save"} onClick={() => save()}>
+                <ActionButton theme={T} variant="primary" onClick={() => save()} style={{ marginTop: 8 }}
+              busyLabel="Saving…" doneLabel="Saved">
                   Save selection
-                </button>
+                </ActionButton>
               </div>
             )}
           </div>

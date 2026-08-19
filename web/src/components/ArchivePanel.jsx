@@ -17,6 +17,7 @@
 import React, { useState, useEffect, useCallback, useMemo } from "react";
 import * as session from "../lib/session.js";
 import * as C from "../lib/completion.js";
+import ActionButton from "./ActionButton.jsx";
 
 const dayLabel = (key) => {
   if (!key) return "";
@@ -82,19 +83,20 @@ export default function ArchivePanel({ theme: T, data, update, me }) {
     } catch (err) { setError(err.message); } finally { setBusy(null); }
   }
 
+  // Uncaught on purpose: ActionButton shows a failure beside the button and
+  // withholds the tick. A swallowed error here would tell an admin their refusal
+  // had been recorded when it had not.
   async function decide(proposal, decision) {
-    setBusy(proposal.id); setError(null);
-    try {
-      const res = await session.decideProposal(proposal.id, decision);
-      // Approved by everyone: carry it out, then tell the server it happened so
-      // the audit trail records the wipe rather than only the agreement.
-      if (res.status === "approved") {
-        const collections = proposal.payload?.collections || [];
-        update((d) => C.wipeArchive(d, collections));
-        await session.markProposalApplied(proposal.id);
-      }
-      await refresh();
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null);
+    const res = await session.decideProposal(proposal.id, decision);
+    // Approved by everyone: carry it out, then tell the server it happened so
+    // the audit trail records the wipe rather than only the agreement.
+    if (res.status === "approved") {
+      const collections = proposal.payload?.collections || [];
+      update((d) => C.wipeArchive(d, collections));
+      await session.markProposalApplied(proposal.id);
+    }
+    await refresh();
   }
 
   /* ------------------------------------------------------ attribution --- */
@@ -130,12 +132,14 @@ export default function ArchivePanel({ theme: T, data, update, me }) {
             </div>
             {iAmAdmin && !mine && (
               <div style={{ display: "flex", gap: 8 }}>
-                <button style={btn(false, true)} disabled={busy === p.id} onClick={() => decide(p, "approve")}>
-                  Agree — wipe it
-                </button>
-                <button style={btn(false)} disabled={busy === p.id} onClick={() => decide(p, "deny")}>
-                  Refuse
-                </button>
+                  <ActionButton theme={T} variant="danger" onClick={() => decide(p, "approve")}
+                    busyLabel="Recording your agreement…" doneLabel="Agreed">
+                    Agree — wipe it
+                  </ActionButton>
+                  <ActionButton theme={T} onClick={() => decide(p, "deny")}
+                    busyLabel="Refusing…" doneLabel="Refused">
+                    Refuse
+                  </ActionButton>
               </div>
             )}
             {mine && <div style={{ fontSize: 13, color: "#6b4708" }}>You have already {mine.decision}d.</div>}

@@ -73,3 +73,57 @@ test("an empty document does not throw", () => {
   assert.equal(ctx.householdSize, 2);
   assert.equal(ctx.signals.overdueCount, 0);
 });
+
+/* ------------------------------------------------- walkthrough steps --- */
+//
+// The bug these lock in: the step list was recomputed on every render, with
+// each step present only while it was still outstanding. The status step
+// therefore vanished the moment everybody had recorded something — so with two
+// people, the second person's first slider deleted the step before they had set
+// the other two, and they could not finish. Every other step behaved the same
+// way, so the list shortened underneath you mid-walkthrough.
+
+import { buildCheckinSteps } from "../src/lib/checkin.js";
+
+test("the status step is offered whenever there is anybody to ask", () => {
+  const steps = buildCheckinSteps({ peopleCount: 2 });
+  assert.ok(steps.some((s) => s.id === "status"));
+});
+
+test("the status step does not depend on who has already recorded", () => {
+  // This is the whole fix. Nothing about what people have already done may
+  // decide whether they are still offered the chance to record or change it.
+  const before = buildCheckinSteps({ peopleCount: 2 });
+  const after = buildCheckinSteps({ peopleCount: 2 });
+  assert.deepEqual(before.map((s) => s.id), after.map((s) => s.id));
+});
+
+test("a household with nobody in it is not asked how they are", () => {
+  assert.ok(!buildCheckinSteps({ peopleCount: 0 }).some((s) => s.id === "status"));
+});
+
+test("the walkthrough always ends with tomorrow's time", () => {
+  for (const opts of [{}, { peopleCount: 2 }, { hasPrompt: true, overdueCount: 3, peopleCount: 1 }]) {
+    assert.equal(buildCheckinSteps(opts).at(-1).id, "time");
+  }
+});
+
+test("steps appear in a stable order", () => {
+  const steps = buildCheckinSteps({
+    hasPrompt: true, overdueCount: 2, slippedCount: 1, topicsCount: 4,
+    tomorrowCount: 3, mealsPlanned: false, peopleCount: 2,
+  });
+  assert.deepEqual(steps.map((s) => s.id),
+    ["prompt", "overdue", "slipped", "topics", "tomorrow", "meals", "status", "time"]);
+});
+
+test("empty sections are left out, but the list is never empty", () => {
+  const steps = buildCheckinSteps({ mealsPlanned: true, peopleCount: 0 });
+  assert.deepEqual(steps.map((s) => s.id), ["time"]);
+});
+
+test("counts are carried through for the progress display", () => {
+  const steps = buildCheckinSteps({ overdueCount: 5, topicsCount: 2, peopleCount: 1 });
+  assert.equal(steps.find((s) => s.id === "overdue").count, 5);
+  assert.equal(steps.find((s) => s.id === "topics").count, 2);
+});

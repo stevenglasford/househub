@@ -13,7 +13,7 @@
 import { q } from "../db/pool.js";
 import { seal, openText } from "../crypto/seal.js";
 import { safeFetch, BlockedRequestError } from "./safe-fetch.js";
-import { parseICS, expandEvents } from "./ics.js";
+import { parseICS, expandEvents, DEFAULT_TZ, isValidTimeZone } from "./ics.js";
 import { REFRESH_MINUTES } from "../config.js";
 
 /**
@@ -98,8 +98,24 @@ export async function refreshFeed(id) {
   }
 }
 
+/**
+ * The zone this household measures calendar days in.
+ *
+ * Looked up here rather than passed in by callers so that every path into feed
+ * expansion gets it -- the signed-in app and the kiosk display both reach
+ * eventsFor, and a display quietly using the server's zone instead of the
+ * household's would put evening events on the wrong tile of the one screen
+ * nobody is logged into to notice.
+ */
+export async function timezoneFor(householdId) {
+  const { rows } = await q("SELECT timezone FROM households WHERE id = $1", [householdId]);
+  const tz = rows[0]?.timezone;
+  return isValidTimeZone(tz) ? tz : DEFAULT_TZ;
+}
+
 /** Expanded events for a window. Parsed per request; feeds are small. */
 export async function eventsFor(householdId, start, end) {
+  const tz = await timezoneFor(householdId);
   const { rows } = await q(
     "SELECT id, ics_enc FROM calendar_feeds WHERE household_id = $1 AND ics_enc IS NOT NULL",
     [householdId]
@@ -109,7 +125,7 @@ export async function eventsFor(householdId, start, end) {
   for (const row of rows) {
     try {
       const text = openText("calendarIcs", row.ics_enc, householdId);
-      out.push(...expandEvents(parseICS(text), start, end).map((e) => ({ ...e, feedId: row.id })));
+      out.push(...expandEvents(parseICS(text, tz), start, end, tz).map((e) => ({ ...e, feedId: row.id })));
     } catch {
       // One malformed feed must not blank the whole calendar.
     }

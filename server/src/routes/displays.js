@@ -91,6 +91,11 @@ householdRouter.post("/:householdId/displays",
       // public half is sent; the private half goes into the setup link's URL
       // fragment, which browsers never transmit.
       publicKey: b64(64),
+      /* The private half, sealed under the household key by the proposing
+         browser. Opaque here -- the server holds no key that opens it. It is
+         stored so that *any* admin can activate the display and re-issue its
+         link, rather than only the tab that happened to propose it. */
+      privateKeyEnc: b64(512).optional(),
       expiresAt: z.string().datetime().nullable().optional(),
       // Off unless asked for. A screen that can only show things is the safe
       // default; ticking a chore off from the kitchen is opt-in.
@@ -119,10 +124,11 @@ householdRouter.post("/:householdId/displays",
 
     const { rows } = await q(
       `INSERT INTO displays (household_id, name, public_key, scopes, expires_at, created_by,
-                             status, can_write, control_domains)
-       VALUES ($1, $2, $3, $4::jsonb, $5, $6, 'pending', $7, $8::jsonb) RETURNING id, created_at`,
+                             status, can_write, control_domains, private_key_enc)
+       VALUES ($1, $2, $3, $4::jsonb, $5, $6, 'pending', $7, $8::jsonb, $9) RETURNING id, created_at`,
       [req.household.id, body.name, bin(body.publicKey), JSON.stringify(body.scopes),
-       body.expiresAt || null, req.user.id, body.canWrite, JSON.stringify(body.controlDomains)]
+       body.expiresAt || null, req.user.id, body.canWrite, JSON.stringify(body.controlDomains),
+       body.privateKeyEnc || null]
     );
     const display = rows[0];
 
@@ -153,7 +159,7 @@ householdRouter.get("/:householdId/displays", requireAuth, loadHousehold(), wrap
   const { rows } = await q(
     `SELECT d.id, d.name, d.scopes, d.status, d.expires_at, d.last_seen_at,
             d.created_by, d.created_at, d.activated_at, d.public_key,
-            d.can_write, d.control_domains,
+            d.can_write, d.control_domains, d.private_key_enc, d.link_enc,
             COALESCE(json_agg(json_build_object('userId', a.user_id, 'decision', a.decision))
                      FILTER (WHERE a.user_id IS NOT NULL), '[]') AS approvals
        FROM displays d
@@ -175,6 +181,10 @@ householdRouter.get("/:householdId/displays", requireAuth, loadHousehold(), wrap
     createdAt: d.created_at,
     activatedAt: d.activated_at,
     publicKey: Buffer.from(d.public_key).toString("base64"),
+      // Ciphertext the server cannot read. It is what lets any admin finish
+      // setting this display up, and any member be shown its link again.
+      privateKeyEnc: d.private_key_enc || null,
+      linkEnc: d.link_enc || null,
     canWrite: d.can_write,
     controlDomains: d.control_domains,
     approvals: d.approvals,
@@ -323,6 +333,36 @@ householdRouter.post("/:householdId/displays/:id/activate",
     });
   })
 );
+
+/* --------------------------------------------------- link escrow ---------- */
+
+/**
+ * Keep a copy of the finished link that the household can open and the server
+ * cannot.
+ *
+ * The alternative was minting a fresh token whenever somebody wanted the link
+ * again -- which would silently knock a screen that was already running off the
+ * air, because its token would no longer be the current one. This way the link
+ * can be shown as many times as the household needs, to whichever member needs
+ * it, and the display in the hall carries on unaffected.
+ *
+ * The body is ciphertext sealed under the household key. The server stores it
+ * and can make no use of it whatsoever.
+ */
+householdRouter.put("/:householdId/displays/:id/link",
+  requireAuth, loadHousehold(), requireRole("admin"), requireWritable,
+  wrap(async (req, res) => {
+    const body = parse(z.object({ linkEnc: b64(2048).nullable() }), req.body);
+
+    const { rowCount } = await q(
+      "UPDATE displays SET link_enc = $3 WHERE id = $1 AND household_id = $2",
+      [req.params.id, req.household.id, body.linkEnc || null]
+    );
+    if (!rowCount) throw notFound();
+    res.json({ ok: true });
+  })
+);
+
 
 /* -------------------------------------------------------------- update ----- */
 

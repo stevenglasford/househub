@@ -311,6 +311,9 @@ describe("a family with a child and a wall display", () => {
       body: {
         name: "Kitchen iPad", scopes: ["today", "todos"],
         publicKey: C.toB64(keys.publicKey), canWrite: true,
+        // The private half, sealed under the household key, so that whichever
+        // parent is standing in the kitchen can finish the job.
+        privateKeyEnc: await C.sealDisplayPrivateKey(home.hk, keys.privateKey),
       },
     });
     assert.equal(proposed.status, 201);
@@ -346,6 +349,68 @@ describe("a family with a child and a wall display", () => {
     const boot = await api("GET", "/api/display/bootstrap", { token: display.token });
     assert.equal(boot.status, 200);
     assert.equal(boot.body.canWrite, true);
+  });
+
+  /* The failure that prompted this: a display both parents had approved could be
+     activated by neither, because the private key lived only in the tab that
+     proposed it. A refresh was enough to strand it permanently. */
+  test("either parent can finish a display, on any device", async () => {
+    const keys = C.newDisplayKeypair();
+    const proposed = await api("POST", `/api/households/${home.id}/displays`, {
+      token: parentA.token,
+      body: {
+        name: "Hall tablet", scopes: ["today"],
+        publicKey: C.toB64(keys.publicKey),
+        privateKeyEnc: await C.sealDisplayPrivateKey(home.hk, keys.privateKey),
+      },
+    });
+    assert.equal(proposed.status, 201);
+    const id = proposed.body.id;
+
+    const proof = await C.approvalProof(parentB.keys, id, keys.publicKey);
+    await api("POST", `/api/households/${home.id}/displays/${id}/approve`, {
+      token: parentB.token, body: { decision: "approve", proof },
+    });
+
+    // Parent B never held this key. Everything they need comes from the list.
+    const list = await api("GET", `/api/households/${home.id}/displays`, { token: parentB.token });
+    const mine = list.body.find((d) => d.id === id);
+    assert.ok(mine.privateKeyEnc, "the escrowed key must reach the other parent");
+
+    const recovered = await C.openDisplayPrivateKey(home.hk, mine.privateKeyEnc);
+    assert.ok(recovered, "and their browser must be able to open it");
+    assert.deepEqual(C.publicKeyFromPrivate(recovered), keys.publicKey,
+      "recovered key must match the one the display was registered with");
+
+    const activated = await api("POST", `/api/households/${home.id}/displays/${id}/activate`, {
+      token: parentB.token,
+      body: {
+        wrappedKey: await C.wrapHouseholdKey(home.hk, C.publicKeyFromPrivate(recovered), "display"),
+        publicKey: C.toB64(C.publicKeyFromPrivate(recovered)),
+      },
+    });
+    assert.equal(activated.status, 200, "the other parent must be able to activate it");
+
+    // And the finished link is kept where both of them can reach it.
+    const url = `${activated.body.url}.${C.toB64(recovered)}`;
+    const escrow = await api("PUT", `/api/households/${home.id}/displays/${id}/link`, {
+      token: parentB.token, body: { linkEnc: await C.sealName(home.hk, url) },
+    });
+    assert.equal(escrow.status, 200);
+
+    const asA = await api("GET", `/api/households/${home.id}/displays`, { token: parentA.token });
+    const seenByA = asA.body.find((d) => d.id === id);
+    assert.equal(await C.openName(home.hk, seenByA.linkEnc), url,
+      "the parent who never saw the link must get the identical one");
+  });
+
+  test("a display is never served the escrowed key or link", async () => {
+    // Opening the escrow needs the household key, which a display does hold --
+    // so the protection is that these fields never appear on a display route.
+    const boot = await api("GET", "/api/display/bootstrap", { token: display.token });
+    assert.equal(boot.status, 200);
+    assert.equal(boot.body.privateKeyEnc, undefined);
+    assert.equal(boot.body.linkEnc, undefined);
   });
 
   test("the child ticks a chore off on the tablet and it is credited to the screen", async () => {

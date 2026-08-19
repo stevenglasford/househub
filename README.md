@@ -31,6 +31,13 @@ else follows from it.
 - **Meals** — breakfast/lunch/dinner per person, eat-in or to-go, with who's
   cooking
 - **To-dos** — recurring chores and one-off tasks; missed items carry over
+- **Reminders** — any chore or task can chime if it isn't done by a set time,
+  repeating until it is and stopping at a cutoff. A banner, or a full-screen
+  takeover for the ones that matter. Snoozes are shared, so silencing it on a
+  phone quiets the tablet too. See [docs/REMINDERS.md](docs/REMINDERS.md)
+- **History** — a window back over completed chores, tasks and projects (7 days
+  to 3 months), with a per-person tally and the ability to correct who got credit
+  after the fact
 - **Grocery** — a shared list, sorted by aisle or store, with purchase history
 - **Projects** — house projects with percent-complete tracking
 - **Agenda** — things to talk about tonight, filed into a dated archive
@@ -84,6 +91,18 @@ and "sexual discovery for partners" produce very different check-in questions,
 and the app has no business guessing which you are.
 
 **Open source, MIT.** Host it for your family, or for a hundred.
+
+## Coming from the old HouseHub?
+
+Everything moves across — people, chores and their full completion history,
+tasks, meals, notes, projects, the agenda archive, check-in history and calendar
+subscriptions. **Settings → Import from the old HouseHub**, drop the old
+`househub.db` on, and read what it found before committing.
+
+The conversion happens entirely in your browser, because the server cannot read
+your household and so could not do it for you. See
+[docs/MIGRATING.md](docs/MIGRATING.md) — particularly the bit about copying the
+`-wal` file, which is the one way to lose recent data.
 
 ## Quick start
 

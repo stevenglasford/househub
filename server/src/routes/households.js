@@ -26,6 +26,7 @@ import { seal, openText, blindIndex } from "../crypto/seal.js";
 import { hashPassword } from "../crypto/password.js";
 import { newToken, hashToken } from "../crypto/tokens.js";
 import { audit, recentForHousehold } from "../services/audit.js";
+import { DEFAULT_TZ, isValidTimeZone } from "../services/ics.js";
 import { PUBLIC_URL } from "../config.js";
 
 export const router = express.Router();
@@ -702,21 +703,61 @@ router.put("/:householdId/settings",
       nameEnc: b64(1024).optional(),
       // 0 means "every current admin must approve a display".
       displayApprovalThreshold: z.number().int().min(0).max(20).optional(),
+      // IANA zone name, or "" to go back to the server default.
+      timezone: z.string().max(64).optional(),
     }), req.body);
+
+    // Validated rather than trusted: this string is handed to Intl on every
+    // feed expansion, and a household that saved rubbish here would silently
+    // fall back to UTC offsets and misplace its own evening events.
+    if (body.timezone && !isValidTimeZone(body.timezone)) {
+      throw badRequest(`"${body.timezone}" is not a timezone this server recognises`);
+    }
 
     await q(
       `UPDATE households
           SET name_enc = COALESCE($2, name_enc),
               display_approval_threshold = COALESCE($3, display_approval_threshold),
+              timezone = CASE WHEN $4::text IS NULL THEN timezone
+                              WHEN $4 = '' THEN NULL
+                              ELSE $4 END,
               updated_at = now()
         WHERE id = $1`,
       [req.household.id, body.nameEnc ? bin(body.nameEnc) : null,
-       body.displayApprovalThreshold ?? null]
+       body.displayApprovalThreshold ?? null,
+       body.timezone ?? null]
     );
     await audit("household_settings_changed", { householdId: req.household.id, actorUserId: req.user.id });
     res.json({ ok: true });
   })
 );
+
+/* ---------------------------------------------------------- timezone ------ */
+
+/**
+ * What zone this household's calendar days are actually being measured in, and
+ * whether anyone chose it.
+ *
+ * Worth an endpoint of its own because a wrong zone is invisible: nothing
+ * errors, evening events simply appear on the following day and the calendar
+ * slowly loses the household's trust. The settings screen shows this next to
+ * the browser's own zone so a mismatch is something you can see rather than
+ * something you have to suspect.
+ */
+router.get("/:householdId/timezone", requireAuth, loadHousehold(), wrap(async (req, res) => {
+  const { rows } = await q("SELECT timezone FROM households WHERE id = $1", [req.household.id]);
+  const chosen = rows[0]?.timezone || null;
+  const effective = isValidTimeZone(chosen) ? chosen : DEFAULT_TZ;
+  res.json({
+    timezone: chosen,
+    effective,
+    serverDefault: DEFAULT_TZ,
+    configured: Boolean(chosen),
+    warning: chosen ? null
+      : `No timezone chosen for this household, so days are being measured in ${DEFAULT_TZ}. `
+        + "If that is not where you live, timed calendar events can land on the wrong day.",
+  });
+}));
 
 /* ------------------------------------------------------------- leave ------- */
 

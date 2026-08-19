@@ -18,9 +18,10 @@
 // Reading eight groups of hex aloud to the person sitting next to you closes
 // that, and nothing else does.
 
-import React, { useState, useEffect, useCallback } from "react";
+import React, { useState, useEffect, useCallback, useMemo } from "react";
 import * as session from "../lib/session.js";
 import { keyFingerprint } from "../lib/crypto.js";
+import ActionButton from "./ActionButton.jsx";
 
 /**
  * Copy to clipboard, and say whether it worked.
@@ -69,7 +70,29 @@ export default function HouseholdPanel({ theme: T, me, householdName }) {
   const [error, setError] = useState(null);
   const [confirming, setConfirming] = useState(null);
   const [copied, setCopied] = useState(null);   // 'ok' | 'failed'
+  const [tz, setTz] = useState(null);
 
+  // What this device thinks the zone is. Only ever a suggestion -- the household
+  // is the authority, since its members may not all be sitting in it.
+  const browserTz = useMemo(
+    () => Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", []);
+
+  /* A short list rather than the full IANA set: the browser's own zone, the
+     server default, whatever is already chosen, and the common ones. Anything
+     else can still be set through the API, and the server validates it. */
+  const zoneChoices = useMemo(() => {
+    const common = [
+      "America/Los_Angeles", "America/Denver", "America/Chicago", "America/New_York",
+      "America/Anchorage", "Pacific/Honolulu", "America/Sao_Paulo",
+      "Europe/London", "Europe/Dublin", "Europe/Lisbon", "Europe/Madrid", "Europe/Paris",
+      "Europe/Berlin", "Europe/Amsterdam", "Europe/Stockholm", "Europe/Warsaw",
+      "Europe/Athens", "Europe/Kyiv", "Africa/Lagos", "Africa/Johannesburg",
+      "Asia/Jerusalem", "Asia/Dubai", "Asia/Kolkata", "Asia/Bangkok", "Asia/Shanghai",
+      "Asia/Tokyo", "Asia/Seoul", "Australia/Perth", "Australia/Sydney",
+      "Pacific/Auckland", "UTC",
+    ];
+    return [...new Set([browserTz, tz?.serverDefault, tz?.timezone, ...common].filter(Boolean))].sort();
+  }, [browserTz, tz?.serverDefault, tz?.timezone]);
 
   const refresh = useCallback(async () => {
     setError(null);
@@ -81,28 +104,36 @@ export default function HouseholdPanel({ theme: T, me, householdName }) {
       setError(err.message);
       setMembers([]);
     }
+    // Separate, and deliberately not fatal: a household that cannot read its
+    // timezone should still get the member list it came here for.
+    try { setTz(await session.getTimezone()); } catch { /* leave it unknown */ }
   }, []);
+
+  async function saveTimezone(value) {
+    setBusy("tz"); setError(null);
+    try {
+      await session.setTimezone(value);
+      setTz(await session.getTimezone());
+    } catch (err) { setError(err.message); } finally { setBusy(null); }
+  }
+
 
   useEffect(() => { refresh(); }, [refresh]);
 
   const iAmAdmin = members?.find((m) => m.userId === me?.id)?.role === "admin";
 
   async function makeInvite() {
-    setBusy("invite"); setError(null);
-    try {
-      const res = await session.createInvite({ role: inviteRole, expiresInHours: 72 });
-      setNewLink(res.url);            // shown once; the server keeps only a hash
-      await refresh();
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    const res = await session.createInvite({ role: inviteRole, expiresInHours: 72 });
+    setNewLink(res.url);            // shown once; the server keeps only a hash
+    await refresh();
   }
 
+  /* Throws rather than swallowing: ActionButton turns a rejection into a
+     message beside the button, which is where somebody is looking. */
   async function grant(member) {
-    setBusy(member.userId); setError(null);
-    try {
-      await session.grantAccess(member.userId, member.publicKey);
-      setConfirming(null);
-      await refresh();
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    await session.grantAccess(member.userId, member.publicKey);
+    setConfirming(null);
+    await refresh();
   }
 
   async function changeRole(member, role) {
@@ -112,15 +143,14 @@ export default function HouseholdPanel({ theme: T, me, householdName }) {
   }
 
   async function remove(member) {
-    if (!confirm(
-      `Remove this person from the household?\n\n` +
-      `They lose access immediately. Rotate the household key afterwards — until you do, ` +
-      `anything they already downloaded stays readable to them.`
-    )) return;
-    setBusy(member.userId); setError(null);
-    try { await session.removeMember(member.userId); await refresh(); }
-    catch (err) { setError(err.message); } finally { setBusy(null); }
+    await session.removeMember(member.userId);
+    await refresh();
   }
+
+  const REMOVE_WARNING =
+    "Remove this person from the household?\n\n" +
+    "They lose access immediately. Rotate the household key afterwards — until you do, " +
+    "anything they already downloaded stays readable to them.";
 
   const card = {
     background: T.panelAlt, border: `1px solid ${T.line}`,
@@ -142,22 +172,20 @@ export default function HouseholdPanel({ theme: T, me, householdName }) {
 
   return (
     <div>
-      {/* Which household this is, and the way out of it. Switching used to mean
-          signing out and back in, which is a strange thing to have to do to look
-          at a different calendar. */}
-      <div style={{ ...card, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
-        <div>
-          <div style={{ fontWeight: 600, color: T.ink }}>{householdName || "This household"}</div>
-          <div style={{ color: T.faint, fontSize: 12 }}>
-            {active.length} {active.length === 1 ? "person" : "people"} · you are {members.find((m) => m.userId === me?.id)?.role || "a member"}
-          </div>
+      {/* Which household this is.
+          There is deliberately no "Switch household" button here any more. It
+          used to sit in this card -- directly above the "Waiting for you"
+          section -- so the control that throws away the whole screen was the
+          nearest neighbour of the two-tap flow for letting somebody in. A
+          near-miss there does not misfire harmlessly: it closes the household,
+          and the admin lands back at the picker wondering why the grant did
+          nothing. The same button already exists under Settings → Account,
+          which is where a navigation control belongs. */}
+      <div style={{ ...card }}>
+        <div style={{ fontWeight: 600, color: T.ink }}>{householdName || "This household"}</div>
+        <div style={{ color: T.faint, fontSize: 12 }}>
+          {active.length} {active.length === 1 ? "person" : "people"} · you are {members.find((m) => m.userId === me?.id)?.role || "a member"}
         </div>
-        <button
-          style={btn(false)}
-          onClick={() => window.dispatchEvent(new CustomEvent("househub:switch-household"))}
-        >
-          Switch household
-        </button>
       </div>
 
       {error && (
@@ -199,10 +227,24 @@ export default function HouseholdPanel({ theme: T, me, householdName }) {
                   <p style={{ fontSize: 13, color: T.ink, marginBottom: 8 }}>
                     Does that match exactly what they see on their screen?
                   </p>
+                  {/* Repeated here as well as at the top of the panel. This list
+                      can be long, and a failure announced above the fold of a
+                      scrolled panel reads as the button having done nothing at
+                      all -- which is precisely the report that sent us looking
+                      for this. */}
+                  {error && (
+                    <div role="alert" style={{
+                      background: "#fdecea", border: "1px solid #f0b4ae", color: "#7a1c12",
+                      borderRadius: 8, padding: "8px 10px", fontSize: 12.5, marginBottom: 8,
+                    }}>
+                      {error}
+                    </div>
+                  )}
                   <div style={{ display: "flex", gap: 8 }}>
-                    <button style={btn(true)} disabled={busy === m.userId} onClick={() => grant(m)}>
-                      {busy === m.userId ? "Granting…" : "Yes — let them in"}
-                    </button>
+                    <ActionButton theme={T} variant="primary" onClick={() => grant(m)}
+                      busyLabel="Letting them in…" doneLabel="They're in">
+                      Yes — let them in
+                    </ActionButton>
                     <button style={btn(false)} onClick={() => setConfirming(null)}>Cancel</button>
                   </div>
                 </div>
@@ -211,13 +253,68 @@ export default function HouseholdPanel({ theme: T, me, householdName }) {
                   <button style={btn(true)} disabled={!iAmAdmin} onClick={() => setConfirming(m.userId)}>
                     Grant access
                   </button>
-                  <button style={btn(false)} onClick={() => remove(m)}>Decline</button>
+                  <ActionButton theme={T} onClick={() => remove(m)} confirm={REMOVE_WARNING}
+                    busyLabel="Declining…" doneLabel="Declined">Decline</ActionButton>
                 </div>
               )}
             </div>
           ))}
         </div>
       )}
+
+      {/* ---- which zone days are measured in ---- */}
+      <h4 style={{ fontWeight: 700, marginBottom: 6, color: T.ink }}>Timezone</h4>
+      <div style={card}>
+        {tz === null ? (
+          <div style={{ color: T.faint, fontSize: 13 }}>Checking…</div>
+        ) : (
+          <>
+            <p style={{ color: T.faint, fontSize: 13, marginBottom: 10 }}>
+              Which zone this household's calendar days are measured in. Subscribed
+              calendars are expanded into days on the server, so if this is wrong,
+              evening events quietly land on the following day — nothing errors, the
+              calendar is just gently untrustworthy.
+            </p>
+
+            {/* A mismatch is the whole reason this is worth showing: nobody goes
+                looking for a timezone setting, they just stop believing the wall
+                display. */}
+            {tz.effective !== browserTz && (
+              <div role="alert" style={{
+                background: "#fff6e5", border: "1px solid #f0d9a8", color: "#6b4708",
+                borderRadius: 8, padding: "8px 10px", fontSize: 13, marginBottom: 10,
+              }}>
+                This browser is in <strong>{browserTz}</strong> but the household is set
+                to <strong>{tz.effective}</strong>
+                {!tz.configured && " (the server default, because nothing has been chosen)"}.
+                If you live in {browserTz}, pick it below.
+              </div>
+            )}
+
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+              <select
+                value={tz.timezone || ""}
+                onChange={(e) => saveTimezone(e.target.value)}
+                disabled={!iAmAdmin || busy === "tz"}
+                style={{
+                  background: T.panel, color: T.ink, border: `1px solid ${T.line}`,
+                  borderRadius: 8, padding: "8px 10px", minWidth: 240,
+                }}
+              >
+                <option value="">Server default ({tz.serverDefault})</option>
+                {zoneChoices.map((z) => <option key={z} value={z}>{z}</option>)}
+              </select>
+              {busy === "tz" && <span style={{ color: T.faint, fontSize: 13 }}>Saving…</span>}
+            </div>
+
+            <div style={{ color: T.faint, fontSize: 12.5, marginTop: 8 }}>
+              Days are currently measured in <strong>{tz.effective}</strong>.
+              {!iAmAdmin && " Only an admin can change this."}
+            </div>
+          </>
+        )}
+      </div>
+
 
       {/* ---- current members ---- */}
       <h4 style={{ fontWeight: 700, marginBottom: 8, color: T.ink }}>Members ({active.length})</h4>
@@ -248,7 +345,8 @@ export default function HouseholdPanel({ theme: T, me, householdName }) {
                 {Object.keys(ROLE_HELP).map((r) => <option key={r} value={r}>{r}</option>)}
               </select>
               {iAmAdmin && m.userId !== me?.id && (
-                <button style={btn(false)} disabled={busy === m.userId} onClick={() => remove(m)}>Remove</button>
+                <ActionButton theme={T} onClick={() => remove(m)} confirm={REMOVE_WARNING}
+                  busyLabel="Removing…" doneLabel="Removed">Remove</ActionButton>
               )}
             </div>
           </div>
@@ -302,9 +400,10 @@ export default function HouseholdPanel({ theme: T, me, householdName }) {
               >
                 {Object.keys(ROLE_HELP).map((r) => <option key={r} value={r}>{r}</option>)}
               </select>
-              <button style={btn(true)} disabled={busy === "invite"} onClick={makeInvite}>
-                {busy === "invite" ? "Creating…" : "Create invite link"}
-              </button>
+              <ActionButton theme={T} variant="primary" onClick={makeInvite}
+                busyLabel="Creating…" doneLabel="Link created">
+                Create invite link
+              </ActionButton>
             </div>
           )}
 

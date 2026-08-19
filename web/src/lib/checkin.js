@@ -178,3 +178,45 @@ export async function suggestDateIdea(doc, { jar, existing } = {}) {
   });
   return res?.idea || null;
 }
+
+/**
+ * The list of things tonight's walkthrough will go through.
+ *
+ * Worked out ONCE, when the walkthrough opens, and then held still. It used to
+ * be recomputed on every render with each step included only while it was still
+ * outstanding, which had two consequences, both reported as the check-in being
+ * broken:
+ *
+ *   * The status step disappeared as soon as everybody had recorded something.
+ *     With two people that meant the second person moving their first slider
+ *     deleted the step out from under themselves, before they had set the other
+ *     two. They could not finish.
+ *   * Every other step did the same, so the list shortened underneath you and
+ *     the walkthrough jumped to whatever now occupied that index.
+ *
+ * A walkthrough is a fixed list. Deciding what is on it belongs at the start;
+ * after that, doing something must not change what you are being asked.
+ */
+export function buildCheckinSteps({
+  hasPrompt = false,
+  overdueCount = 0,
+  slippedCount = 0,
+  topicsCount = 0,
+  tomorrowCount = 0,
+  mealsPlanned = true,
+  peopleCount = 0,
+} = {}) {
+  const steps = [];
+  if (hasPrompt) steps.push({ id: "prompt", label: "Tonight's question" });
+  if (overdueCount) steps.push({ id: "overdue", label: "Overdue", count: overdueCount });
+  if (slippedCount) steps.push({ id: "slipped", label: "Projects that slipped", count: slippedCount });
+  if (topicsCount) steps.push({ id: "topics", label: "Things to talk about", count: topicsCount });
+  if (tomorrowCount) steps.push({ id: "tomorrow", label: "Tomorrow", count: tomorrowCount });
+  if (!mealsPlanned) steps.push({ id: "meals", label: "Tomorrow's meals" });
+  // Offered whenever there is anybody to ask, and never withdrawn part-way:
+  // somebody who already recorded a score may want to change it, and the other
+  // person has not been asked yet.
+  if (peopleCount) steps.push({ id: "status", label: "How we're doing" });
+  steps.push({ id: "time", label: "Tomorrow's check-in" });
+  return steps;
+}

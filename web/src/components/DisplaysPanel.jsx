@@ -22,6 +22,7 @@ import React, { useState, useEffect, useCallback } from "react";
 import * as session from "../lib/session.js";
 import * as C from "../lib/crypto.js";
 import { appPath } from "../lib/paths.js";
+import ActionButton from "./ActionButton.jsx";
 
 const SCOPES = [
   ["today", "Today", "The dashboard: schedule, meals, to-dos"],
@@ -63,6 +64,7 @@ async function copyText(text) {
 export default function DisplaysPanel({ theme: T, me }) {
   const [displays, setDisplays] = useState(null);
   const [error, setError] = useState(null);
+  const [note, setNote] = useState(null);
   const [busy, setBusy] = useState(null);
   const [creating, setCreating] = useState(false);
   const [link, setLink] = useState(null);
@@ -70,7 +72,6 @@ export default function DisplaysPanel({ theme: T, me }) {
 
   // Held only until the display is activated: the private half of the new
   // screen's keypair, which never goes to the server.
-  const [pending, setPending] = useState({});
 
   const [form, setForm] = useState({
     name: "", scopes: ["today"], expiresAt: "", canWrite: false, controlDomains: [],
@@ -104,36 +105,34 @@ export default function DisplaysPanel({ theme: T, me }) {
 
   async function propose(e) {
     e.preventDefault();
-    setBusy("create"); setError(null);
-    try {
-      // Generated here. The server only ever receives the public half.
-      const keys = C.newDisplayKeypair();
-      const created = await session.createDisplay({
-        name: form.name.trim(),
-        scopes: form.scopes,
-        publicKey: C.toB64(keys.publicKey),
-        expiresAt: form.expiresAt ? new Date(form.expiresAt).toISOString() : null,
-        canWrite: form.canWrite,
-        controlDomains: form.controlDomains,
-      });
-      setPending((p) => ({ ...p, [created.id]: keys }));
-      setCreating(false);
-      setForm({ name: "", scopes: ["today"], expiresAt: "", canWrite: false, controlDomains: [] });
-      await refresh();
+    setError(null);
+    // session.createDisplay generates the keypair and escrows the private half
+    // sealed under the household key, so this no longer depends on the key
+    // surviving in this tab.
+    const created = await session.createDisplay({
+      name: form.name.trim(),
+      scopes: form.scopes,
+      expiresAt: form.expiresAt ? new Date(form.expiresAt).toISOString() : null,
+      canWrite: form.canWrite,
+      controlDomains: form.controlDomains,
+    });
+    setCreating(false);
+    setForm({ name: "", scopes: ["today"], expiresAt: "", canWrite: false, controlDomains: [] });
+    await refresh();
 
-      if (created.approvals?.length >= created.required) await activate(created.id, keys);
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    if (created.approvals?.length >= created.required) await activate(created.id);
   }
 
+  /* Uncaught: ActionButton reports failures beside the button. Swallowing here
+     would tell an admin their approval was recorded when it was not -- and a
+     display nobody approved is exactly what the sign-off exists to prevent. */
   async function approve(display, decision) {
-    setBusy(display.id); setError(null);
-    try {
-      const proof = decision === "approve"
-        ? await session.approvalProofFor(display.id, display.publicKey)
-        : undefined;
-      await session.approveDisplay(display.id, decision, proof);
-      await refresh();
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null);
+    const proof = decision === "approve"
+      ? await session.approvalProofFor(display.id, display.publicKey)
+      : undefined;
+    await session.approveDisplay(display.id, decision, proof);
+    await refresh();
   }
 
   /**
@@ -142,40 +141,71 @@ export default function DisplaysPanel({ theme: T, me }) {
    * Only possible from an admin's browser, and only once the server agrees the
    * approvals are in.
    */
-  async function activate(displayId, keys) {
-    const material = keys || pending[displayId];
-    if (!material) {
-      setError(
-        "The private key for this display was generated on the device that proposed it and " +
-        "is not in this browser. Ask that admin to finish it, or delete it and start again."
+  /**
+   * Bring a display to life. Any admin, on any device.
+   *
+   * The private key comes out of escrow rather than out of this tab's memory,
+   * which is the whole fix: previously only the proposing browser could finish
+   * the job, and only until it was refreshed.
+   */
+  async function activate(displayId) {
+    setError(null);
+    const display = displays.find((d) => d.id === displayId);
+    if (!display) throw new Error("That display is no longer in the list. Reload and try again.");
+
+    /* Two distinct dead ends, and they need different words. A display proposed
+       before the key was escrowed has nothing to recover at all; one whose
+       escrow will not open was sealed under a household key since rotated away.
+       Both are fixed by recreating it, but saying "sealed under an older key"
+       about a display that never had a stored key is just confusing. */
+    if (!display.privateKeyEnc) {
+      throw new Error(
+        `"${display.name}" was set up before display keys were saved, so its key exists only ` +
+        "in the browser tab that proposed it — which is why it cannot be activated here. " +
+        "Revoke it and add it again; the new one can be finished by either of you, on any device."
       );
-      return;
     }
-    setBusy(displayId); setError(null);
-    try {
-      const res = await session.activateDisplay(displayId, material.publicKey);
-      // token + private key, both in the fragment.
-      setLink({
-        id: displayId,
-        url: `${res.url}.${C.toB64(material.privateKey)}`,
-      });
-      setPending((p) => { const n = { ...p }; delete n[displayId]; return n; });
-      await refresh();
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    const privateKey = await session.displayPrivateKey(display.privateKeyEnc);
+    if (!privateKey) {
+      throw new Error(
+        `"${display.name}"'s key cannot be opened with this household's current key, which ` +
+        "happens after a key rotation. Revoke it and add it again."
+      );
+    }
+
+    const res = await session.activateDisplay(displayId, C.publicKeyFromPrivate(privateKey));
+    // token + private key, both in the fragment, which browsers never transmit.
+    const url = `${res.url}.${C.toB64(privateKey)}`;
+    // Kept where the household can retrieve it, so the other people who live
+    // here can set up the screen without this one person being present.
+    await session.escrowDisplayLink(displayId, url);
+    setLink({ id: displayId, url });
+    await refresh();
   }
 
+  /** Show a link that was issued earlier. Does not re-mint it. */
+  async function showLink(display) {
+    setError(null);
+    const url = await session.openDisplayLink(display.linkEnc);
+    if (!url) {
+      throw new Error(
+        "The link for this display was not saved, or was sealed under an older household key. " +
+        "Revoke it and add it again to get a fresh one."
+      );
+    }
+    setLink({ id: display.id, url });
+  }
+
+  const revokeWarning = (name) =>
+    `Revoke "${name}"?\n\n` +
+    "The link stops working immediately. If the device is out of your control, rotate " +
+    "the household key afterwards too — it still holds a copy of the current one.";
+
   async function revoke(display) {
-    if (!confirm(
-      `Revoke "${display.name}"?\n\n` +
-      "The link stops working immediately. If the device is out of your control, rotate " +
-      "the household key afterwards too — it still holds a copy of the current one."
-    )) return;
-    setBusy(display.id); setError(null);
-    try {
-      const out = await session.revokeDisplay(display.id);
-      if (out.rotationRecommended) alert(out.note);
-      await refresh();
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null);
+    const out = await session.revokeDisplay(display.id);
+    if (out.rotationRecommended) setNote(out.note || null);
+    await refresh();
   }
 
   const toggleIn = (list, value) =>
@@ -185,6 +215,12 @@ export default function DisplaysPanel({ theme: T, me }) {
 
   return (
     <div>
+      {note && (
+        <div role="status" style={{ ...card, background: "#fff6e5", borderColor: "#f0d9a8", color: "#6b4708", fontSize: 13 }}>
+          {note}
+        </div>
+      )}
+
       {error && (
         <div role="alert" style={{ ...card, background: "#fdecea", borderColor: "#f0b4ae", color: "#7a1c12" }}>
           {error}
@@ -271,23 +307,34 @@ export default function DisplaysPanel({ theme: T, me }) {
               <div style={{ display: "flex", gap: 6, alignItems: "flex-start", flexWrap: "wrap" }}>
                 {d.status === "pending" && iAmAdmin && !mine && (
                   <>
-                    <button style={btn(true)} disabled={busy === d.id} onClick={() => approve(d, "approve")}>
+                    <ActionButton theme={T} variant="primary" onClick={() => approve(d, "approve")}
+                      busyLabel="Approving…" doneLabel="Approved">
                       Approve
-                    </button>
-                    <button style={btn(false)} disabled={busy === d.id} onClick={() => approve(d, "deny")}>
+                    </ActionButton>
+                    <ActionButton theme={T} onClick={() => approve(d, "deny")}
+                      busyLabel="Refusing…" doneLabel="Refused">
                       Refuse
-                    </button>
+                    </ActionButton>
                   </>
                 )}
                 {d.status === "pending" && ready && iAmAdmin && (
-                  <button style={btn(true)} disabled={busy === d.id} onClick={() => activate(d.id)}>
-                    {busy === d.id ? "Activating…" : "Activate"}
-                  </button>
+                  <ActionButton theme={T} variant="primary" onClick={() => activate(d.id)}
+                    busyLabel="Activating…" doneLabel="Live">
+                    Activate
+                  </ActionButton>
+                )}
+                {d.status === "active" && d.linkEnc && (
+                  <ActionButton theme={T} onClick={() => showLink(d)}
+                    busyLabel="Fetching…" doneLabel="Shown">
+                    Show link
+                  </ActionButton>
                 )}
                 {iAmAdmin && d.status !== "revoked" && (
-                  <button style={btn(false, true)} disabled={busy === d.id} onClick={() => revoke(d)}>
+                  <ActionButton theme={T} variant="danger" onClick={() => revoke(d)}
+                    confirm={revokeWarning(d.name)}
+                    busyLabel="Revoking…" doneLabel="Revoked">
                     Revoke
-                  </button>
+                  </ActionButton>
                 )}
               </div>
             </div>

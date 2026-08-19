@@ -104,5 +104,9 @@ export default function DisplayApp() {
 
   // App reads the household through the same api.js seam as a signed-in member;
   // session.js routes its requests to the display endpoints instead.
-  return <App displayScopes={state.boot.scopes} displayName={state.boot.name} readOnly />;
+  /* App reads the display's scopes and name from the session rather than from
+     props -- it takes none. Passing them here looked like it configured
+     something and configured nothing, which is how the scope filtering came to
+     be documented but never implemented. */
+  return <App />;
 }

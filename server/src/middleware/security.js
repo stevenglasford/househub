@@ -19,8 +19,49 @@ import { forbidden } from "./errors.js";
  */
 const WEATHER_HOSTS = ["https://api.open-meteo.com", "https://geocoding-api.open-meteo.com"];
 
+/**
+ * Hosts a household may send phone reminders to, e.g. their own ntfy instance.
+ *
+ * Opt-in, empty by default, and set by the operator rather than by a household,
+ * because connect-src is a property of the origin and not of one document. A
+ * household cannot widen this by editing anything it controls.
+ *
+ * Understand what it costs before setting it. connect-src is part of what stops
+ * injected script from posting key material somewhere useful to an attacker;
+ * every host added here is one more place it could post to. Name the exact
+ * origin -- "https://ntfy.example.com", never a wildcard -- and prefer one you
+ * run. See docs/REMINDERS.md.
+ */
+const PUSH_HOSTS = (process.env.PUSH_HOSTS || "")
+  .split(/[,\s]+/)
+  .map((s) => s.trim())
+  .filter(Boolean)
+  .filter((s) => {
+    // A wildcard here would undo the point of the directive, so refuse it
+    // loudly at boot instead of silently accepting a policy nobody intended.
+    if (s === "*" || s.includes("*")) {
+      console.warn(`[security] ignoring wildcard PUSH_HOSTS entry ${JSON.stringify(s)}`);
+      return false;
+    }
+    try {
+      const u = new URL(s);
+      if (u.protocol !== "https:" && u.hostname !== "localhost" && !u.hostname.startsWith("127.")) {
+        console.warn(`[security] ignoring non-https PUSH_HOSTS entry ${JSON.stringify(s)}`);
+        return false;
+      }
+      return true;
+    } catch {
+      console.warn(`[security] ignoring unparseable PUSH_HOSTS entry ${JSON.stringify(s)}`);
+      return false;
+    }
+  });
+
 export function securityHeaders() {
-  const connectSrc = ["'self'", ...(process.env.WEATHER_PROXY ? [] : WEATHER_HOSTS)];
+  const connectSrc = [
+    "'self'",
+    ...(process.env.WEATHER_PROXY ? [] : WEATHER_HOSTS),
+    ...PUSH_HOSTS,
+  ];
 
   return helmet({
     contentSecurityPolicy: {

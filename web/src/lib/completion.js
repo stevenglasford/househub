@@ -13,9 +13,11 @@
 //
 //   by           person id in the household document, when we can name one
 //   actorUserId  the *account* that ticked it -- the authoritative fact
-//   byType       'user'   a signed-in member; attribution is trustworthy
+//   byType       'user'    a signed-in member; attribution is trustworthy
 //                'display' a shared screen; anyone in the room could have done it
-//   source       the display's name, when byType is 'display'
+//                'onBehalf' somebody said a third person did it -- second-hand,
+//                          so credited to them but still open to correction
+//   source       the display's name, when the tick came from one
 //   at           timestamp
 //   locked       set for signed-in completions: cannot be reassigned afterwards
 //
@@ -98,7 +100,9 @@ export function markCompleted(actor, { fallbackPersonId = "" } = {}) {
 export function canUncheck(mark, actor) {
   const c = completionOf(mark);
   if (!c) return true;
-  if (c.byType === "display" || c.byType === "legacy") return true;
+  // None of these is a first-person claim, so nobody's word is being overridden
+  // by undoing one.
+  if (c.byType === "display" || c.byType === "legacy" || c.byType === "onBehalf") return true;
   if (actor?.isDisplay) return false;             // a screen cannot undo a person's claim
   return c.actorUserId === actor?.userId;
 }
@@ -106,15 +110,24 @@ export function canUncheck(mark, actor) {
 /**
  * May `actor` change who is credited?
  *
- * Only for completions made on a shared display, and only by a signed-in
- * member. This is the ex-post-facto attribution: the iPad recorded that the bins
- * went out, and later someone says it was Sam.
+ * The ex-post-facto attribution: the iPad recorded that the bins went out, and
+ * somebody says it was Sam.
+ *
+ * A shared display may do this too, which it could not at first. The original
+ * reasoning was that a screen cannot know who is standing at it -- true, but it
+ * proves too much: that same screen is already trusted to tick the chore off in
+ * the first place. Naming who did it is the same act by the same anonymous
+ * person, and refusing it only meant the correction had to wait for somebody to
+ * find a laptop, which in practice meant it never happened.
+ *
+ * What a display still cannot do is overwrite a *locked* completion. Those are
+ * first-person claims made by a signed-in member about themselves, and nothing
+ * anonymous gets to rewrite them.
  */
 export function canReattribute(mark, actor) {
   const c = completionOf(mark);
   if (!c) return false;
-  if (actor?.isDisplay) return false;
-  return !c.locked && (c.byType === "display" || c.byType === "legacy");
+  return !c.locked && (c.byType === "display" || c.byType === "legacy" || c.byType === "onBehalf");
 }
 
 export function reattribute(mark, personId, actor) {
@@ -126,6 +139,9 @@ export function reattribute(mark, personId, actor) {
     // Kept, so the archive still shows the completion came off a screen and was
     // attributed later rather than claimed at the time.
     attributedBy: actor?.userId || null,
+    // When the correction itself came from a shared screen, say which one. The
+    // record should not imply a person stood behind it when none is known.
+    attributedOn: actor?.isDisplay ? (actor.displayName || "a shared display") : null,
     attributedAt: Date.now(),
   };
 }
@@ -184,6 +200,10 @@ export function describeActor(entry, personById) {
     return who
       ? `${who} — attributed after the fact, ticked on ${entry.source || "a shared display"}`
       : `Ticked on ${entry.source || "a shared display"}`;
+  }
+  if (entry.byType === "onBehalf") {
+    const who = entry.by ? personById(entry.by)?.name : null;
+    return who ? `${who} — recorded by someone else` : "Recorded by someone else";
   }
   if (entry.byType === "user") {
     return personById(entry.by)?.name || entry.actorName || "A member";
@@ -251,6 +271,57 @@ export function toggleChore(doc, choreId, dateKey, actor, { assigneeOf } = {}) {
     chores: (next.chores || []).map((c) => (c.id === choreId ? { ...c, done } : c)),
   };
   return next;
+}
+
+/**
+ * Tick a chore off on somebody else's behalf: "it was Sam".
+ *
+ * A signed-in completion is a statement about yourself, which is why
+ * markCompleted locks it. Saying somebody *else* did it is a different claim
+ * entirely -- it is second-hand, and the person credited never touched the
+ * screen. Recording it as though they had ticked it themselves would forge a
+ * first-person claim in the archive, and locking it would leave the one person
+ * who could correct it unable to.
+ *
+ * So it is stored for what it is: credited to them, recorded by you, and still
+ * open to correction. Which is also what a shared display produces, for the
+ * same reason -- neither knows first-hand who did the thing.
+ */
+export function completeOnBehalf(doc, choreId, dateKey, personId, actor, { assigneeOf } = {}) {
+  const chore = (doc.chores || []).find((c) => c.id === choreId);
+  if (!chore) return doc;
+  if (isCompletion(chore.done?.[dateKey])) {
+    // Already ticked: this is a correction, not a new completion.
+    return attributeChore(doc, choreId, dateKey, personId, actor);
+  }
+
+  const completion = {
+    by: personId || "",
+    actorUserId: actor?.userId || null,
+    byType: "onBehalf",
+    source: actor?.isDisplay ? (actor.displayName || "Shared display") : null,
+    at: Date.now(),
+    locked: false,
+  };
+
+  const next = appendArchive(doc, "chores", {
+    choreId,
+    dateKey,
+    title: chore.title,
+    assignedTo: assigneeOf ? assigneeOf(chore, dateKey) : (chore.personId || ""),
+    by: completion.by,
+    actorUserId: completion.actorUserId,
+    byType: completion.byType,
+    source: completion.source,
+    completedAt: completion.at,
+  });
+
+  return {
+    ...next,
+    chores: (next.chores || []).map((c) =>
+      c.id === choreId ? { ...c, done: { ...(c.done || {}), [dateKey]: completion } } : c
+    ),
+  };
 }
 
 /** Credit an existing display completion to a person, after the fact. */

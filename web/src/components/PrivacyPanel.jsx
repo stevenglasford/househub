@@ -20,6 +20,7 @@
 
 import React, { useState, useEffect, useCallback } from "react";
 import * as session from "../lib/session.js";
+import ActionButton from "./ActionButton.jsx";
 
 function download(filename, text, type = "application/json") {
   const url = URL.createObjectURL(new Blob([text], { type }));
@@ -60,17 +61,18 @@ export default function PrivacyPanel({ theme: T, data, me }) {
 
   const stamp = new Date().toISOString().slice(0, 10);
 
+  // Deliberately uncaught: ActionButton reports a failure beside the button and
+  // withholds the success tick. Catching here would tell somebody their data had
+  // downloaded when it had not.
   async function exportAccount() {
-    setBusy("account"); setError(null);
-    try {
-      const blob = await session.downloadAccountExport();
-      download(`househub-account-${stamp}.json`, await blob.text());
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null);
+    const blob = await session.downloadAccountExport();
+    download(`househub-account-${stamp}.json`, await blob.text());
   }
 
   function exportHousehold() {
-    setBusy("household"); setError(null);
-    try {
+    setError(null);
+    {
       // Straight from the decrypted document held in memory. Nothing is asked of
       // the server, because the server could not answer.
       download(`househub-${(data.householdName || "household").replace(/\W+/g, "-").toLowerCase()}-${stamp}.json`,
@@ -88,7 +90,7 @@ export default function PrivacyPanel({ theme: T, data, me }) {
           },
           household: data,
         }, null, 2));
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    }
   }
 
   async function erase() {
@@ -123,9 +125,10 @@ export default function PrivacyPanel({ theme: T, data, me }) {
           Everything this server holds about you: your account, which households you belong
           to, your sessions, and a log of actions you have taken. Machine-readable JSON.
         </p>
-        <button style={btn(true)} disabled={busy === "account"} onClick={exportAccount}>
-          {busy === "account" ? "Preparing…" : "Download account data"}
-        </button>
+        <ActionButton theme={T} variant="primary" onClick={exportAccount}
+          busyLabel="Preparing your download…" doneLabel="Downloaded">
+          Download account data
+        </ActionButton>
       </div>
 
       <div style={card}>
@@ -136,9 +139,10 @@ export default function PrivacyPanel({ theme: T, data, me }) {
           written by everyone who lives here, so it contains information about other
           people too.
         </p>
-        <button style={btn(true)} disabled={busy === "household"} onClick={exportHousehold}>
-          {busy === "household" ? "Preparing…" : "Download household data"}
-        </button>
+        <ActionButton theme={T} variant="primary" onClick={exportHousehold}
+          busyLabel="Preparing your download…" doneLabel="Downloaded">
+          Download household data
+        </ActionButton>
       </div>
 
       {/* ------------------------------------------------------- erasure --- */}

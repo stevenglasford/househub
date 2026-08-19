@@ -29,10 +29,42 @@ export function notFoundHandler(req, res) {
   res.status(404).json({ error: "Not found", code: "not_found" });
 }
 
+/**
+ * Should this refusal be written down?
+ *
+ * Refusals used to be entirely silent: only 500s reached the log, so a request
+ * turned away with a 403 or a 409 left no trace anywhere on the server. That is
+ * fine until somebody reports "it won't let me do X" -- at which point there is
+ * nothing to look at, and the only way to find out what happened is to guess.
+ *
+ * Everything a browser does routinely is excluded, so this stays quiet in
+ * normal running:
+ *   401  an unauthenticated poll before sign-in; constant and uninteresting
+ *   404  missing assets and probing
+ *   429  already visible in the rate-limit table
+ * A refused *write* is nearly always either a real bug or a real attack, and
+ * either way somebody should be able to see it.
+ */
+function worthLogging(status, method) {
+  if (status === 401 || status === 404 || status === 429) return false;
+  if (status >= 500) return true;
+  return status >= 400 && !["GET", "HEAD", "OPTIONS"].includes(method);
+}
+
 // eslint-disable-next-line no-unused-vars -- Express identifies error middleware by arity
 export function errorHandler(err, req, res, next) {
   if (err instanceof ApiError) {
     if (err.meta?.retryAfter) res.set("Retry-After", String(err.meta.retryAfter));
+    if (worthLogging(err.status, req.method)) {
+      // Path and ids only. No bodies, no headers, no query string -- those carry
+      // display tokens and invitation tokens, and a log is not a place for a
+      // credential.
+      console.warn(
+        `[refused] ${req.method} ${req.path} -> ${err.status} ${err.code}` +
+        `${req.user?.id ? ` actor=${String(req.user.id).slice(0, 8)}` : ""}` +
+        ` :: ${err.message}`
+      );
+    }
     return res.status(err.status).json({ error: err.message, code: err.code, ...(err.meta || {}) });
   }
 

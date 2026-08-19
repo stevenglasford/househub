@@ -478,6 +478,22 @@ export const setMemberRole = (userId, role) =>
 export const removeMember = (userId) =>
   request("DELETE", `api/households/${state.householdId}/members/${userId}`);
 
+/* ------------------------------------------------------------- timezone --- */
+
+/**
+ * Which zone this household's calendar days are measured in.
+ *
+ * One of the few settings the server genuinely has to be able to read: it is
+ * the server that expands subscribed .ics feeds into days, because browsers
+ * cannot fetch a Google or iCloud feed themselves.
+ */
+export const getTimezone = () =>
+  request("GET", `api/households/${state.householdId}/timezone`);
+
+/** Pass "" to go back to the server default. */
+export const setTimezone = (timezone) =>
+  request("PUT", `api/households/${state.householdId}/settings`, { timezone });
+
 /* -------------------------------------------------------------------- ai --- */
 
 /**
@@ -608,8 +624,31 @@ export function currentActor(doc) {
 export const listDisplays = () =>
   request("GET", `api/households/${state.householdId}/displays`);
 
-export const createDisplay = (body) =>
-  request("POST", `api/households/${state.householdId}/displays`, body);
+/**
+ * Propose a display.
+ *
+ * Generates the display's keypair here and escrows the private half sealed under
+ * the household key. Without that escrow the private key lived only in this
+ * tab's memory, so a display every admin had approved could be activated by
+ * nobody but the proposer, on this device, before any refresh -- which is
+ * exactly how a household ends up staring at "2 of 2 approved" and no way on.
+ */
+export async function createDisplay(body) {
+  if (!state.householdKey) throw new Error("The household is locked.");
+  const keys = C.newDisplayKeypair();
+  const res = await request("POST", `api/households/${state.householdId}/displays`, {
+    ...body,
+    publicKey: C.toB64(keys.publicKey),
+    privateKeyEnc: await C.sealDisplayPrivateKey(state.householdKey, keys.privateKey),
+  });
+  return { ...res, keys };
+}
+
+/** The display's private key, recovered from escrow by any member. */
+export async function displayPrivateKey(privateKeyEnc) {
+  if (!state.householdKey) throw new Error("The household is locked.");
+  return C.openDisplayPrivateKey(state.householdKey, privateKeyEnc);
+}
 
 /** A proof only this admin's key can produce, so the server cannot forge consent. */
 export async function approvalProofFor(displayId, displayPublicKeyB64) {
@@ -633,6 +672,26 @@ export async function activateDisplay(displayId, displayPublicKey) {
   return request("POST", `api/households/${state.householdId}/displays/${displayId}/activate`, {
     wrappedKey, publicKey: C.toB64(displayPublicKey),
   });
+}
+
+/**
+ * Keep the finished link where the household can get at it again.
+ *
+ * Sealed here, so the server stores something it cannot read. The alternative --
+ * re-minting a token whenever somebody needs the link -- would knock a screen
+ * that is already running off the air every time.
+ */
+export async function escrowDisplayLink(displayId, url) {
+  if (!state.householdKey) throw new Error("The household is locked.");
+  return request("PUT", `api/households/${state.householdId}/displays/${displayId}/link`, {
+    linkEnc: await C.sealName(state.householdKey, url),
+  });
+}
+
+/** Recover a previously issued link. Null if it was sealed under an old epoch. */
+export async function openDisplayLink(linkEnc) {
+  if (!state.householdKey || !linkEnc) return null;
+  return C.openName(state.householdKey, linkEnc);
 }
 
 export const updateDisplay = (id, patch) =>

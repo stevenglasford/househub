@@ -17,6 +17,7 @@
 
 import React, { useState, useEffect, useCallback } from "react";
 import * as session from "../lib/session.js";
+import ActionButton from "./ActionButton.jsx";
 
 const PRIVACY = [
   ["minimal", "Nothing", "No detail about your household at all. The question will be generic."],
@@ -68,18 +69,19 @@ export default function AiPanel({ theme: T, data, update }) {
   const setField = (key, value) =>
     update((d) => ({ ...d, checkin: { ...(d.checkin || {}), [key]: value } }));
 
+  // Uncaught so the button reports it. Silently failing to switch provider is
+  // particularly bad here: somebody could believe their household had moved off
+  // a remote model when it had not.
   async function choose(id, consent) {
-    setBusy("provider"); setError(null);
-    try {
-      const target = provider.available.find((p) => p.id === id);
-      await session.setAiProvider({
-        providerId: id,
-        model: target?.defaultModel || undefined,
-        consent: Boolean(consent),
-      });
-      setPendingId(null);
-      await load();
-    } catch (err) { setError(err.message); } finally { setBusy(null); }
+    setError(null);
+    const target = provider.available.find((p) => p.id === id);
+    await session.setAiProvider({
+      providerId: id,
+      model: target?.defaultModel || undefined,
+      consent: Boolean(consent),
+    });
+    setPendingId(null);
+    await load();
   }
 
   async function chooseModel(model) {
@@ -200,10 +202,10 @@ export default function AiPanel({ theme: T, data, update }) {
                 </span>
               </div>
               {!current && (
-                <button style={btn(false)} disabled={busy === "provider"}
-                        onClick={() => (p.isLocal ? choose(p.id, false) : setPendingId(p.id))}>
+                <ActionButton theme={T} onClick={() => (p.isLocal ? choose(p.id, false) : setPendingId(p.id))}
+                  busyLabel="Switching…" doneLabel="In use">
                   Use this
-                </button>
+                </ActionButton>
               )}
             </div>
           );
@@ -228,9 +230,10 @@ export default function AiPanel({ theme: T, data, update }) {
               </span>
             </p>
             <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-              <button style={btn(false, true)} disabled={busy === "provider"} onClick={() => choose(pending.id, true)}>
+              <ActionButton theme={T} variant="danger" onClick={() => choose(pending.id, true)}
+                busyLabel="Switching…" doneLabel="Switched">
                 I understand — use {pending.label}
-              </button>
+              </ActionButton>
               <button style={btn(false)} onClick={() => setPendingId(null)}>Keep it local</button>
             </div>
           </div>

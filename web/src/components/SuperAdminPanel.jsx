@@ -14,6 +14,7 @@
 
 import React, { useState, useEffect, useCallback } from "react";
 import * as session from "../lib/session.js";
+import ActionButton from "./ActionButton.jsx";
 
 const bytes = (n) => {
   if (!n) return "0 B";
@@ -54,10 +55,11 @@ export default function SuperAdminPanel({ theme: T }) {
     borderRadius: 10, padding: "6px 12px", fontWeight: 600, cursor: "pointer", fontSize: 13,
   });
 
+  // Uncaught so ActionButton can report it: a chain check that silently failed
+  // would be indistinguishable from one that passed.
   async function verifyChain() {
-    setBusy(true); setError(null);
-    try { setAudit(await session.request("GET", "api/admin/audit/verify")); }
-    catch (err) { setError(err.message); } finally { setBusy(false); }
+    setError(null);
+    setAudit(await session.request("GET", "api/admin/audit/verify"));
   }
 
   async function setStatus(id, status) {
@@ -168,9 +170,10 @@ export default function SuperAdminPanel({ theme: T }) {
               Every audit entry commits to the hash of the one before it. If any row were
               edited or removed, the chain breaks at that point and this reports where.
             </p>
-            <button style={btn(true)} disabled={busy} onClick={verifyChain}>
-              {busy ? "Checking…" : "Verify the chain"}
-            </button>
+            <ActionButton theme={T} variant="primary" onClick={verifyChain}
+              busyLabel="Checking…" doneLabel="Checked">
+              Verify the chain
+            </ActionButton>
             {audit && (
               <div style={{ marginTop: 8, fontSize: 13, color: audit.ok ? "#1e4620" : "#7a1c12" }}>
                 {audit.ok
@@ -254,7 +257,10 @@ function AiProviders({ theme: T, card, btn }) {
               {p.isLocal ? " · stays on your hardware" : " · context leaves your network"}
             </div>
           </div>
-          {!p.isLocal && <button style={btn(false)} disabled={busy} onClick={() => remove(p)}>Remove</button>}
+          {!p.isLocal && (
+            <ActionButton theme={T} onClick={() => remove(p)}
+              busyLabel="Removing…" doneLabel="Removed">Remove</ActionButton>
+          )}
         </div>
       ))}
 

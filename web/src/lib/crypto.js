@@ -354,6 +354,41 @@ export async function openName(householdKeyRaw, nameEnc) {
 
 /* --------------------------------------------------------------- display --- */
 
+/**
+ * Seal a display's private key under the household key, so any admin can
+ * finish setting the display up and hand out its link.
+ *
+ * The original design kept this key in the proposing browser's memory and
+ * nowhere else, which had two consequences nobody wanted. A display approved by
+ * every admin could not be activated by any of them except the one who proposed
+ * it, on the same device, in the same tab -- a refresh was enough to strand it
+ * permanently. And once a link had been shown it could never be shown again, so
+ * the second person in the household had no way to get it.
+ *
+ * Storing it sealed under the household key fixes both. The server holds
+ * ciphertext it cannot read; every member's browser can open it. That is not an
+ * escalation: a display's link grants strictly less than the household key that
+ * unseals it, so anybody able to decrypt this could already read everything the
+ * display will ever show.
+ */
+export async function sealDisplayPrivateKey(householdKeyRaw, privateKey) {
+  const key = await importAes(householdKeyRaw, ["encrypt"]);
+  return toB64(await aesSeal(key, privateKey, enc.encode("househub/display-key/v1")));
+}
+
+export async function openDisplayPrivateKey(householdKeyRaw, sealed) {
+  if (!sealed) return null;
+  const key = await importAes(householdKeyRaw, ["decrypt"]);
+  try {
+    return new Uint8Array(await aesOpen(key, fromB64(sealed), enc.encode("househub/display-key/v1")));
+  } catch {
+    // Sealed under a key epoch this household has rotated away from. The display
+    // has to be recreated; the caller says so rather than throwing.
+    return null;
+  }
+}
+
+
 // A wall display gets its own X25519 keypair. The private half is generated on
 // the provisioning device and handed over in the URL *fragment* of the setup
 // link -- fragments are never sent in an HTTP request, so it does not reach the

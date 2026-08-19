@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback, useRef, createContext, useContext } from "react";
+import React, { useState, useEffect, useCallback, useMemo, useRef, createContext, useContext } from "react";
 import {
   Calendar as CalIcon, UtensilsCrossed, CheckCircle2, Circle,
   Home, Plus, X, ChevronLeft, ChevronRight, Settings, Trash2,
@@ -21,6 +21,7 @@ import { getConfig } from "./config.js";
 import { useCheckinPrompt } from "./lib/useCheckinPrompt.js";
 import HouseholdPanel from "./components/HouseholdPanel.jsx";
 import ArchivePanel from "./components/ArchivePanel.jsx";
+import ImportPanel from "./components/ImportPanel.jsx";
 import SuperAdminPanel from "./components/SuperAdminPanel.jsx";
 import HomeAssistantPanel from "./components/HomeAssistantPanel.jsx";
 import DisplaysPanel from "./components/DisplaysPanel.jsx";
@@ -30,6 +31,11 @@ import AiPanel from "./components/AiPanel.jsx";
 import SecondBlock, { SecondBlockSettings } from "./components/SecondBlock.jsx";
 import PrivacyPanel from "./components/PrivacyPanel.jsx";
 import * as COMPLETION from "./lib/completion.js";
+import { DEFAULT_ALERT, hasAlert, dueAlerts, escalationStep } from "./lib/alerts.js";
+import * as RELAY from "./lib/relay.js";
+import * as STATUS from "./lib/status.js";
+import * as SUB from "./lib/subtasks.js";
+import { buildCheckinSteps } from "./lib/checkin.js";
 
 /* ---------------------------------------------------------------
    Theme — warm "kitchen paper" palette, pine-green brand.
@@ -712,6 +718,19 @@ export default function HouseholdHub() {
   }, []);
   useEffect(() => session.onChange((s) => setSessionUser(s.user)), []);
 
+  /* A display must not sit on a tab it was never granted. The tab bar hides
+     them, but the default ("today") would otherwise still render for a screen
+     scoped to, say, the calendar alone. */
+  useEffect(() => {
+    if (!session.isDisplay()) return;
+    const scopes = session.snapshot().displayScopes || [];
+    const allowed = (id) => !TAB_SCOPE[id] || scopes.includes(TAB_SCOPE[id]);
+    if (allowed(tab)) return;
+    const first = ["today", "calendar", "meals", "chores", "grocery", "agenda", "board", "home"]
+      .find(allowed);
+    if (first) setTab(first);
+  }, [tab]);
+
   const [modal, setModal] = useState(null);
   const width = useWindowWidth();
   const vp = useViewportMetrics();
@@ -775,6 +794,35 @@ export default function HouseholdHub() {
     }
   }, []);
 
+  /**
+   * Save right now, and tell the caller whether it worked.
+   *
+   * `update` is fire-and-forget: it queues a debounced save and `flush` swallows
+   * any failure into a connection indicator. That is right for ordinary edits --
+   * a chore tick should not throw a dialogue at somebody -- but wrong for an
+   * action that reports "imported successfully" afterwards. A confirmation that
+   * appears before the save completes, or despite the save failing, is a lie.
+   *
+   * The payload is passed in rather than read from `latest`, because React runs
+   * a state updater during render rather than at the call site, so `latest` is
+   * not reliably set yet at the moment the caller wants to persist.
+   */
+  const saveNow = useCallback(async (payload) => {
+    clearTimeout(saveTimer.current);
+    const doc = payload || latest.current;
+    if (!doc) return;
+    latest.current = doc;
+    setConn("saving");
+    try {
+      await saveState(doc);
+      dirty.current = false;
+      setConn("ok");
+    } catch (e) {
+      setConn("error");
+      throw e;                 // the caller is showing a confirmation
+    }
+  }, []);
+
   const update = useCallback((fn) => {
     setData((d) => {
       const next = fn({ ...d });
@@ -817,9 +865,113 @@ export default function HouseholdHub() {
   // declared before the loading guard so the check-in scheduler can read it
   const allEvents = data ? [...(data.events || []), ...importedEvents] : [];
 
-  /* The reminder. No push service or notification permission needed: the wall
-     tablet already has this page open, so at the appointed minute it chimes and
-     opens the check-in itself. Fires once per night and not if already done. */
+  /* ---- time-of-day reminders ----
+     Anything with an alert time that is past due and still unticked. Recomputed
+     off `now`, which already ticks, so no second timer is needed; the chime
+     fires only when a new escalation step is crossed rather than every render.
+
+     Snoozes come from data.alertSnooze, which is part of the synced document,
+     so silencing one on a phone also quiets the tablet in the hall. */
+  const alertChime = useChime(data?.checkin?.soundOn !== false, "alert");
+  const lastChime = useRef({});
+
+  const activeAlerts = data
+    ? dueAlerts(data, todayKey, now.getHours() * 60 + now.getMinutes(),
+        { dueOn: choreDueOn, assigneeOf: choreAssignee })
+    : [];
+
+  useEffect(() => {
+    for (const a of activeAlerts) {
+      const step = escalationStep(a.alert, a.overdue);   // step 0 at the due minute
+      if (lastChime.current[a.key] !== step) {
+        lastChime.current[a.key] = step;
+        alertChime();
+      }
+    }
+    // forget anything no longer sounding, so it chimes again next time it does
+    const live = new Set(activeAlerts.map((a) => a.key));
+    for (const k of Object.keys(lastChime.current)) if (!live.has(k)) delete lastChime.current[k];
+  }, [activeAlerts.map((a) => a.key + ":" + escalationStep(a.alert, a.overdue)).join(",")]); // eslint-disable-line
+
+  /* Phone reminders, if the household set one up. Sent from here rather than
+     from the server, which cannot read any of this -- see lib/relay.js. The
+     "already sent" bookkeeping lives in the document so two awake devices do
+     not both send the same push. */
+  useEffect(() => {
+    if (!data || !RELAY.relayConfigured(data)) return;
+    const live = new Set(activeAlerts.map((a) => a.key));
+    const pending = activeAlerts.filter(
+      (a) => !RELAY.alreadySent(data, a.key, escalationStep(a.alert, a.overdue)));
+    if (!pending.length) {
+      // Still worth tidying: bookkeeping for finished reminders would otherwise
+      // accumulate in the document forever.
+      update((d) => RELAY.pruneRelayed(d, live));
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      for (const a of pending) {
+        const step = escalationStep(a.alert, a.overdue);
+        const ok = await RELAY.sendReminder(data.reminderRelay, a);
+        if (cancelled) return;
+        // Only record a send that actually happened, so a push service that was
+        // briefly down gets retried on the next tick instead of being skipped.
+        if (ok) update((d) => RELAY.recordSent(RELAY.pruneRelayed(d, live), a.key, step));
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [activeAlerts.map((a) => a.key + ":" + escalationStep(a.alert, a.overdue)).join(","),
+      data?.reminderRelay?.enabled, data?.reminderRelay?.endpoint]); // eslint-disable-line
+
+  /* Ticking from a reminder has to go through the same completion machinery as
+     ticking from the list. Writing the mark directly here would skip the
+     archive, drop the actor, and quietly produce a completion that nobody is
+     allowed to undo -- so the fast path would corrupt exactly the records the
+     archive exists to keep honest. */
+  const alertDone = (a) => update((d) => {
+    if (a.kind === "chore") {
+      return COMPLETION.toggleChore(d, a.id, todayKey, actorFor(d), { assigneeOf: choreAssignee });
+    }
+    d.tasks = d.tasks.map((t) => t.id === a.id ? { ...t, done: true, doneAt: todayKey } : t);
+    return d;
+  });
+  const alertSnooze = (a, mins) => update((d) => {
+    d.alertSnooze = { ...(d.alertSnooze || {}), [a.key]: Date.now() + mins * 60000 };
+    return d;
+  });
+  const alertSkip = (a) => update((d) => {
+    if (a.kind === "chore") {
+      d.chores = d.chores.map((c) => {
+        if (c.id !== a.id) return c;
+        const done = { ...c.done };
+        for (const k of owedOccurrences(c, todayKey)) done[k] = SKIPPED;
+        return { ...c, done };
+      });
+    } else {
+      d.tasks = d.tasks.map((t) => t.id === a.id
+        ? { ...t, date: ymd(addDays(parseYMD(t.date || todayKey), 1)) } : t);
+    }
+    return d;
+  });
+  /* "It was actually Sam." Second-hand by definition -- whoever is tapping is
+     not the person being credited -- so it is recorded as such and stays open
+     to correction, rather than forging a first-person claim in the archive. */
+  const alertCredit = (a, personId) => update((d) => {
+    if (a.kind === "chore") {
+      return COMPLETION.completeOnBehalf(d, a.id, todayKey, personId, actorFor(d), { assigneeOf: choreAssignee });
+    }
+    d.tasks = d.tasks.map((t) => t.id === a.id
+      ? { ...t, personId, done: true, doneAt: todayKey } : t);
+    return d;
+  });
+  // split by how insistent each one asked to be
+  const popupAlerts = activeAlerts.filter((a) => (a.alert.style || "banner") === "popup");
+  const bannerAlerts = activeAlerts.filter((a) => (a.alert.style || "banner") !== "popup");
+
+  /* The check-in reminder. No push service or notification permission needed:
+     the wall tablet already has this page open, so at the appointed minute it
+     chimes and opens the check-in itself. Fires once a night, and not if the
+     check-in is already done. */
   const plan = data ? checkinPlan(data, todayKey, allEvents) : null;
   const chime = useChime(data?.checkin?.soundOn !== false);
   const firedFor = useRef("");
@@ -897,12 +1049,17 @@ export default function HouseholdHub() {
         input,textarea,select{user-select:text;-webkit-user-select:text}
         .tapfade{transition:transform .12s ease, background .15s ease, opacity .15s ease}
         .tapfade:active{transform:scale(.97)}
-        @media (prefers-reduced-motion: reduce){.tapfade{transition:none}}
+        @keyframes hubshake{0%,100%{transform:rotate(0)}20%{transform:rotate(-14deg)}40%{transform:rotate(12deg)}60%{transform:rotate(-8deg)}80%{transform:rotate(6deg)}}
+        @media (prefers-reduced-motion: reduce){.tapfade{transition:none}
+          [style*="hubshake"]{animation:none !important}}
       `}</style>
 
       <Header now={now} greeting={greeting} householdName={data.householdName}
         checkin={{ plan, done: checkinDoneFor(data, todayKey), open: () => setModal({ type: "checkin" }) }} conn={conn}
         onSettings={() => setModal({ type: "settings" })} />
+
+      <AlertBanner alerts={bannerAlerts} people={people} onDone={alertDone} onSkip={alertSkip}
+        onSnooze={alertSnooze} onCredit={alertCredit} />
 
       <GlanceStrip data={data} allEvents={allEvents} now={now} viewKey={viewKey} personById={personById} weather={weather}
         inFilter={inFilter} filter={filter} todosLeft={todosLeftToday} overdueTotal={overdueTotal} onGoto={setTab} hidden={isMobile} />
@@ -923,7 +1080,9 @@ export default function HouseholdHub() {
             viewEvent={(ev) => setModal({ type: "viewEvent", payload: ev })}
             openNote={(n) => setModal({ type: "note", payload: n || {} })}
             gotoBoard={() => setTab("board")}
-            openProject={(pr) => setModal({ type: "project", payload: pr || {} })} />
+            openProject={(pr) => setModal({ type: "project", payload: pr || {} })}
+            openTask={(t) => setModal({ type: "task", payload: t || {} })}
+            openChore={(c) => setModal({ type: "chore", payload: c || {} })} />
           {/* Whatever this household actually looks at on the way out of the
               door: the shopping list, the back garden, the date jar. Chosen per
               person filter -- see components/SecondBlock.jsx. */}
@@ -948,7 +1107,8 @@ export default function HouseholdHub() {
           <GroceryView data={data} update={update} />
         )}
         {tab === "agenda" && (
-          <AgendaView data={data} update={update} personById={personById} />
+          <AgendaView data={data} update={update} personById={personById}
+            openCheckin={() => setModal({ type: "checkin" })} />
         )}
         {tab === "home" && (
           <HomeView data={data} />
@@ -963,7 +1123,8 @@ export default function HouseholdHub() {
             update={update} taskDueToday={taskDueToday}
             openChore={(c) => setModal({ type: "chore", payload: c || {} })}
             openTask={(t) => setModal({ type: "task", payload: t || {} })}
-            openProject={(pr) => setModal({ type: "project", payload: pr || {} })} />
+            openProject={(pr) => setModal({ type: "project", payload: pr || {} })}
+            openHistory={() => setModal({ type: "history" })} />
         )}
       </main>
 
@@ -973,6 +1134,7 @@ export default function HouseholdHub() {
       {modal?.type === "chore" && <ChoreModal payload={modal.payload} people={people} update={update} close={() => setModal(null)} />}
       {modal?.type === "task" && <TaskModal payload={modal.payload} people={people} update={update} close={() => setModal(null)} />}
       {modal?.type === "project" && <ProjectModal payload={modal.payload} people={people} update={update} close={() => setModal(null)} />}
+      {modal?.type === "history" && <HistoryModal data={data} update={update} personById={personById} close={() => setModal(null)} />}
       {modal?.type === "note" && <NoteModal payload={modal.payload} people={people} update={update} close={() => setModal(null)} />}
       {modal?.type === "date" && <DateModal payload={modal.payload} update={update} close={() => setModal(null)} />}
       {modal?.type === "checkin" && (
@@ -980,7 +1142,12 @@ export default function HouseholdHub() {
           todayKey={todayKey} onOpenMeal={(k) => setModal({ type: "meal", key: k, slot: "dinner" })}
           close={() => setModal(null)} />
       )}
-      {modal?.type === "settings" && <SettingsModal data={data} update={update} syncCalendars={syncCalendars} close={() => setModal(null)} currentUser={sessionUser} />}
+      {modal?.type === "settings" && <SettingsModal data={data} update={update} saveNow={saveNow} syncCalendars={syncCalendars} close={() => setModal(null)} currentUser={sessionUser} />}
+
+      {/* Last, so it covers the modals too — a takeover that a settings panel
+          could sit on top of would not be a takeover. */}
+      <AlertPopup alerts={popupAlerts} people={people} onDone={alertDone} onSkip={alertSkip}
+        onSnooze={alertSnooze} onCredit={alertCredit} />
     </div>
     </ViewportCtx.Provider>
     </MobileCtx.Provider>
@@ -1211,9 +1378,19 @@ const posOf = (n, i) => ({
   y: typeof n.y === "number" ? n.y : autoPos(i).y,
 });
 
-function NoteOverlay({ notes, update, personById, openNote, onOverflow }) {
+function NoteOverlay({ notes, update, personById, openNote, onOverflow, drift }) {
   const ref = useRef(null);
   const [drag, setDrag] = useState(null);
+
+  /* Optional idle drift. Deliberately slow and small — a wall display that
+     twitches constantly is worse than one that sits perfectly still, so this
+     nudges each note a few pixels every several seconds and no more. */
+  const [nudge, setNudge] = useState(0);
+  useEffect(() => {
+    if (!drift) return;
+    const t = setInterval(() => setNudge((n) => n + 1), 6000);
+    return () => clearInterval(t);
+  }, [drift]);
   const shown = notes.slice(0, OVERLAY_MAX);
   const extra = notes.length - shown.length;
 
@@ -1247,6 +1424,10 @@ function NoteOverlay({ notes, update, personById, openNote, onOverflow }) {
         const p = personById(n.personId);
         const pos = posOf(n, i);
         const dragging = drag?.id === n.id;
+        // a tiny deterministic wander, so each note drifts differently
+        const dseed = (n.id.charCodeAt(0) || 7) + nudge;
+        const dx = drift && !dragging ? Math.sin(dseed * 1.7) * 6 : 0;
+        const dy = drift && !dragging ? Math.cos(dseed * 2.3) * 5 : 0;
         return (
           <div key={n.id}
             onPointerDown={(e) => down(e, n, i)}
@@ -1257,8 +1438,9 @@ function NoteOverlay({ notes, update, personById, openNote, onOverflow }) {
             style={{
               left: `${pos.x}%`, top: `${pos.y}%`, width: 168,
               pointerEvents: "auto", cursor: dragging ? "grabbing" : "grab",
-              transform: `rotate(${rotFor(n.id)}deg) translate(${dragging ? drag.dx : 0}px, ${dragging ? drag.dy : 0}px) scale(${dragging ? 1.04 : 1})`,
-              transition: dragging ? "none" : "transform .15s ease",
+              transform: `rotate(${rotFor(n.id)}deg) translate(${dragging ? drag.dx : dx}px, ${dragging ? drag.dy : dy}px) scale(${dragging ? 1.04 : 1})`,
+              // slow while drifting, quick while being dragged
+              transition: dragging ? "none" : drift ? "transform 3.5s ease-in-out" : "transform .15s ease",
               zIndex: dragging ? 40 : 30,
               touchAction: "none",
             }}>
@@ -1309,9 +1491,26 @@ function NoteRow({ notes, personById, openNote, onOverflow }) {
 }
 
 /* ---------------- Tab bar + person filter ---------------- */
+/**
+ * Which scope has to be granted for a display to reach each tab.
+ *
+ * A tab with no entry is available to everyone. Members are unaffected -- this
+ * only narrows what a *display* can navigate to.
+ */
+const TAB_SCOPE = {
+  today: "today",
+  calendar: "calendar",
+  meals: "meals",
+  chores: "todos",
+  grocery: "grocery",
+  agenda: "agenda",
+  board: "notes",
+  home: "home",
+};
+
 function TabBar({ tab, setTab, todosLeft, groceryLeft, noteCount, agendaOpen, homeOn, people, filter, setFilter }) {
   const isMobile = useMobile();
-  const tabs = [
+  const all = [
     { id: "today", label: "Today", Icon: Home },
     { id: "calendar", label: "Calendar", Icon: CalIcon },
     { id: "meals", label: "Meals", Icon: UtensilsCrossed },
@@ -1321,6 +1520,18 @@ function TabBar({ tab, setTab, todosLeft, groceryLeft, noteCount, agendaOpen, ho
     { id: "board", label: "Board", Icon: StickyNote, badge: noteCount },
     ...(homeOn ? [{ id: "home", label: "Home", Icon: Sofa }] : []),
   ];
+
+  /* Displays only get the tabs their admins granted.
+     This was documented behaviour that had never been implemented: every tab
+     showed on every screen regardless of scope, so a display "limited" to the
+     calendar still had the agenda and the check-in one tap away. It is not a
+     confidentiality boundary -- the document is decrypted in the page either way,
+     and the threat model says so -- but a wall screen by the front door should
+     not offer the household's private conversation topics to whoever walks past. */
+  const scopes = session.isDisplay() ? (session.snapshot().displayScopes || []) : null;
+  const tabs = scopes
+    ? all.filter((t) => !TAB_SCOPE[t.id] || scopes.includes(TAB_SCOPE[t.id]))
+    : all;
 
   const Filters = ({ compact }) => (
     <div className={`flex items-center gap-1 rounded-full p-0.5 shrink-0 ${compact ? "overflow-x-auto" : ""}`}
@@ -1391,7 +1602,8 @@ function FilterChip({ label, color, active, onClick }) {
    height and the three columns share the remaining space, each scrolling
    internally. The page itself never scrolls.                              */
 function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOffset, setViewOffset,
-  filter, inFilter, colorFor, update, taskDueToday, openMeal, openEvent, viewEvent, openNote, gotoBoard, openProject }) {
+  filter, inFilter, colorFor, update, taskDueToday, openMeal, openEvent, viewEvent, openNote,
+  gotoBoard, openProject, openTask, openChore }) {
   const isMobile = useMobile();
   // each slot is a list now; hide anything belonging to the other person
   const plannedMeals = MEALS
@@ -1404,6 +1616,27 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
 
   // record WHO did it, not just that it happened — the rotation advances from
   // the completion record, so a bare `true` here would freeze everyone's turn
+  // Which row has its "who did it" picker open. One at a time.
+  const [creditOpen, setCreditOpen] = useState(null);
+  const [creditError, setCreditError] = useState(null);
+
+  const skipChore = (id) => update((d) => {
+    d.chores = d.chores.map((c) => {
+      if (c.id !== id) return c;
+      const done = { ...c.done };
+      for (const k of owedOccurrences(c, viewKey)) done[k] = SKIPPED;
+      return { ...c, done };
+    });
+    return d;
+  });
+
+  const creditChore = (id, personId) => {
+    setCreditError(null);
+    try {
+      update((d) => COMPLETION.attributeChore(d, id, viewKey, personId, actorFor(d)));
+    } catch (err) { setCreditError(err.message); }
+  };
+
   const toggleChore = (id) => update((d) => COMPLETION.toggleChore(d, id, viewKey, actorFor(d), { assigneeOf: choreAssignee }))
   // doneAt records which day it was ticked, so a completed task can sit under
   // that day's "done" list instead of vanishing from the view entirely
@@ -1417,13 +1650,23 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
   const isChoreLate = (c) => !c.done[viewKey] && !!choreState(c, viewKey).missedSince;
   // finished items drop to a "done" group at the bottom rather than holding their place
   const doneItems = [
-    ...chores.filter((c) => c.done[viewKey]).map((c) => ({
-      key: "c" + c.id, title: c.title,
-      person: personById(typeof c.done[viewKey] === "string" && !isSkipped(c.done[viewKey]) ? c.done[viewKey] : choreAssignee(c, viewKey)),
-      toggle: () => toggleChore(c.id),
-    })),
+    ...chores.filter((c) => c.done[viewKey]).map((c) => {
+      const mark = c.done[viewKey];
+      return {
+        key: "c" + c.id, id: c.id, kind: "chore", title: c.title, mark,
+        // Reads every stored shape. The old check was `typeof mark === "string"`,
+        // which only matches the legacy bare person id -- so anything ticked off
+        // by this version fell through to showing the *assignee* instead of
+        // whoever actually did it.
+        person: personById(isSkipped(mark) ? "" : COMPLETION.completedBy(mark)) || null,
+        skipped: isSkipped(mark),
+        editable: COMPLETION.canReattribute(mark, actorFor(data)),
+        toggle: () => toggleChore(c.id),
+      };
+    }),
     ...data.tasks.filter((t) => inFilter(t.personId) && t.done && t.doneAt === viewKey).map((t) => ({
-      key: "t" + t.id, title: t.title, person: personById(t.personId), toggle: () => toggleTask(t.id),
+      key: "t" + t.id, id: t.id, kind: "task", title: t.title,
+      person: personById(t.personId), editable: false, toggle: () => toggleTask(t.id),
     })),
   ];
   const restChores = chores.filter((c) => !isChoreLate(c) && !c.done[viewKey]);
@@ -1616,11 +1859,19 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
         </Card>
 
         <Card grow={!isMobile} title={isToday ? "To-dos today" : "To-dos"} Icon={CheckCircle2}
-          action={overdueCount > 0 ? (
-            <span className="rounded-full px-2.5 py-1 shrink-0" style={{ background: "#E86A4C", color: "#fff", fontSize: 12, fontWeight: 800 }}>
-              {overdueCount} overdue
-            </span>
-          ) : null}>
+          action={(
+            <div className="flex items-center gap-2 shrink-0">
+              {overdueCount > 0 && (
+                <span className="rounded-full px-2.5 py-1" style={{ background: "#E86A4C", color: "#fff", fontSize: 12, fontWeight: 800 }}>
+                  {overdueCount} overdue
+                </span>
+              )}
+              {/* Adding a to-do from the screen you are already looking at.
+                  It used to mean switching to the To-Dos tab, which is two taps
+                  and a change of context for the most common thing anyone does. */}
+              <AddBtn onClick={() => openTask({ date: viewKey })} />
+            </div>
+          )}>
           {chores.length === 0 && dueTasks.length === 0 && doneItems.length === 0 && dayProjects.length === 0 && carriedProjects.length === 0 ? <Empty text="Nothing to do here." /> : (
             <div className="flex flex-col gap-1">
               {overdueItems.length > 0 && (
@@ -1649,29 +1900,52 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
               )}
               {restChores.map((c) => {
                 const p = personById(choreAssignee(c, viewKey));
+                // The row is not a button — only the circle completes the chore.
+                // Wrapping the whole row meant reaching for the person's name, or
+                // the skip control, ticked it off instead. Irritating on a phone,
+                // worse on a wall tablet where people tap in passing.
                 return (
-                  <button key={c.id} onClick={() => toggleChore(c.id)} className="tapfade flex items-center gap-2.5 rounded-xl px-2 py-2 text-left">
-                    <Circle size={25} style={{ color: T.faint }} className="shrink-0" />
-                    <span className="flex-1 min-w-0 truncate" style={{ fontSize: 15.5, fontWeight: 600 }}>{c.title}</span>
-                    {isRotating(c) && <Repeat size={11} style={{ color: T.faint }} className="shrink-0" />}
-                    {p && (
-                      <span className="shrink-0 rounded-full px-2 py-0.5" style={{ background: p.color + "1F", color: p.color, fontSize: 11, fontWeight: 800 }}>
-                        {p.name}
-                      </span>
-                    )}
-                  </button>
+                  <div key={c.id} className="rounded-xl px-2 py-2">
+                    <div className="flex items-center gap-2.5">
+                      <button onClick={() => toggleChore(c.id)} aria-label={`Mark ${c.title} done`}
+                        className="tapfade shrink-0" style={{ color: T.faint }}>
+                        <Circle size={25} />
+                      </button>
+                      <span className="flex-1 min-w-0 truncate" style={{ fontSize: 15.5, fontWeight: 600 }}>{c.title}</span>
+                      {isRotating(c) && <Repeat size={11} style={{ color: T.faint }} className="shrink-0" />}
+                      {p && (
+                        <span className="shrink-0 rounded-full px-2 py-0.5" style={{ background: p.color + "1F", color: p.color, fontSize: 11, fontWeight: 800 }}>
+                          {p.name}
+                        </span>
+                      )}
+                      <button onClick={() => skipChore(c.id)} title="Skip this one"
+                        aria-label={`Skip ${c.title}`} className="tapfade px-2 py-0.5 rounded-full shrink-0"
+                        style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.sub, fontSize: 11, fontWeight: 700 }}>
+                        Skip
+                      </button>
+                    </div>
+                  </div>
                 );
               })}
               {restChores.length > 0 && restTasks.length > 0 && <div className="my-1" style={{ borderTop: `1px dashed ${T.line}` }} />}
               {restTasks.map((t) => {
                 const p = personById(t.personId);
                 return (
-                  <button key={t.id} onClick={() => toggleTask(t.id)} className="tapfade flex items-center gap-2.5 rounded-xl px-2 py-2 text-left">
-                    <Circle size={25} style={{ color: T.faint }} className="shrink-0" />
-                    <span className="flex-1 min-w-0 truncate" style={{ fontSize: 15.5, fontWeight: 600 }}>{t.title}</span>
-                    <span className="text-xs font-bold rounded-full px-2 py-0.5 shrink-0" style={{ background: T.gold + "1F", color: T.gold }}>Due</span>
-                    {p && <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: p.color }} />}
-                  </button>
+                  <div key={t.id} className="rounded-xl px-2 py-2">
+                    <div className="flex items-center gap-2.5">
+                      <button onClick={() => toggleTask(t.id)} aria-label={`Mark ${t.title} done`}
+                        className="tapfade shrink-0" style={{ color: T.faint }}>
+                        <Circle size={25} />
+                      </button>
+                      <span className="flex-1 min-w-0 truncate" style={{ fontSize: 15.5, fontWeight: 600 }}>{t.title}</span>
+                      <span className="text-xs font-bold rounded-full px-2 py-0.5 shrink-0" style={{ background: T.gold + "1F", color: T.gold }}>Due</span>
+                      {p && <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: p.color }} />}
+                      <button onClick={() => openTask(t)} aria-label={`Edit ${t.title}`}
+                        className="tapfade p-1 shrink-0" style={{ color: T.faint }}>
+                        <Settings size={15} />
+                      </button>
+                    </div>
+                  </div>
                 );
               })}
               {carriedProjects.length > 0 && (
@@ -1747,15 +2021,19 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
                         {todays.length > 0 && (
                           <div className="flex flex-col gap-1 mt-1.5">
                             {todays.map((st) => (
-                              <button key={st.id} onClick={() => toggleProjectStage(pr.id, st.id)}
-                                className="tapfade flex items-center gap-2 text-left" style={{ opacity: st.done ? 0.55 : 1 }}>
-                                {st.done
-                                  ? <CheckCircle2 size={19} style={{ color: T.brand }} className="shrink-0" />
-                                  : <Circle size={19} style={{ color: T.faint }} className="shrink-0" />}
+                              <div key={st.id} className="flex items-center gap-2" style={{ opacity: st.done ? 0.55 : 1 }}>
+                                {/* Only the circle ticks a stage off. */}
+                                <button onClick={() => toggleProjectStage(pr.id, st.id)}
+                                  aria-label={st.done ? "Un-tick this stage" : "Tick this stage"}
+                                  className="tapfade shrink-0">
+                                  {st.done
+                                    ? <CheckCircle2 size={19} style={{ color: T.brand }} />
+                                    : <Circle size={19} style={{ color: T.faint }} />}
+                                </button>
                                 <span className="flex-1 min-w-0 truncate" style={{ fontSize: 13.5, fontWeight: 600, textDecoration: st.done ? "line-through" : "none" }}>
                                   {st.title || "Untitled stage"}
                                 </span>
-                              </button>
+                              </div>
                             ))}
                           </div>
                         )}
@@ -1776,11 +2054,29 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
                     Done · {doneItems.length}
                   </div>
                   {doneItems.map((it) => (
-                    <button key={it.key} onClick={it.toggle} className="tapfade flex items-center gap-2.5 rounded-xl px-2 py-1.5 text-left" style={{ opacity: 0.5 }}>
-                      <CheckCircle2 size={22} style={{ color: T.brand }} className="shrink-0" />
-                      <span className="flex-1 min-w-0 truncate" style={{ fontSize: 14.5, fontWeight: 500, textDecoration: "line-through" }}>{it.title}</span>
-                      {it.person && <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: it.person.color }} />}
-                    </button>
+                    <div key={it.key} className="rounded-xl px-2 py-1.5" style={{ opacity: it.skipped ? 0.4 : 0.62 }}>
+                      <div className="flex items-center gap-2.5">
+                        {/* Only the tick un-does it. */}
+                        <button onClick={it.toggle} aria-label={`Un-tick ${it.title}`}
+                          className="tapfade shrink-0" style={{ color: T.brand }}>
+                          <CheckCircle2 size={22} />
+                        </button>
+                        <span className="flex-1 min-w-0 truncate" style={{ fontSize: 14.5, fontWeight: 500, textDecoration: "line-through" }}>{it.title}</span>
+                        {it.skipped ? (
+                          <span style={{ color: T.faint, fontSize: 11, fontWeight: 700 }} className="shrink-0">skipped</span>
+                        ) : it.editable ? (
+                          <CreditChip mark={it.mark} personById={personById} open={creditOpen === it.key}
+                            onOpen={() => setCreditOpen(creditOpen === it.key ? null : it.key)} />
+                        ) : it.person ? (
+                          <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: it.person.color }} />
+                        ) : null}
+                      </div>
+                      {it.editable && creditOpen === it.key && (
+                        <CreditPicker people={data.people} currentId={it.person?.id || ""}
+                          onPick={(pid) => { creditChore(it.id, pid); setCreditOpen(null); }}
+                          note={creditError} />
+                      )}
+                    </div>
                   ))}
                 </>
               )}
@@ -2007,8 +2303,80 @@ function MealsView({ weekDays, data, todayKey, shiftWeek, resetWeek, openMeal, p
 }
 
 /* ---------------- To-Dos view (chores + tasks) ---------------- */
-function ToDosView({ data, personById, todayKey, inFilter, update, openChore, openTask, openProject }) {
+/* ---------------- Who did it ----------------
+   Tap the name on a completed chore and the people appear underneath it; tap
+   one and the credit moves. That is the whole interaction.
+
+   It replaces a flow that required going to Settings, opening the archive, and
+   finding the row -- which meant that on the wall tablet, where the correction
+   is actually noticed ("that was me, not you"), there was no way to make it at
+   all. The people appear below the item rather than in a modal because on a
+   display the thing being corrected needs to stay on screen while you do it. */
+function CreditChip({ mark, personById, open, onOpen }) {
+  const rec = COMPLETION.completionOf(mark);
+  if (!rec) return null;
+  const credited = personById(rec.by);
+
+  const label = credited ? credited.name : "Who did it?";
+  const colour = credited ? credited.color : T.sub;
+
+  return (
+    <>
+      <button
+        onClick={onOpen}
+        aria-expanded={open}
+        aria-label={credited ? `Change who did this — currently ${credited.name}` : "Say who did this"}
+        className="tapfade shrink-0 rounded-full px-2.5 py-1"
+        style={{
+          background: credited ? colour + "1F" : T.panelAlt,
+          color: colour,
+          border: `1px solid ${open ? colour : "transparent"}`,
+          fontSize: 12,
+          fontWeight: 800,
+        }}
+      >
+        {label}
+      </button>
+    </>
+  );
+}
+
+/* The picker itself, rendered under the row so the item stays visible. */
+export function CreditPicker({ people, currentId, onPick, note }) {
+  return (
+    <div className="mt-2 pt-2 flex items-center gap-1.5 flex-wrap"
+      style={{ borderTop: `1px dashed ${T.line}` }}>
+      <span style={{ color: T.sub, fontSize: 12, fontWeight: 700 }}>Done by</span>
+      {people.map((p) => {
+        const on = p.id === currentId;
+        return (
+          <button key={p.id} onClick={() => onPick(p.id)}
+            aria-label={`Credit ${p.name}`}
+            className="tapfade px-3 py-1.5 rounded-full font-bold"
+            style={{
+              background: on ? p.color : T.panelAlt,
+              color: on ? "#fff" : T.ink,
+              border: `1px solid ${on ? p.color : T.line}`,
+              fontSize: 12.5,
+            }}>
+            {p.name}
+          </button>
+        );
+      })}
+      <button onClick={() => onPick("")} className="tapfade px-3 py-1.5 rounded-full font-semibold"
+        style={{ background: T.panelAlt, color: T.faint, border: `1px solid ${T.line}`, fontSize: 12.5 }}>
+        Nobody
+      </button>
+      {note && <div style={{ color: T.faint, fontSize: 11.5, width: "100%" }}>{note}</div>}
+    </div>
+  );
+}
+
+
+function ToDosView({ data, personById, todayKey, inFilter, update, openChore, openTask, openProject, openHistory }) {
   const isMobile = useMobile();
+  // Which row currently has its "who did it" picker open. One at a time.
+  const [creditOpen, setCreditOpen] = useState(null);
   const [pane, setPane] = useState("work");   // work | projects
   const projects = (data.projects || []).filter((p) => inFilter(p.personId));
   const scheduled = projects.filter((p) => projectOpen(p) && projectDates(p).length);
@@ -2032,10 +2400,20 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
     return d;
   });
   // Reassign the credit when someone covered for the other person.
-  const creditChore = (id, personId) => update((d) => {
-    d.chores = d.chores.map((c) => c.id === id ? { ...c, done: { ...c.done, [todayKey]: personId || true } } : c);
-    return d;
-  });
+  /* Moves the credit through the attribution model rather than overwriting the
+     mark. The old version wrote `personId || true` straight into done[], which
+     threw away everything the record knew -- which device ticked it, when, and
+     whether the claim was somebody's own -- and never touched the archive, so
+     the permanent record and the screen disagreed from then on. */
+  const [creditError, setCreditError] = useState(null);
+  const creditChore = (id, personId) => {
+    setCreditError(null);
+    try {
+      update((d) => COMPLETION.attributeChore(d, id, todayKey, personId, actorFor(d)));
+    } catch (err) {
+      setCreditError(err.message);
+    }
+  };
   const removeChore = (id) => update((d) => { d.chores = d.chores.filter((c) => c.id !== id); return d; });
 
   const tasks = data.tasks.filter((t) => inFilter(t.personId));
@@ -2095,7 +2473,14 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
             <h2 style={{ fontFamily: DISPLAY, fontSize: 24, fontWeight: 600 }}>Recurring chores</h2>
             <p style={{ color: T.sub, fontSize: 14 }}>{chores.length === 0 ? "None due today" : `${done} of ${chores.length} done today`}</p>
           </div>
+          <div className="flex items-center gap-2">
+            <button onClick={openHistory} aria-label="Show completed history"
+              className="tapfade flex items-center gap-2 px-3.5 py-2.5 rounded-full font-semibold"
+              style={{ background: T.panelAlt, color: T.sub, border: `1px solid ${T.line}` }}>
+              <History size={17} /> History
+            </button>
           <button onClick={() => openChore(null)} className="tapfade flex items-center gap-2 px-4 py-2.5 rounded-full font-semibold" style={{ background: T.brand, color: "#fff" }}><Plus size={18} /> Chore</button>
+          </div>
         </div>
         {chores.length > 0 && (
           <div className="h-2 rounded-full mb-4 overflow-hidden" style={{ background: T.line }}>
@@ -2112,7 +2497,10 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
             const st = choreState(c, todayKey);
             const missedD = st.missedSince ? parseYMD(st.missedSince) : null;
             const up = personById(choreAssignee(c, todayKey));
-            const creditedTo = isDone && typeof mark === "string" ? personById(mark) : null;
+            // Reads every stored shape, not just the legacy bare person id — which
+            // is why completions made by this version credited nobody.
+            const creditedTo = isDone ? personById(COMPLETION.completedBy(mark)) : null;
+            const canFixCredit = isDone && COMPLETION.canReattribute(mark, actorFor(data));
             const lastBy = personById(lastDoneBy(c));
             return (
               <div key={c.id} className="rounded-2xl px-4 py-3.5"
@@ -2139,6 +2527,16 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
                       {isRotating(c) ? `${up.name}'s turn` : up.name}
                     </span>
                   )}
+                  {isDone && (canFixCredit ? (
+                    <CreditChip mark={mark} personById={personById} open={creditOpen === c.id}
+                      onOpen={() => setCreditOpen(creditOpen === c.id ? null : c.id)} />
+                  ) : creditedTo ? (
+                    <span className="shrink-0 rounded-full px-2.5 py-1"
+                      title="They ticked this off themselves, so it stands"
+                      style={{ background: creditedTo.color + "1F", color: creditedTo.color, fontSize: 12, fontWeight: 800 }}>
+                      {creditedTo.name}
+                    </span>
+                  ) : null)}
                   {!mark && (
                     <button onClick={() => skipChore(c.id)} title="Skip this one"
                       className="tapfade px-2.5 py-1 rounded-full shrink-0"
@@ -2149,20 +2547,19 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
                   <button onClick={() => openChore(c)} className="tapfade p-1.5 shrink-0" style={{ color: T.sub }}><Settings size={17} /></button>
                   <button onClick={() => removeChore(c.id)} className="tapfade p-1.5 shrink-0" style={{ color: T.faint }}><Trash2 size={17} /></button>
                 </div>
-                {isDone && isRotating(c) && (
-                  <div className="flex items-center gap-1.5 flex-wrap mt-2 pl-11">
-                    <span style={{ color: T.sub, fontSize: 12, fontWeight: 700 }}>Done by</span>
-                    {data.people.map((pp) => {
-                      const on = creditedTo?.id === pp.id;
-                      return (
-                        <button key={pp.id} onClick={() => creditChore(c.id, pp.id)}
-                          className="tapfade px-2.5 py-1 rounded-full font-semibold"
-                          style={{ background: on ? pp.color : T.panelAlt, color: on ? "#fff" : T.sub,
-                            border: `1px solid ${on ? pp.color : T.line}`, fontSize: 12 }}>
-                          {pp.name}
-                        </button>
-                      );
-                    })}
+                {/* Shown on demand, under the item, for any completed chore --
+                    not only rotating ones, which was arbitrary: somebody covering
+                    a fixed chore is exactly the case worth recording. */}
+                {isDone && canFixCredit && creditOpen === c.id && (
+                  <div className="pl-11">
+                    <CreditPicker
+                      people={data.people}
+                      currentId={creditedTo?.id || ""}
+                      onPick={(pid) => { creditChore(c.id, pid); setCreditOpen(null); }}
+                      note={creditError || (COMPLETION.completionOf(mark)?.byType === "display"
+                        ? `Ticked on ${COMPLETION.completionOf(mark).source || "a shared display"}.`
+                        : null)}
+                    />
                   </div>
                 )}
               </div>
@@ -2213,7 +2610,16 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
                       <button onClick={() => toggleTask(t.id)} className="tapfade shrink-0" style={{ color: T.faint }}><Circle size={30} /></button>
                       <div className="flex-1 min-w-0">
                         <div style={{ fontSize: 17, fontWeight: 600 }} className="truncate">{t.title}</div>
-                        {t.date && <div style={{ fontSize: 13, fontWeight: 600, color: overdue ? "#E86A4C" : T.sub }}>{dateLabel(t.date)}</div>}
+                        <div className="flex items-center gap-2 flex-wrap">
+                          {t.date && <span style={{ fontSize: 13, fontWeight: 600, color: overdue ? "#E86A4C" : T.sub }}>{dateLabel(t.date)}</span>}
+                          {/* Steps at a glance, so a half-finished task does not look
+                              identical to one nobody has started. */}
+                          {SUB.stepProgress(t) && (
+                            <span style={{ fontSize: 12.5, fontWeight: 700, color: T.faint }}>
+                              {SUB.stepProgress(t).done}/{SUB.stepProgress(t).total} steps
+                            </span>
+                          )}
+                        </div>
                       </div>
                       {p && <span className="rounded-full px-2.5 py-1 text-xs font-semibold shrink-0" style={{ background: p.color + "1F", color: p.color }}>{p.name}</span>}
                       <button onClick={() => openTask(t)} className="tapfade p-1.5 shrink-0" style={{ color: T.sub }}><Settings size={17} /></button>
@@ -2827,6 +3233,150 @@ const STATUS_DIMS = [
 ];
 const SCALE = ["", "Rough", "Low", "Okay", "Good", "Great"];
 
+/* ---------------- How we're doing, over time ----------------
+   The nightly check-in has always shown one evening at a time, which answers
+   "how was tonight" and nothing else. The question a household actually has is
+   whether things are drifting -- and that is only visible across weeks.
+
+   Drawn as plain SVG rather than pulled from a charting library: it is one
+   polyline per person and the app has no other need for 40KB of charts.
+
+   Deliberately restrained. Averages invite grading a relationship, which is not
+   what this is for, so the emphasis is on shape and divergence: where the two
+   lines separate, and which way each is heading. */
+
+const GRAPH_WINDOWS = [[30, "30 days"], [90, "3 months"], [365, "a year"]];
+
+export function StatusGraph({ data, todayKey }) {
+  const isMobile = useMobile();
+  const [days, setDays] = useState(90);
+  const [dim, setDim] = useState("average");
+
+  const people = (data.people || []).filter(Boolean);
+  const status = data.status || {};
+
+  /* One series per person: [{ x: dayIndex, y: score }], oldest first. */
+  const { series, count } = useMemo(
+    () => STATUS.buildSeries(status, people, { todayKey, days, dimension: dim }),
+    [status, people.map((p) => p.id).join(","), days, dim, todayKey]
+  );
+  const span = days;
+
+  const W = isMobile ? 320 : 560;
+  const H = 170;
+  const PAD = { l: 26, r: 10, t: 10, b: 20 };
+  const px = (x) => PAD.l + (x / Math.max(1, span - 1)) * (W - PAD.l - PAD.r);
+  const py = (y) => PAD.t + (1 - (y - 1) / 4) * (H - PAD.t - PAD.b);
+
+  if (!count) {
+    return (
+      <div className="rounded-2xl p-4 mt-4" style={{ background: T.panelAlt, border: `1px solid ${T.line}` }}>
+        <h3 style={{ fontFamily: DISPLAY, fontSize: 19, fontWeight: 600 }} className="mb-1">Over time</h3>
+        <p style={{ color: T.faint, fontSize: 14 }}>
+          No check-ins recorded in this window yet. A few evenings of the nightly check-in
+          and the shape starts to show.
+        </p>
+        <WindowPicker days={days} setDays={setDays} />
+      </div>
+    );
+  }
+
+  const gap = STATUS.gapDaysFor(days);
+
+  return (
+    <div className="rounded-2xl p-4 mt-4" style={{ background: T.panelAlt, border: `1px solid ${T.line}` }}>
+      <h3 style={{ fontFamily: DISPLAY, fontSize: 19, fontWeight: 600 }} className="mb-2">Over time</h3>
+
+      <div className="flex items-center gap-2 flex-wrap mb-3">
+        {[["average", "All three"], ...STATUS_DIMS.map((d) => [d.key, d.label])].map(([k, label]) => (
+          <button key={k} onClick={() => setDim(k)}
+            className="tapfade px-3 py-1.5 rounded-full font-semibold"
+            style={{ background: dim === k ? T.brand : T.panel, color: dim === k ? "#fff" : T.sub,
+              border: `1px solid ${dim === k ? T.brand : T.line}`, fontSize: 12.5 }}>
+            {label}
+          </button>
+        ))}
+      </div>
+
+      <svg viewBox={`0 0 ${W} ${H}`} width="100%" height={H} role="img"
+        aria-label={`${dim === "average" ? "Overall" : dim} scores over the last ${days} days`}>
+        {/* 1-5 gridlines. The scale is fixed so a good week cannot be made to
+            look like a bad one by rescaling the axis. */}
+        {[1, 2, 3, 4, 5].map((v) => (
+          <g key={v}>
+            <line x1={PAD.l} x2={W - PAD.r} y1={py(v)} y2={py(v)}
+              stroke={T.line} strokeWidth="1" strokeDasharray={v === 3 ? "0" : "3 4"} />
+            <text x={PAD.l - 6} y={py(v) + 4} textAnchor="end"
+              style={{ fill: T.faint, fontSize: 10 }}>{v}</text>
+          </g>
+        ))}
+
+        {people.map((p) => {
+          const pts = series.get(p.id) || [];
+          if (!pts.length) return null;
+          // Split into runs so a long silence is a break, not a straight line
+          // drawn confidently through weeks nobody recorded anything.
+          const runs = STATUS.splitRuns(pts, gap);
+
+          return (
+            <g key={p.id}>
+              {runs.filter((r) => r.length > 1).map((r, i) => (
+                <polyline key={i} fill="none" stroke={p.color} strokeWidth="2"
+                  strokeLinejoin="round" strokeLinecap="round"
+                  points={r.map((pt) => `${px(pt.x)},${py(pt.y)}`).join(" ")} />
+              ))}
+              {pts.map((pt, i) => (
+                <circle key={i} cx={px(pt.x)} cy={py(pt.y)} r={pts.length > 60 ? 1.6 : 2.6}
+                  fill={p.color}>
+                  <title>{`${p.name} · ${pt.date} · ${pt.y.toFixed(1)}`}</title>
+                </circle>
+              ))}
+            </g>
+          );
+        })}
+      </svg>
+
+      <div className="flex items-center gap-3 flex-wrap mt-1">
+        {people.map((p) => {
+          const pts = series.get(p.id) || [];
+          return (
+            <span key={p.id} className="flex items-center gap-1.5"
+              style={{ fontSize: 12.5, fontWeight: 700, color: p.color }}>
+              <span className="rounded-full" style={{ width: 10, height: 10, background: p.color, display: "inline-block" }} />
+              {p.name}
+              <span style={{ color: T.faint, fontWeight: 600 }}>{STATUS.trend(pts).label}</span>
+            </span>
+          );
+        })}
+      </div>
+
+      <WindowPicker days={days} setDays={setDays} />
+
+      <p style={{ color: T.faint, fontSize: 12 }} className="mt-2">
+        A gap in a line means no check-in that week, not a bad one. Where the lines
+        separate is usually the more interesting part.
+      </p>
+    </div>
+  );
+}
+
+function WindowPicker({ days, setDays }) {
+  return (
+    <div className="flex items-center gap-2 flex-wrap mt-3">
+      {GRAPH_WINDOWS.map(([n, label]) => (
+        <button key={n} onClick={() => setDays(n)}
+          className="tapfade px-3 py-1.5 rounded-full font-semibold"
+          style={{ background: days === n ? T.ink : T.panel, color: days === n ? "#fff" : T.sub,
+            border: `1px solid ${T.line}`, fontSize: 12.5 }}>
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+
+
 /* Starter conversation prompts. The prompt shown is picked by day of year, so
    both devices land on the same one without storing anything. Add your own in
    the editor and they're used instead. */
@@ -2946,7 +3496,7 @@ function ScaleTrack({ value, onChange, color, marks }) {
   );
 }
 
-function AgendaView({ data, update, personById }) {
+function AgendaView({ data, update, personById, openCheckin }) {
   const isMobile = useMobile();
   const todayKey = ymd(new Date());
   const [dayOffset, setDayOffset] = useState(0);
@@ -3219,6 +3769,16 @@ function AgendaView({ data, update, personById }) {
             })}
           </div>
 
+          {/* The way into the walkthrough. There was no route to it from here at
+              all: the only trigger was the header, or the app opening it itself
+              at the appointed minute. Somebody looking at tonight's scores and
+              wanting to actually do the check-in had nowhere to press. */}
+          <button onClick={openCheckin}
+            className="tapfade w-full mb-4 py-3 rounded-2xl font-semibold flex items-center justify-center gap-2"
+            style={{ background: T.brand, color: "#fff" }}>
+            <HeartHandshake size={17} /> Start tonight's check-in
+          </button>
+
           {/* both scores on one track */}
           <div className="rounded-2xl p-4" style={{ background: T.panelAlt, border: `1px solid ${T.line}` }}>
             <h3 style={{ fontFamily: DISPLAY, fontSize: 19, fontWeight: 600 }} className="mb-1">How we're doing</h3>
@@ -3256,6 +3816,7 @@ function AgendaView({ data, update, personById }) {
               </>
             )}
           </div>
+          <StatusGraph data={data} todayKey={todayKey} />
         </>
       ) : (
         <DateJarPane data={data} update={update} personById={personById}
@@ -3914,29 +4475,291 @@ function HomeSettings() {
    a few taps and a busy one is still bounded. It ends by choosing tomorrow's
    time, which is both the override and the fallback when the calendar can't
    tell us when work finishes.                                            */
-function useChime(enabled) {
+/* ---------------------------------------------------------------
+   Time-of-day reminders.
+
+   A chore having an assignee and a due date is not the same as it getting done.
+   These are for the ones with a consequence attached — pet medication, bins out
+   before the lorry, a dose at a fixed hour — where "it's on the list" is not
+   enough and something has to actually interrupt.
+
+   Deliberately evaluated in the browser rather than on the server. The server
+   cannot read the household document at all, so it does not know these chores
+   exist, let alone what they are called. See ALERTS in the client notes and the
+   reminder-relay settings for how that constraint shapes phone notifications.
+--------------------------------------------------------------- */
+
+function AlertEditor({ value, onChange }) {
+  const on = hasAlert({ alert: value });
+  const a = value && value.at ? value : DEFAULT_ALERT;
+  return (
+    <Field label="Remind us if it isn't done">
+      <div className="flex gap-2 mb-2">
+        <button onClick={() => onChange(null)} className="tapfade flex-1 py-2.5 rounded-xl font-semibold"
+          style={{ background: !on ? T.brand : T.panelAlt, color: !on ? "#fff" : T.ink, border: `1px solid ${!on ? T.brand : T.line}` }}>
+          No reminder
+        </button>
+        <button onClick={() => onChange({ ...DEFAULT_ALERT, ...(value || {}) })}
+          className="tapfade flex-1 py-2.5 rounded-xl font-semibold flex items-center justify-center gap-2"
+          style={{ background: on ? T.brand : T.panelAlt, color: on ? "#fff" : T.ink, border: `1px solid ${on ? T.brand : T.line}` }}>
+          <BellRing size={15} /> Remind
+        </button>
+      </div>
+      {on && (
+        <>
+          <div className="grid grid-cols-3 gap-2">
+            <div>
+              <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }} className="uppercase mb-1">By</div>
+              <input type="time" value={a.at} onChange={(e) => onChange({ ...a, at: e.target.value })}
+                className="w-full px-2.5 py-2.5 rounded-xl text-base outline-none" style={inputStyle} />
+            </div>
+            <div>
+              <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }} className="uppercase mb-1">Repeat</div>
+              <select value={a.everyMins} onChange={(e) => onChange({ ...a, everyMins: Number(e.target.value) })}
+                className="w-full px-2 py-2.5 rounded-xl text-base outline-none" style={inputStyle}>
+                {[5, 10, 15, 30, 60].map((n) => <option key={n} value={n}>every {n}m</option>)}
+              </select>
+            </div>
+            <div>
+              <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }} className="uppercase mb-1">Stop at</div>
+              <input type="time" value={a.until} onChange={(e) => onChange({ ...a, until: e.target.value })}
+                className="w-full px-2.5 py-2.5 rounded-xl text-base outline-none" style={inputStyle} />
+            </div>
+          </div>
+          <div className="mt-2.5">
+            <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }} className="uppercase mb-1">How loud</div>
+            <div className="flex gap-2">
+              {[["banner", "Banner", "a strip under the header"],
+                ["popup", "Takeover", "fills the screen — hard to miss"]].map(([id, l, hint]) => {
+                const sel = (a.style || "banner") === id;
+                return (
+                  <button key={id} onClick={() => onChange({ ...a, style: id })}
+                    className="tapfade flex-1 text-left px-3 py-2.5 rounded-xl"
+                    style={{ background: sel ? T.brand : T.panelAlt, color: sel ? "#fff" : T.ink,
+                      border: `1px solid ${sel ? T.brand : T.line}` }}>
+                    <div style={{ fontSize: 13.5, fontWeight: 700 }}>{l}</div>
+                    <div style={{ fontSize: 11.5, opacity: 0.85 }}>{hint}</div>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+          <p style={{ color: T.faint, fontSize: 12.5 }} className="mt-2">
+            Chimes from {fmtTime(a.at)} until it's ticked off, stopping at {fmtTime(a.until)}.
+            A screen has to be awake to sound — for anything critical also turn on
+            phone reminders in Settings.
+          </p>
+        </>
+      )}
+    </Field>
+  );
+}
+
+/* One action set, shared by the banner and the takeover so the two cannot drift
+   apart: done, skip, snooze, and correct who actually did it. That last one
+   matters because the rotation is frequently wrong about reality — it says it
+   was your turn, but the other person was already up. */
+function AlertActions({ a, people, onDone, onSkip, onSnooze, onCredit, big, light }) {
+  const [who, setWho] = useState(false);
+  const btn = (bg, fg) => ({
+    background: bg, color: fg, fontSize: big ? 15 : 13.5, fontWeight: 800,
+    padding: big ? "12px 20px" : "8px 16px", borderRadius: 999,
+  });
+  const ghost = light
+    ? { background: "#ffffff2e", color: "#fff" }
+    : { background: T.panelAlt, color: T.sub, border: `1px solid ${T.line}` };
+  return (
+    <div className={big ? "flex flex-col gap-2.5 items-stretch" : "flex items-center gap-2 flex-wrap"}>
+      <div className={big ? "flex gap-2.5 justify-center flex-wrap" : "flex items-center gap-2 flex-wrap"}>
+        <button onClick={() => onDone(a)} aria-label={`Mark ${a.title} done`} className="tapfade shrink-0"
+          style={btn(light ? "#fff" : T.brand, light ? "#B4442A" : "#fff")}>Done</button>
+        <button onClick={() => onSkip(a)} aria-label={`Skip ${a.title}`}
+          className="tapfade shrink-0" style={{ ...btn("", ""), ...ghost }}>Skip</button>
+        <button onClick={() => onSnooze(a, 10)} aria-label={`Snooze ${a.title} for ten minutes`}
+          className="tapfade shrink-0" style={{ ...btn("", ""), ...ghost }}>Snooze 10m</button>
+        <button onClick={() => setWho(!who)} aria-label={`Change who did ${a.title}`}
+          className="tapfade shrink-0" style={{ ...btn("", ""), ...ghost }}>
+          {a.person ? a.person.name : "Who?"}
+        </button>
+      </div>
+      {who && (
+        <div className={`flex items-center gap-1.5 flex-wrap ${big ? "justify-center" : ""}`}>
+          <span style={{ fontSize: 12, fontWeight: 700, color: light ? "#ffffffcc" : T.sub }}>Done by</span>
+          {people.map((pp) => (
+            <button key={pp.id} onClick={() => { onCredit(a, pp.id); setWho(false); }}
+              aria-label={`Credit ${pp.name} for ${a.title}`}
+              className="tapfade px-3 py-1.5 rounded-full font-bold"
+              style={{ background: light ? "#ffffff2e" : T.panelAlt, color: light ? "#fff" : T.ink,
+                border: `1px solid ${light ? "#ffffff44" : T.line}`, fontSize: 12.5 }}>
+              {pp.name}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* The takeover. For the ones where a strip along the top is not enough — pet
+   medication being the case that prompted it. */
+function AlertPopup({ alerts, people, onDone, onSkip, onSnooze, onCredit }) {
+  const isMobile = useMobile();
+  if (!alerts.length) return null;
+  const a = alerts[0];
+  return (
+    <div className="fixed inset-0 z-[60] flex items-center justify-center p-4"
+      role="alertdialog" aria-modal="true" aria-label={`Reminder: ${a.title}`}
+      style={{ background: "#B4442AF0", backdropFilter: "blur(2px)" }}>
+      <div className="text-center" style={{ maxWidth: 520 }}>
+        <BellRing size={isMobile ? 46 : 60} style={{ color: "#fff", margin: "0 auto 14px",
+          animation: "hubshake 1.1s ease-in-out infinite" }} />
+        <div style={{ color: "#ffffffcc", fontSize: 12.5, fontWeight: 800, letterSpacing: 1.4 }} className="uppercase mb-1.5">
+          {a.overdue < 1 ? "Due now" : `${a.overdue} minutes late`}
+        </div>
+        <h2 style={{ fontFamily: DISPLAY, fontSize: isMobile ? 32 : 44, fontWeight: 600, color: "#fff", lineHeight: 1.1 }}>
+          {a.title}
+        </h2>
+        <p style={{ color: "#ffffffdd", fontSize: 15, fontWeight: 600 }} className="mt-1.5 mb-5">
+          Due at {fmtTime(a.alert.at)}
+          {a.person ? ` · ${a.person.name}` : ""}
+          {alerts.length > 1 ? ` · and ${alerts.length - 1} more` : ""}
+        </p>
+        <AlertActions a={a} people={people} onDone={onDone} onSkip={onSkip}
+          onSnooze={onSnooze} onCredit={onCredit} big light />
+      </div>
+    </div>
+  );
+}
+
+/* The banner. Sits above the tab content and does not scroll away — an alert
+   you can navigate past is not an alert. */
+function AlertBanner({ alerts, people, onDone, onSkip, onSnooze, onCredit }) {
+  if (!alerts.length) return null;
+  const worst = alerts[0];
+  return (
+    <div className="shrink-0 px-3 md:px-4 pt-2" role="alert">
+      <div className="rounded-2xl px-3.5 py-3 flex items-center gap-3 flex-wrap"
+        style={{ background: "#E86A4C", color: "#fff", boxShadow: "0 6px 18px #E86A4C55" }}>
+        <BellRing size={20} className="shrink-0" style={{ animation: "hubshake 1.1s ease-in-out infinite" }} />
+        <div className="min-w-0 flex-1">
+          <div style={{ fontSize: 16.5, fontWeight: 800 }} className="truncate">{worst.title}</div>
+          <div style={{ fontSize: 12.5, fontWeight: 700, opacity: 0.92 }}>
+            due {fmtTime(worst.alert.at)} · {worst.overdue < 1 ? "now" : `${worst.overdue} min late`}
+            {alerts.length > 1 ? ` · +${alerts.length - 1} more` : ""}
+            {worst.person ? ` · ${worst.person.name}` : ""}
+          </div>
+        </div>
+        <AlertActions a={worst} people={people} onDone={onDone} onSkip={onSkip}
+          onSnooze={onSnooze} onCredit={onCredit} light />
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
+   Audio.
+
+   Two things make Web Audio silently do nothing, and the version of this that
+   shipped first hit both:
+
+     1. A new AudioContext starts *suspended* until a user gesture. Scheduling
+        notes into a suspended context fails quietly -- no error, no sound, and
+        nothing in the console to suggest the reminder never rang.
+     2. Browsers cap how many AudioContexts a page may create, so building a
+        fresh one per chime works in testing and then stops working on the one
+        device that has been left open on the wall for a fortnight.
+
+   So: one shared context, resumed on the first tap anywhere, and every play
+   attempt resumes again before scheduling in case it was auto-suspended.
+--------------------------------------------------------------- */
+let sharedAudioCtx = null;
+function audioContext() {
+  if (sharedAudioCtx) return sharedAudioCtx;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    sharedAudioCtx = new Ctx();
+  } catch (e) { return null; }
+  return sharedAudioCtx;
+}
+
+/** Whether a chime would actually be audible right now. */
+export function audioReady() {
+  const ctx = audioContext();
+  return Boolean(ctx) && ctx.state === "running";
+}
+
+/* Called from a real user gesture. Until this happens the browser will not let
+   us make any sound at all, no matter what we schedule. */
+function unlockAudio() {
+  const ctx = audioContext();
+  if (ctx && ctx.state !== "running" && ctx.resume) ctx.resume().catch(() => {});
+}
+
+const CHIME_PATTERNS = {
+  // two soft notes rather than a buzz — it has to be pleasant nightly
+  gentle: {
+    wave: "sine", peak: 0.18, decay: 0.55,
+    notes: [{ t: 0, f: 587.33 }, { t: 0.28, f: 880 }],
+  },
+  // deliberately more insistent, and repeated: this one is for something that
+  // was supposed to happen and did not
+  alert: {
+    wave: "triangle", peak: 0.3, decay: 0.34,
+    notes: [0, 0.8, 1.6].flatMap((base) => [
+      { t: base, f: 880 },            // A5
+      { t: base + 0.16, f: 1108.73 }, // C#6
+      { t: base + 0.32, f: 1318.51 }, // E6
+    ]),
+  },
+};
+
+function playPattern(patternName) {
+  const spec = CHIME_PATTERNS[patternName] || CHIME_PATTERNS.gentle;
+  const ctx = audioContext();
+  if (!ctx) return false;
+  const schedule = () => {
+    const t0 = ctx.currentTime;
+    for (const n of spec.notes) {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = spec.wave;
+      osc.frequency.value = n.f;
+      gain.gain.setValueAtTime(0, t0 + n.t);
+      gain.gain.linearRampToValueAtTime(spec.peak, t0 + n.t + 0.015);
+      gain.gain.exponentialRampToValueAtTime(0.001, t0 + n.t + spec.decay);
+      osc.connect(gain); gain.connect(ctx.destination);
+      osc.start(t0 + n.t);
+      osc.stop(t0 + n.t + spec.decay + 0.05);
+    }
+  };
+  // resume first — a suspended context accepts every call and plays nothing
+  if (ctx.state !== "running" && ctx.resume) {
+    ctx.resume().then(schedule).catch(() => {});
+  } else {
+    schedule();
+  }
+  return true;
+}
+
+function useChime(enabled, pattern = "gentle") {
+  // one listener for the whole app: the first tap anywhere makes audio possible
+  useEffect(() => {
+    const on = () => unlockAudio();
+    window.addEventListener("pointerdown", on, { passive: true });
+    window.addEventListener("keydown", on, { passive: true });
+    return () => {
+      window.removeEventListener("pointerdown", on);
+      window.removeEventListener("keydown", on);
+    };
+  }, []);
   return useCallback(() => {
     if (!enabled) return;
-    try {
-      const Ctx = window.AudioContext || window.webkitAudioContext;
-      if (!Ctx) return;
-      const ctx = new Ctx();
-      // two soft notes rather than a buzz — it has to be pleasant nightly
-      [0, 0.28].forEach((delay, i) => {
-        const osc = ctx.createOscillator();
-        const gain = ctx.createGain();
-        osc.type = "sine";
-        osc.frequency.value = i === 0 ? 587.33 : 880;
-        gain.gain.setValueAtTime(0, ctx.currentTime + delay);
-        gain.gain.linearRampToValueAtTime(0.18, ctx.currentTime + delay + 0.04);
-        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + delay + 0.55);
-        osc.connect(gain); gain.connect(ctx.destination);
-        osc.start(ctx.currentTime + delay);
-        osc.stop(ctx.currentTime + delay + 0.6);
-      });
-      setTimeout(() => ctx.close && ctx.close(), 1500);
-    } catch (e) { /* audio blocked until the user has interacted; fine */ }
-  }, [enabled]);
+    playPattern(pattern);
+    if (pattern === "alert") {
+      try { navigator.vibrate && navigator.vibrate([220, 120, 220, 120, 380]); } catch (e) { /* not on desktop */ }
+    }
+  }, [enabled, pattern]);
 }
 
 function CheckInOverlay({ data, update, personById, allEvents, todayKey, onOpenMeal, close }) {
@@ -3957,6 +4780,9 @@ function CheckInOverlay({ data, update, personById, allEvents, todayKey, onOpenM
     .sort((a, b) => (a.time || "99").localeCompare(b.time || "99"));
   const mealsPlanned = dayHasMeals(data, tomorrowKey);
   const openTopics = (data.agenda || []).filter((a) => !a.resolved);
+  // Who has not recorded anything yet. Shown as a nudge on the step; it no
+  // longer decides *whether* the step exists, which is what deleted it out
+  // from under the second person mid-walkthrough.
   const missingStatus = (data.people || []).filter((pp) => !((data.status || {})[todayKey] || {})[pp.id]);
   const generated = useCheckinPrompt(todayKey, data, update, promptForDate(todayKey, data.agendaPrompts));
   const prompt = generated.question;
@@ -3982,15 +4808,36 @@ function CheckInOverlay({ data, update, personById, allEvents, todayKey, onOpenM
     return d;
   });
 
-  const steps = [];
-  if (prompt) steps.push({ id: "prompt", label: "Tonight's question" });
-  if (overdueChores.length + overdueTasks.length) steps.push({ id: "overdue", label: "Overdue", count: overdueChores.length + overdueTasks.length });
-  if (slipped.length) steps.push({ id: "slipped", label: "Projects that slipped", count: slipped.length });
-  if (openTopics.length) steps.push({ id: "topics", label: "Things to talk about", count: openTopics.length });
-  if (tomorrowEvents.length) steps.push({ id: "tomorrow", label: "Tomorrow", count: tomorrowEvents.length });
-  if (!mealsPlanned) steps.push({ id: "meals", label: "Tomorrow's meals" });
-  if (missingStatus.length) steps.push({ id: "status", label: "How we're doing" });
-  steps.push({ id: "time", label: "Tomorrow's check-in" });
+  /* Worked out ONCE, when the walkthrough opens, and then held still.
+     
+     These used to be recomputed on every render, with each step included only
+     while it was still outstanding — so a step vanished from the list the moment
+     you dealt with it. Two consequences, both reported as the check-in being
+     broken:
+     
+       * The status step disappeared as soon as *everybody* had recorded
+         something. With two people that meant the second person moving their
+         first slider deleted the step out from under themselves, before they
+         had set the other two. They could not finish.
+       * Every other step did the same, so the list shortened underneath you and
+         the walkthrough jumped to whatever now occupied that index.
+     
+     A walkthrough is a fixed list of things to go through. Deciding what is on
+     it belongs at the start; after that, doing something must not change what
+     you are being asked. */
+  /* Decided once, when the walkthrough opens, and then held still. See
+     buildCheckinSteps in lib/checkin.js for why -- the short version is that
+     recomputing it deleted the status step out from under the second person
+     before they had finished. */
+  const [steps] = useState(() => buildCheckinSteps({
+    hasPrompt: Boolean(prompt),
+    overdueCount: overdueChores.length + overdueTasks.length,
+    slippedCount: slipped.length,
+    topicsCount: openTopics.length,
+    tomorrowCount: tomorrowEvents.length,
+    mealsPlanned,
+    peopleCount: (data.people || []).length,
+  }));
 
   const finish = () => {
     update((d) => {
@@ -4101,26 +4948,30 @@ function CheckInOverlay({ data, update, personById, allEvents, todayKey, onOpenM
               const st = choreState(c, todayKey);
               const who = personById(choreAssignee(c, todayKey));
               return (
-                <button key={c.id} onClick={() => toggleChore(c.id)} className="tapfade flex items-center gap-3 rounded-xl px-3.5 py-3 text-left"
+                <div key={c.id} className="flex items-center gap-3 rounded-xl px-3.5 py-3"
                   style={{ background: "#E86A4C10", borderLeft: "3px solid #E86A4C" }}>
-                  <Circle size={24} style={{ color: "#E86A4C" }} className="shrink-0" />
+                  <button onClick={() => toggleChore(c.id)} className="tapfade shrink-0" style={{ color: "#E86A4C" }}>
+                    <Circle size={24} />
+                  </button>
                   <span className="flex-1 min-w-0">
                     <span style={{ fontSize: 15.5, fontWeight: 600 }} className="block truncate">{c.title}</span>
                     <span style={{ color: "#C2542F", fontSize: 12, fontWeight: 700 }}>{lateLabel(daysBetween(st.missedSince, todayKey))}</span>
                   </span>
                   {who && <span className="shrink-0 rounded-full px-2 py-0.5" style={{ background: who.color + "1F", color: who.color, fontSize: 11, fontWeight: 800 }}>{who.name}</span>}
-                </button>
+                </div>
               );
             })}
             {overdueTasks.map((t) => (
-              <button key={t.id} onClick={() => toggleTask(t.id)} className="tapfade flex items-center gap-3 rounded-xl px-3.5 py-3 text-left"
+              <div key={t.id} className="flex items-center gap-3 rounded-xl px-3.5 py-3"
                 style={{ background: "#E86A4C10", borderLeft: "3px solid #E86A4C" }}>
-                <Circle size={24} style={{ color: "#E86A4C" }} className="shrink-0" />
+                <button onClick={() => toggleTask(t.id)} className="tapfade shrink-0" style={{ color: "#E86A4C" }}>
+                  <Circle size={24} />
+                </button>
                 <span className="flex-1 min-w-0">
                   <span style={{ fontSize: 15.5, fontWeight: 600 }} className="block truncate">{t.title}</span>
                   <span style={{ color: "#C2542F", fontSize: 12, fontWeight: 700 }}>{lateLabel(daysBetween(t.date, todayKey))}</span>
                 </span>
-              </button>
+              </div>
             ))}
           </div>
         )}
@@ -4157,9 +5008,13 @@ function CheckInOverlay({ data, update, personById, allEvents, todayKey, onOpenM
               const c = catOf(a.category);
               const who = personById(a.personId);
               return (
-                <button key={a.id} onClick={() => toggleTopic(a.id)} className="tapfade flex items-start gap-3 rounded-xl px-3.5 py-3 text-left"
+                <div key={a.id} className="flex items-start gap-3 rounded-xl px-3.5 py-3"
                   style={{ background: T.panelAlt }}>
-                  <Circle size={24} style={{ color: T.faint }} className="shrink-0 mt-0.5" />
+                  {/* Only the circle resolves a topic. */}
+                  <button onClick={() => toggleTopic(a.id)} aria-label="Mark resolved"
+                    className="tapfade shrink-0 mt-0.5" style={{ color: T.faint }}>
+                    <Circle size={24} />
+                  </button>
                   <span className="flex-1 min-w-0">
                     <span style={{ fontSize: 15.5, fontWeight: 600, lineHeight: 1.35 }} className="block">{a.text}</span>
                     <span className="flex items-center gap-2 mt-1">
@@ -4169,7 +5024,7 @@ function CheckInOverlay({ data, update, personById, allEvents, todayKey, onOpenM
                       {who && <span style={{ color: who.color, fontSize: 11.5, fontWeight: 700 }}>{who.name}</span>}
                     </span>
                   </span>
-                </button>
+                </div>
               );
             })}
           </div>
@@ -4205,12 +5060,28 @@ function CheckInOverlay({ data, update, personById, allEvents, todayKey, onOpenM
         )}
 
         {step.id === "status" && (
+          <div>
+          {missingStatus.length > 0 && (
+            <p style={{ color: T.sub, fontSize: 13.5 }} className="mb-2">
+              {missingStatus.length === (data.people || []).length
+                ? "Neither of you has recorded tonight yet."
+                : `Still waiting on ${missingStatus.map((pp) => pp.name).join(" and ")}.`}
+            </p>
+          )}
           <div className="grid gap-3" style={{ gridTemplateColumns: isMobile ? "1fr" : "repeat(2, minmax(0,1fr))" }}>
             {(data.people || []).map((pp) => {
               const cur = ((data.status || {})[todayKey] || {})[pp.id] || { happiness: 3, connection: 3, intimacy: 3 };
+              const recorded = Boolean(((data.status || {})[todayKey] || {})[pp.id]);
               return (
                 <div key={pp.id} className="rounded-2xl p-3.5" style={{ background: T.panelAlt }}>
-                  <div style={{ fontWeight: 700, fontSize: 15, color: pp.color }} className="mb-2">{pp.name}</div>
+                  <div className="flex items-center justify-between mb-2">
+                    <span style={{ fontWeight: 700, fontSize: 15, color: pp.color }}>{pp.name}</span>
+                    {/* So it is obvious that recording is per person, and that yours
+                        landed — the confusion was not knowing whether it had. */}
+                    <span style={{ color: recorded ? pp.color : T.faint, fontSize: 11.5, fontWeight: 700 }}>
+                      {recorded ? "recorded" : "not yet"}
+                    </span>
+                  </div>
                   {STATUS_DIMS.map((dim) => (
                     <div key={dim.key} className="mb-2.5">
                       <div className="flex items-baseline justify-between">
@@ -4223,6 +5094,7 @@ function CheckInOverlay({ data, update, personById, allEvents, todayKey, onOpenM
                 </div>
               );
             })}
+          </div>
           </div>
         )}
 
@@ -4676,12 +5548,164 @@ function MealModal({ mealKey, slot, data, update, close }) {
   );
 }
 
+/* Steps on a to-do. "Renew the car tabs" is really three things, and a list you
+   can tick through beats one line you keep failing to start. */
+function StepsEditor({ steps, onChange }) {
+  const [draft, setDraft] = useState("");
+  const add = () => {
+    const text = draft.trim();
+    if (!text) return;
+    onChange([...steps, { id: uid(), title: text, done: false }]);
+    setDraft("");
+  };
+  return (
+    <Field label={`Steps${steps.length ? ` · ${steps.filter((s) => s.done).length} of ${steps.length}` : ""}`}>
+      {steps.map((s) => (
+        <div key={s.id} className="flex items-center gap-2 mb-1.5">
+          <button onClick={() => onChange(steps.map((x) => x.id === s.id ? { ...x, done: !x.done } : x))}
+            aria-label={s.done ? `Un-tick ${s.title}` : `Tick ${s.title}`}
+            className="tapfade shrink-0" style={{ color: s.done ? T.brand : T.faint }}>
+            {s.done ? <CheckCircle2 size={20} /> : <Circle size={20} />}
+          </button>
+          <input value={s.title}
+            onChange={(e) => onChange(steps.map((x) => x.id === s.id ? { ...x, title: e.target.value } : x))}
+            className="flex-1 min-w-0 px-3 py-2 rounded-xl outline-none"
+            style={{ ...inputStyle, textDecoration: s.done ? "line-through" : "none", fontSize: 15 }} />
+          <button onClick={() => onChange(steps.filter((x) => x.id !== s.id))}
+            aria-label={`Remove ${s.title}`} className="tapfade p-1.5 shrink-0" style={{ color: T.faint }}>
+            <Trash2 size={16} />
+          </button>
+        </div>
+      ))}
+      <div className="flex items-center gap-2">
+        <input value={draft} onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }}
+          placeholder="Add a step…" className="flex-1 px-3 py-2.5 rounded-xl outline-none"
+          style={{ ...inputStyle, fontSize: 15 }} />
+        <button onClick={add} disabled={!draft.trim()} className="tapfade px-4 py-2.5 rounded-xl font-semibold"
+          style={{ background: draft.trim() ? T.brand : T.panelAlt, color: draft.trim() ? "#fff" : T.faint,
+            border: `1px solid ${draft.trim() ? T.brand : T.line}` }}>
+          Add
+        </button>
+      </div>
+    </Field>
+  );
+}
+
+/* A note about one occurrence of a recurring chore.
+
+   Keyed by date on purpose. "The lorry never came" belongs to that Tuesday, not
+   to bin night forever — attaching it to the chore would turn an observation
+   into a standing instruction. */
+/* A recurring chore's checklist: what the job involves, the same every time.
+   No tick boxes — "wheelie bin, recycling, garden waste" is not something you
+   complete once. Ticking off one *occurrence* is what the circle on the row
+   does, and what happened on a particular day is what the note is for. */
+function ChecklistEditor({ items, onChange }) {
+  const [draft, setDraft] = useState("");
+  const add = () => {
+    const text = draft.trim();
+    if (!text) return;
+    onChange([...items, text]);
+    setDraft("");
+  };
+  return (
+    <Field label={`Checklist${items.length ? ` · ${items.length}` : ""}`}>
+      {items.map((text, i) => (
+        <div key={i} className="flex items-center gap-2 mb-1.5">
+          <span style={{ color: T.faint, fontSize: 13, width: 14 }} className="shrink-0">{i + 1}.</span>
+          <input value={text}
+            onChange={(e) => onChange(items.map((x, n) => (n === i ? e.target.value : x)))}
+            className="flex-1 min-w-0 px-3 py-2 rounded-xl outline-none"
+            style={{ ...inputStyle, fontSize: 15 }} />
+          <button onClick={() => onChange(items.filter((_, n) => n !== i))}
+            aria-label={`Remove ${text}`} className="tapfade p-1.5 shrink-0" style={{ color: T.faint }}>
+            <Trash2 size={16} />
+          </button>
+        </div>
+      ))}
+      <div className="flex items-center gap-2">
+        <input value={draft} onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); add(); } }}
+          placeholder="Add to the checklist…" className="flex-1 px-3 py-2.5 rounded-xl outline-none"
+          style={{ ...inputStyle, fontSize: 15 }} />
+        <button onClick={add} disabled={!draft.trim()} className="tapfade px-4 py-2.5 rounded-xl font-semibold"
+          style={{ background: draft.trim() ? T.brand : T.panelAlt, color: draft.trim() ? "#fff" : T.faint,
+            border: `1px solid ${draft.trim() ? T.brand : T.line}` }}>
+          Add
+        </button>
+      </div>
+      <p style={{ color: T.faint, fontSize: 12.5 }} className="mt-1.5">
+        The same every time this chore comes round. Ticking the circle on the row completes
+        the whole chore; use the note below for what happened on one particular day.
+      </p>
+    </Field>
+  );
+}
+
+
+function ChoreNotesEditor({ chore, dateKey, notes, onChange }) {
+  const [day, setDay] = useState(dateKey);
+  const history = Object.entries(notes)
+    .map(([k, text]) => ({ dateKey: k, text }))
+    .sort((a, b) => b.dateKey.localeCompare(a.dateKey));
+
+  const setNote = (text) => {
+    const next = { ...notes };
+    const trimmed = text.trim();
+    if (trimmed) next[day] = trimmed; else delete next[day];
+    onChange(next);
+  };
+
+  return (
+    <Field label="Note for one day">
+      <div className="flex items-center gap-2 mb-2">
+        <input type="date" value={day} onChange={(e) => setDay(e.target.value)}
+          className="px-3 py-2.5 rounded-xl outline-none" style={{ ...inputStyle, fontSize: 15 }} />
+        <span style={{ color: T.faint, fontSize: 12 }}>
+          {day === dateKey ? "today" : ""}
+        </span>
+      </div>
+      <textarea
+        value={notes[day] || ""}
+        onChange={(e) => setNote(e.target.value)}
+        rows={2}
+        placeholder="What happened that day — left out early, skipped, done twice…"
+        className="w-full px-3 py-2.5 rounded-xl outline-none"
+        style={{ ...inputStyle, fontSize: 15, resize: "vertical" }}
+      />
+      {history.length > 0 && (
+        <div className="mt-2">
+          <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }} className="uppercase mb-1">
+            Notes so far · {history.length}
+          </div>
+          <div className="flex flex-col gap-1" style={{ maxHeight: 150, overflowY: "auto" }}>
+            {history.map((n) => (
+              <button key={n.dateKey} onClick={() => setDay(n.dateKey)}
+                className="tapfade text-left rounded-lg px-2.5 py-1.5"
+                style={{ background: n.dateKey === day ? T.brandSoft : T.panelAlt, border: `1px solid ${T.line}` }}>
+                <span style={{ color: T.sub, fontSize: 11, fontWeight: 700 }}>{n.dateKey}</span>
+                <span style={{ color: T.ink, fontSize: 13 }} className="block truncate">{n.text}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+    </Field>
+  );
+}
+
+
 function ChoreModal({ payload, people, update, close }) {
   const editing = !!payload.id;
   const [title, setTitle] = useState(payload.title || "");
   const [personId, setPersonId] = useState(payload.personId || "");
   const [rotation, setRotation] = useState(Array.isArray(payload.rotation) ? payload.rotation.filter(Boolean) : []);
   const [cad, setCad] = useState(payload.cadence || { type: "daily" });
+  const [alert, setAlert] = useState(payload.alert || null);
+  const [notes, setNotes] = useState(
+    payload.notes && typeof payload.notes === "object" && !Array.isArray(payload.notes) ? payload.notes : {});
+  const [checklist, setChecklist] = useState(SUB.choreChecklist(payload));
   const rotating = rotation.length > 0;
   // tapping a person appends them to the end, so the order you tap is the order it rotates
   const toggleRot = (id) => setRotation((cur) => cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]);
@@ -4703,8 +5727,8 @@ function ChoreModal({ payload, people, update, close }) {
     const rot = rotation.length > 1 ? rotation : [];
     const fixed = rotation.length === 1 ? rotation[0] : personId;
     update((d) => {
-      if (editing) d.chores = d.chores.map((c) => c.id === payload.id ? { ...c, title, personId: fixed, rotation: rot, cadence } : c);
-      else d.chores = [...d.chores, { id: uid(), title, personId: fixed, rotation: rot, cadence, createdOn: ymd(new Date()), done: {} }];
+      if (editing) d.chores = d.chores.map((c) => c.id === payload.id ? { ...c, title, personId: fixed, rotation: rot, cadence, alert, notes, checklist: checklist.filter((x) => x.trim()) } : c);
+      else d.chores = [...d.chores, { id: uid(), title, personId: fixed, rotation: rot, cadence, alert, notes, checklist: checklist.filter((x) => x.trim()), createdOn: ymd(new Date()), done: {} }];
       return d;
     });
     close();
@@ -4808,6 +5832,9 @@ function ChoreModal({ payload, people, update, close }) {
           </>
         )}
       </Field>
+      <ChecklistEditor items={checklist} onChange={setChecklist} />
+      <ChoreNotesEditor chore={payload} dateKey={ymd(new Date())} notes={notes} onChange={setNotes} />
+      <AlertEditor value={alert} onChange={setAlert} />
       <SaveBar onSave={save} onDelete={editing ? del : null} />
     </Overlay>
   );
@@ -4818,11 +5845,14 @@ function TaskModal({ payload, people, update, close }) {
   const [title, setTitle] = useState(payload.title || "");
   const [date, setDate] = useState(payload.date || "");
   const [personId, setPersonId] = useState(payload.personId || "");
+  const [alert, setAlert] = useState(payload.alert || null);
+  const [steps, setSteps] = useState(Array.isArray(payload.steps) ? payload.steps : []);
+  const [note, setNote] = useState(SUB.taskNote(payload));
   const save = () => {
     if (!title.trim()) return;
     update((d) => {
-      if (editing) d.tasks = d.tasks.map((t) => t.id === payload.id ? { ...t, title, date, personId } : t);
-      else d.tasks = [...d.tasks, { id: uid(), title, date, personId, done: false }];
+      if (editing) d.tasks = d.tasks.map((t) => t.id === payload.id ? { ...t, title, date, personId, alert, steps, note: note.trim() } : t);
+      else d.tasks = [...d.tasks, { id: uid(), title, date, personId, alert, steps, note: note.trim(), done: false }];
       return d;
     });
     close();
@@ -4834,6 +5864,14 @@ function TaskModal({ payload, people, update, close }) {
       <Field label="Task"><input autoFocus value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Renew car tabs" className="w-full px-4 py-3.5 rounded-xl text-lg outline-none" style={inputStyle} /></Field>
       <Field label="Due date (optional)"><input type="date" value={date} onChange={(e) => setDate(e.target.value)} className="w-full px-4 py-3.5 rounded-xl text-lg outline-none" style={inputStyle} /></Field>
       <Field label="Assigned to"><PersonPicker people={people} value={personId} onChange={setPersonId} /></Field>
+      <StepsEditor steps={steps} onChange={setSteps} />
+      <Field label="Notes">
+        <textarea value={note} onChange={(e) => setNote(e.target.value)} rows={3}
+          placeholder="Anything worth remembering — a phone number, where the paperwork is…"
+          className="w-full px-3 py-2.5 rounded-xl outline-none"
+          style={{ ...inputStyle, fontSize: 15, resize: "vertical" }} />
+      </Field>
+      <AlertEditor value={alert} onChange={setAlert} />
       <SaveBar onSave={save} onDelete={editing ? del : null} />
     </Overlay>
   );
@@ -4909,6 +5947,204 @@ function DateModal({ payload, update, close }) {
     </Overlay>
   );
 }
+
+/* ---------------- History ----------------
+   A window back over what actually got done. Distinct from the archive panel in
+   Settings, which is the permanent append-only record that every admin has to
+   agree to switch off: this reads the live document, so it works whether or not
+   the archive is on, and it is reachable in one tap from the To-Dos tab.
+
+   The tally is the part people actually come for. "Who has been doing more"
+   is a question households already ask each other, usually badly, and a count
+   over a chosen window answers it without anyone having to keep score.
+
+   Credit can be corrected here, but only where the completion model allows it
+   (see lib/completion.js): a signed-in member ticking their own box made a
+   first-person claim, and this screen will not rewrite it. Anything ticked on a
+   shared display, or recorded on somebody's behalf, is fair game. */
+export function HistoryModal({ data, update, personById, close }) {
+  const [days, setDays] = useState(14);
+  const [who, setWho] = useState("all");
+  const [error, setError] = useState("");
+  const todayKey = ymd(new Date());
+  const actor = actorFor(data);
+
+  const rows = [];
+  for (let i = 0; i < days; i++) {
+    const k = ymd(addDays(parseYMD(todayKey), -i));
+    const items = [];
+
+    for (const c of data.chores || []) {
+      const mark = c.done?.[k];
+      if (!mark) continue;
+      if (COMPLETION.isSkipped(mark)) {
+        items.push({ id: "c" + c.id, kind: "chore", title: c.title, skipped: true, personId: "" });
+        continue;
+      }
+      const rec = COMPLETION.completionOf(mark);
+      items.push({
+        id: "c" + c.id, kind: "chore", title: c.title, personId: rec?.by || "",
+        chore: c, mark,
+        // A locked completion is somebody's own claim about themselves. It is
+        // shown, but not up for editing by whoever happens to be looking.
+        editable: COMPLETION.canReattribute(mark, actor),
+        note: rec?.byType === "display" ? (rec.source || "shared display") : null,
+      });
+    }
+
+    for (const t of data.tasks || []) {
+      if (t.done && t.doneAt === k) {
+        items.push({ id: "t" + t.id, kind: "task", title: t.title, personId: t.personId, task: t, editable: true });
+      }
+    }
+
+    for (const pr of data.projects || []) {
+      if (pr.doneOn === k) {
+        items.push({ id: "p" + pr.id, kind: "project", title: pr.title, personId: pr.personId, editable: false });
+      }
+    }
+
+    const filtered = who === "all" ? items : items.filter((x) => x.personId === who);
+    if (filtered.length) rows.push({ date: k, items: filtered });
+  }
+
+  // Tally over the whole window, not just the filtered view — otherwise
+  // choosing one person makes everybody else's count read zero.
+  const tally = {};
+  for (let i = 0; i < days; i++) {
+    const k = ymd(addDays(parseYMD(todayKey), -i));
+    for (const c of data.chores || []) {
+      const mark = c.done?.[k];
+      if (!mark || COMPLETION.isSkipped(mark)) continue;
+      const by = COMPLETION.completedBy(mark);
+      if (by) tally[by] = (tally[by] || 0) + 1;
+    }
+    for (const t of data.tasks || []) if (t.done && t.doneAt === k && t.personId) tally[t.personId] = (tally[t.personId] || 0) + 1;
+    for (const pr of data.projects || []) if (pr.doneOn === k && pr.personId) tally[pr.personId] = (tally[pr.personId] || 0) + 1;
+  }
+
+  const recredit = (x, dateKey, personId) => {
+    setError("");
+    try {
+      if (x.kind === "chore") {
+        update((d) => COMPLETION.attributeChore(d, x.chore.id, dateKey, personId, actorFor(d)));
+      } else {
+        update((d) => {
+          d.tasks = d.tasks.map((t) => t.id === x.task.id ? { ...t, personId } : t);
+          return d;
+        });
+      }
+    } catch (err) { setError(err.message); }
+  };
+
+  const kindIcon = (k) => k === "chore" ? <Repeat size={11} /> : k === "task" ? <CheckCircle2 size={11} /> : <Wrench size={11} />;
+  const pill = (on, bg) => ({
+    background: on ? bg : T.panelAlt, color: on ? "#fff" : T.sub,
+    border: `1px solid ${on ? bg : T.line}`, fontSize: 12.5,
+  });
+
+  return (
+    <Overlay close={close} wide>
+      <ModalHead title="History" close={close} />
+
+      {error && (
+        <div role="alert" className="rounded-xl px-3 py-2 mb-3"
+          style={{ background: "#fdecea", border: "1px solid #f0b4ae", color: "#7a1c12", fontSize: 13 }}>
+          {error}
+        </div>
+      )}
+
+      <div className="flex items-center gap-2 flex-wrap mb-3">
+        {[[7, "7 days"], [14, "2 weeks"], [30, "30 days"], [90, "3 months"]].map(([n, l]) => (
+          <button key={n} onClick={() => setDays(n)} className="tapfade px-3 py-1.5 rounded-full font-semibold"
+            style={pill(days === n, T.brand)}>{l}</button>
+        ))}
+        <span style={{ width: 1, height: 18, background: T.line }} className="mx-1" />
+        <button onClick={() => setWho("all")} className="tapfade px-3 py-1.5 rounded-full font-semibold"
+          style={pill(who === "all", T.ink)}>Everyone</button>
+        {data.people.map((pp) => (
+          <button key={pp.id} onClick={() => setWho(pp.id)} className="tapfade px-3 py-1.5 rounded-full font-semibold"
+            style={pill(who === pp.id, pp.color)}>{pp.name}</button>
+        ))}
+      </div>
+
+      {Object.keys(tally).length > 0 && (
+        <div className="flex items-center gap-3 flex-wrap rounded-xl px-3 py-2.5 mb-3" style={{ background: T.panelAlt }}>
+          <span style={{ color: T.sub, fontSize: 11.5, fontWeight: 800, letterSpacing: 0.5 }} className="uppercase">Completed</span>
+          {data.people.map((pp) => (
+            <span key={pp.id} className="flex items-center gap-1.5">
+              <span className="rounded-full" style={{ width: 8, height: 8, background: pp.color }} />
+              <span style={{ fontSize: 13, fontWeight: 700, color: T.ink }}>{pp.name} {tally[pp.id] || 0}</span>
+            </span>
+          ))}
+        </div>
+      )}
+
+      {rows.length === 0 ? (
+        <Empty text="Nothing completed in this window." />
+      ) : (
+        <div className="flex flex-col gap-3.5">
+          {rows.map((r) => {
+            const d = parseYMD(r.date);
+            return (
+              <div key={r.date}>
+                <div style={{ color: T.sub, fontSize: 11.5, fontWeight: 800, letterSpacing: 0.8 }} className="uppercase mb-1.5">
+                  {r.date === todayKey ? "Today" : `${WD_LONG[d.getDay()]}, ${MO_LONG[d.getMonth()].slice(0, 3)} ${d.getDate()}`}
+                </div>
+                <div className="flex flex-col gap-1.5">
+                  {r.items.map((x) => {
+                    const pp = personById(x.personId);
+                    return (
+                      <div key={r.date + x.id} className="rounded-xl px-3 py-2"
+                        style={{ background: T.panel, border: `1px solid ${T.line}`, opacity: x.skipped ? 0.6 : 1 }}>
+                        <div className="flex items-center gap-2">
+                          <span style={{ color: T.faint }} className="shrink-0">{kindIcon(x.kind)}</span>
+                          <span style={{ fontSize: 14.5, fontWeight: 600, color: T.ink, textDecoration: x.skipped ? "line-through" : "none" }}
+                            className="truncate flex-1">{x.title}</span>
+                          {x.skipped ? (
+                            <span style={{ color: T.faint, fontSize: 11.5, fontWeight: 700 }}>skipped</span>
+                          ) : x.editable ? (
+                            <div className="flex items-center gap-1.5 shrink-0 flex-wrap justify-end">
+                              {data.people.map((cand) => {
+                                const on = pp?.id === cand.id;
+                                return (
+                                  <button key={cand.id} onClick={() => recredit(x, r.date, cand.id)}
+                                    aria-label={`Credit ${cand.name} for ${x.title}`}
+                                    className="tapfade px-2 py-0.5 rounded-full font-semibold"
+                                    style={{ background: on ? cand.color : "transparent", color: on ? "#fff" : T.faint,
+                                      border: `1px solid ${on ? cand.color : T.line}`, fontSize: 11 }}>
+                                    {cand.name}
+                                  </button>
+                                );
+                              })}
+                            </div>
+                          ) : pp ? (
+                            <span style={{ color: pp.color, fontSize: 11.5, fontWeight: 700 }} className="shrink-0">{pp.name}</span>
+                          ) : (
+                            <span style={{ color: T.faint, fontSize: 11.5, fontWeight: 700 }} className="shrink-0">
+                              {x.note || "unattributed"}
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <p style={{ color: T.faint, fontSize: 12 }} className="mt-3">
+        Tap a name to change who gets credit — handy when the rotation said one of you but
+        the other actually did it. Anything one of you ticked off while signed in stays as
+        it was recorded, and shows the name without the buttons.
+      </p>
+    </Overlay>
+  );
+}
+
 
 function ProjectModal({ payload, people, update, close }) {
   const editing = !!payload.id;
@@ -5062,7 +6298,7 @@ function PersonPicker({ people, value, onChange }) {
 }
 
 /* ---------------- Settings ---------------- */
-function SettingsModal({ data, update, syncCalendars, close, currentUser }) {
+function SettingsModal({ data, update, saveNow, syncCalendars, close, currentUser }) {
   const [name, setName] = useState(data.householdName || "Our Home");
   const [tab, setTab] = useState("people");
   const saveName = () => {
@@ -5114,6 +6350,9 @@ function SettingsModal({ data, update, syncCalendars, close, currentUser }) {
       </Field>
       <Field label="Extra row on Today">
         <SecondBlockSettings data={data} update={update} theme={T} people={data.people} />
+      </Field>
+      <Field label="Import from the old HouseHub">
+        <ImportPanel theme={T} data={data} update={update} saveNow={saveNow} />
       </Field>
       <Field label="Your data">
         <PrivacyPanel theme={T} data={data} me={currentUser} />
@@ -5173,6 +6412,26 @@ function SettingsModal({ data, update, syncCalendars, close, currentUser }) {
         <p style={{ color: T.faint, fontSize: 13 }} className="mt-2">
           "Stuck on" lays notes over the Today screen — drag to move them, tap to edit. Phones always use the compact row.
         </p>
+
+        {(data.noteDisplay || "overlay") === "overlay" && (
+          <div className="mt-3">
+            <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }} className="uppercase mb-1">Idle drift</div>
+            <div className="flex gap-2">
+              {[[false, "Still"], [true, "Gentle drift"]].map(([v, l]) => {
+                const on = !!data.noteDrift === v;
+                return (
+                  <button key={String(v)} onClick={() => update((d) => { d.noteDrift = v; return d; })}
+                    className="tapfade flex-1 py-2.5 rounded-xl font-semibold"
+                    style={{ background: on ? T.brand : T.panelAlt, color: on ? "#fff" : T.ink, border: `1px solid ${on ? T.brand : T.line}` }}>{l}</button>
+                );
+              })}
+            </div>
+            <p style={{ color: T.faint, fontSize: 12.5 }} className="mt-1.5">
+              Lets the notes wander a few pixels every so often, which stops a wall display
+              burning a fixed image into the panel. Off if you find movement distracting.
+            </p>
+          </div>
+        )}
         {(data.notes || []).some((n) => typeof n.x === "number") && (
           <button onClick={() => update((d) => { d.notes = d.notes.map(({ x, y, ...rest }) => rest); return d; })}
             className="tapfade mt-3 w-full py-2.5 rounded-xl font-semibold" style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.sub }}>
@@ -5457,6 +6716,18 @@ function CheckInSettings({ data, update }) {
   const cfg = { ...DEFAULT_CHECKIN, ...(data.checkin || {}) };
   const set = (patch) => update((d) => { d.checkin = { ...DEFAULT_CHECKIN, ...(d.checkin || {}), ...patch }; return d; });
 
+  // null = not tried yet, so the result line stays hidden until it means something
+  const [soundTested, setSoundTested] = useState(null);
+  const [relayTest, setRelayTest] = useState(null);
+  const relay = { ...RELAY.DEFAULT_RELAY, ...(data.reminderRelay || {}) };
+  const setRelay = (patch) => {
+    setRelayTest(null);
+    update((d) => {
+      d.reminderRelay = { ...RELAY.DEFAULT_RELAY, ...(d.reminderRelay || {}), ...patch };
+      return d;
+    });
+  };
+
   return (
     <div>
       <div className="rounded-2xl p-4 mb-4" style={{ background: T.brandSoft }}>
@@ -5527,10 +6798,111 @@ function CheckInSettings({ data, update }) {
             );
           })}
         </div>
+
+        {/* Pressing this is not just a test: the tap itself is what permits the
+            browser to make any sound for the rest of the session. After a tablet
+            reboot, a reminder that never chimes is almost always this. */}
+        <button onClick={() => { setSoundTested(playPattern("alert") && audioReady()); }}
+          className="tapfade w-full mt-2 py-3 rounded-xl font-semibold flex items-center justify-center gap-2"
+          style={{ background: T.panelAlt, color: T.ink, border: `1px solid ${T.line}` }}>
+          <Volume2 size={15} /> Test the alert sound
+        </button>
+        {soundTested !== null && (
+          <p style={{ color: soundTested ? T.sub : "#B4442A", fontSize: 12.5 }} className="mt-1.5">
+            {soundTested
+              ? "Sound is armed for this session. Every later chime will play."
+              : "The browser is still refusing audio. Tap anywhere on the page, then try again."}
+          </p>
+        )}
+
         <p style={{ color: T.faint, fontSize: 12.5 }} className="mt-2">
           Browsers block audio until someone has tapped the page at least once, so the very
-          first chime after a reboot may be silent.
+          first chime after a reboot may be silent. If the test above is silent too, it is the
+          device rather than the app — check the volume, and on an iPad the physical mute
+          switch, which Safari honours even for web audio.
         </p>
+      </Field>
+
+      {/* ---- phone reminders ---- */}
+      <Field label="Phone reminders">
+        <p style={{ color: T.faint, fontSize: 12.5 }} className="mb-2">
+          A screen has to be awake and showing this page to chime, which is no good for
+          anything critical. This sends reminders to a push service you run — an{" "}
+          <strong>ntfy</strong> instance, typically — so they reach a phone that is in
+          someone's pocket.
+        </p>
+
+        {/* Said plainly rather than buried: this is the one place where something
+            leaves the house, and a household deserves to make that choice knowing
+            what it costs. */}
+        <div className="rounded-xl px-3 py-2.5 mb-2" style={{ background: "#fff6e5", border: "1px solid #f0d9a8" }}>
+          <div style={{ color: "#6b4708", fontSize: 12.5, lineHeight: 1.5 }}>
+            <strong>What this shares.</strong> Your browser sends the reminder's title
+            directly to the address below. HouseHub's own server is not involved and
+            still cannot read any of this. Whoever runs that push service <em>can</em>{" "}
+            see the titles — so point it at one you host if that matters to you.
+          </div>
+        </div>
+
+        <div className="flex gap-2 mb-2">
+          {[[false, "Off"], [true, "On"]].map(([v, l]) => {
+            const on = Boolean(relay.enabled) === v;
+            return (
+              <button key={String(v)} onClick={() => setRelay({ enabled: v })}
+                className="tapfade flex-1 py-2.5 rounded-xl font-semibold"
+                style={{ background: on ? T.brand : T.panelAlt, color: on ? "#fff" : T.ink, border: `1px solid ${on ? T.brand : T.line}` }}>
+                {l}
+              </button>
+            );
+          })}
+        </div>
+
+        {relay.enabled && (
+          <>
+            <input value={relay.endpoint || ""} onChange={(e) => setRelay({ endpoint: e.target.value.trim() })}
+              placeholder="https://ntfy.example.com/your-topic"
+              className="w-full px-4 py-3 rounded-xl text-base outline-none" style={inputStyle} />
+            <div className="flex gap-2 mt-2">
+              {[["default", "Normal"], ["urgent", "Urgent"]].map(([v, l]) => {
+                const on = (relay.priority || "default") === v;
+                return (
+                  <button key={v} onClick={() => setRelay({ priority: v })}
+                    className="tapfade flex-1 py-2.5 rounded-xl font-semibold"
+                    style={{ background: on ? T.brand : T.panelAlt, color: on ? "#fff" : T.ink, border: `1px solid ${on ? T.brand : T.line}` }}>
+                    {l}
+                  </button>
+                );
+              })}
+            </div>
+
+            <button
+              disabled={!relay.endpoint || relayTest === "sending"}
+              onClick={async () => {
+                setRelayTest("sending");
+                const ok = await RELAY.sendReminder(
+                  { ...relay, enabled: true },
+                  { title: "HouseHub test reminder", overdue: 0, person: null });
+                setRelayTest(ok ? "ok" : "failed");
+              }}
+              className="tapfade w-full mt-2 py-3 rounded-xl font-semibold"
+              style={{ background: T.panelAlt, color: T.ink, border: `1px solid ${T.line}`, opacity: relay.endpoint ? 1 : 0.5 }}>
+              {relayTest === "sending" ? "Sending…" : "Send a test reminder"}
+            </button>
+
+            {relayTest === "ok" && (
+              <p style={{ color: T.sub, fontSize: 12.5 }} className="mt-1.5">
+                Sent. If nothing arrived, check the topic name and that the app is subscribed.
+              </p>
+            )}
+            {relayTest === "failed" && (
+              <p style={{ color: "#B4442A", fontSize: 12.5 }} className="mt-1.5">
+                That did not go through. The usual cause is the browser blocking it: whoever
+                runs this server has to allow the host in <code>PUSH_HOSTS</code> before any
+                page here may contact it. See docs/REMINDERS.md.
+              </p>
+            )}
+          </>
+        )}
       </Field>
     </div>
   );
