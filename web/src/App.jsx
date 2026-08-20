@@ -36,6 +36,8 @@ import { DEFAULT_ALERT, hasAlert, dueAlerts, escalationStep } from "./lib/alerts
 import * as RELAY from "./lib/relay.js";
 import * as STATUS from "./lib/status.js";
 import * as SUB from "./lib/subtasks.js";
+import { urgencyOf, partitionDates, agoLabel } from "./lib/dates.js";
+import * as ROT from "./lib/rotation.js";
 import { buildCheckinSteps } from "./lib/checkin.js";
 
 /* ---------------------------------------------------------------
@@ -45,7 +47,24 @@ const T = {
   bg: "#F3EDE2", panel: "#FFFFFF", panelAlt: "#FBF7F0",
   ink: "#2C2536", sub: "#867E8F", faint: "#B7AEB9", line: "#E7DECF",
   brand: "#1E6E5C", brandInk: "#12463A", brandSoft: "#E2EEE9", gold: "#C98A2B",
+  // Urgency for important dates. Warm red rather than a pure #F00, which would
+  // sit outside this palette and read as an error rather than as "soon".
+  danger: "#C1442E", dangerInk: "#8E2F1F", dangerSoft: "#FBE7E1",
+  goldInk: "#8A5C14", goldSoft: "#FAF0DC",
 };
+/* How each urgency band is drawn. One table, so the countdown chips on Today
+   and the list on the board cannot drift apart -- which they had, the chip
+   using the brand colour for "soon" while the list used gold. */
+const URGENCY_STYLE = {
+  today:     { fg: T.danger, ink: T.dangerInk, bg: T.dangerSoft, border: T.danger, bold: true },
+  week:      { fg: T.danger, ink: T.dangerInk, bg: T.dangerSoft, border: T.danger, bold: true },
+  fortnight: { fg: T.gold,   ink: T.goldInk,   bg: T.goldSoft,   border: T.gold,   bold: true },
+  soon:      { fg: T.brand,  ink: T.brandInk,  bg: T.panel,      border: T.line,   bold: false },
+  later:     { fg: T.faint,  ink: T.sub,       bg: T.panel,      border: T.line,   bold: false },
+  past:      { fg: T.faint,  ink: T.sub,       bg: T.panelAlt,   border: T.line,   bold: false },
+};
+const styleFor = (band) => URGENCY_STYLE[band?.key] || URGENCY_STYLE.later;
+
 const PERSON_COLORS = ["#E86A4C", "#E3A72C", "#2E9187", "#5D6FE0", "#D25B86", "#8A5CC2", "#4C9A54", "#3D8FD1"];
 const CAL_COLORS = ["#5D6FE0", "#8A5CC2", "#3D8FD1", "#C98A2B", "#D25B86"];
 // sticky-note paper colors, tuned to the warm palette
@@ -385,12 +404,7 @@ function owedOccurrences(chore, dateKey, lookback = 400) {
 }
 
 /* The most recent real completion — date and who. Skips are not completions. */
-function lastDoneEntry(chore, beforeKey) {
-  const entries = Object.entries(chore.done || {})
-    .filter(([k, v]) => isCompletion(v) && typeof v === "string" && (!beforeKey || k < beforeKey))
-    .sort((a, b) => b[0].localeCompare(a[0]));
-  return entries.length ? { date: entries[0][0], by: entries[0][1] } : null;
-}
+
 const lastDoneBy = (chore) => lastDoneEntry(chore)?.by ?? null;
 
 /* Whose turn it is on a given day.
@@ -399,22 +413,12 @@ const lastDoneBy = (chore) => lastDoneEntry(chore)?.by ?? null;
    same person stays up — including on later days — so an unfinished chore keeps
    belonging to whoever owed it rather than sliding onto the other person. Once
    it's done, the next day shows the next person. Skips don't advance anything. */
-function choreAssignee(chore, dateKey) {
-  const rot = Array.isArray(chore.rotation) ? chore.rotation.filter(Boolean) : [];
-  if (!rot.length) return chore.personId || "";
-  const target = dateKey || ymd(new Date());
-
-  // completed on this very day? that's who it was for
-  const mark = chore.done?.[target];
-  const credited = COMPLETION.completedBy(mark);
-  if (credited && rot.includes(credited)) return credited;
-
-  const prior = lastDoneEntry(chore, target);
-  if (!prior) return rot[0];
-  const base = rot.indexOf(prior.by);
-  return base === -1 ? rot[0] : rot[(base + 1) % rot.length];
-}
-const isRotating = (chore) => Array.isArray(chore.rotation) && chore.rotation.filter(Boolean).length > 1;
+const choreAssignee = (chore, dateKey) => ROT.assigneeFor(chore, dateKey || ymd(new Date()));
+const isRotating = (chore) => ROT.isRotating(chore);
+const lastDoneEntry = (chore, beforeKey) => {
+  const last = ROT.lastCompletion(chore, beforeKey);
+  return last ? { date: last.date, by: last.completion.by } : null;
+};
 
 // the next day this chore is actually scheduled, for previewing whose turn it'll be
 function nextOccurrenceOf(chore, fromKey, cap = 400) {
@@ -824,9 +828,28 @@ export default function HouseholdHub() {
     }
   }, []);
 
+  /* Refusals surfaced here rather than thrown.
+     
+     An updater that throws does so inside setData, which React treats as an
+     error during render: it unmounts the tree and the page goes blank until
+     somebody reloads. That is exactly what happened when a display tried to
+     un-tick a completion it was not allowed to touch -- completion.js throws a
+     perfectly sensible message, and the screen went white.
+     
+     So `update` catches. A refused change leaves the document untouched and the
+     reason appears as a notice. No updater anywhere can blank the app again. */
+  const [actionError, setActionError] = useState(null);
+
   const update = useCallback((fn) => {
     setData((d) => {
-      const next = fn({ ...d });
+      let next;
+      try {
+        next = fn({ ...d });
+      } catch (err) {
+        // Cannot call setState from inside an updater; defer it by a tick.
+        queueMicrotask(() => setActionError(err?.message || "That change was not allowed."));
+        return d;
+      }
       latest.current = next;
       dirty.current = true;
       clearTimeout(saveTimer.current);
@@ -1059,6 +1082,21 @@ export default function HouseholdHub() {
         checkin={{ plan, done: checkinDoneFor(data, todayKey), open: () => setModal({ type: "checkin" }) }} conn={conn}
         onSettings={() => setModal({ type: "settings" })} />
 
+      {/* A change the rules refused. Shown, then dismissed -- the alternative
+          was the page going blank, which told nobody anything. */}
+      {actionError && (
+        <div role="alert" className="shrink-0 px-3 md:px-4 pt-2">
+          <div className="rounded-2xl px-3.5 py-2.5 flex items-center gap-3"
+            style={{ background: "#fdecea", border: "1px solid #f0b4ae", color: "#7a1c12" }}>
+            <span style={{ fontSize: 14, fontWeight: 600 }} className="flex-1">{actionError}</span>
+            <button onClick={() => setActionError(null)} aria-label="Dismiss"
+              className="tapfade shrink-0 px-3 py-1 rounded-full"
+              style={{ background: "#7a1c1218", fontSize: 12.5, fontWeight: 700 }}>
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
       <AlertBanner alerts={bannerAlerts} people={people} onDone={alertDone} onSkip={alertSkip}
         onSnooze={alertSnooze} onCredit={alertCredit} />
 
@@ -1332,7 +1370,7 @@ function WeatherCell({ weather, label }) {
 /* ---------------- Countdown strip (Today screen) ----------------
    Deliberately one line only — it must never wrap and steal height
    from the three columns below it. Overflow scrolls sideways.        */
-function CountdownStrip({ dates, todayKey }) {
+export function CountdownStrip({ dates, todayKey }) {
   const upcoming = (dates || [])
     .map((d) => {
       const when = nextOccurrence(d.date, d.annual, todayKey);
@@ -1345,13 +1383,16 @@ function CountdownStrip({ dates, todayKey }) {
   return (
     <div className="flex gap-1.5 flex-nowrap overflow-x-auto pt-1.5" style={{ scrollbarWidth: "none" }}>
       {upcoming.map((d) => {
-        const soon = d.days <= 7;
+        /* Red inside a week, amber inside a fortnight, quiet after that. The
+           chip is also given a heavier border when it is urgent, because on a
+           wall display across a room colour alone is not enough. */
+        const u = styleFor(urgencyOf(d.days));
         return (
           <div key={d.id} className="shrink-0 flex items-center gap-1.5 rounded-full px-2.5 py-1 whitespace-nowrap"
-            style={{ background: soon ? T.brandSoft : T.panel, border: `1px solid ${soon ? T.brand : T.line}` }}>
-            {d.days === 0 ? <PartyPopper size={13} style={{ color: T.brand }} /> : <Hourglass size={12} style={{ color: soon ? T.brand : T.faint }} />}
-            <span style={{ fontSize: 12.5, fontWeight: 700, color: T.ink }}>{d.title}</span>
-            <span style={{ fontSize: 12, fontWeight: 600, color: soon ? T.brandInk : T.sub }}>{countdownLabel(d.days)}</span>
+            style={{ background: u.bg, border: `${u.bold ? 1.5 : 1}px solid ${u.border}` }}>
+            {d.days === 0 ? <PartyPopper size={13} style={{ color: u.fg }} /> : <Hourglass size={12} style={{ color: u.fg }} />}
+            <span style={{ fontSize: 12.5, fontWeight: 700, color: u.bold ? u.ink : T.ink }}>{d.title}</span>
+            <span style={{ fontSize: 12, fontWeight: u.bold ? 800 : 600, color: u.bold ? u.ink : T.sub }}>{countdownLabel(d.days)}</span>
           </div>
         );
       })}
@@ -4128,18 +4169,20 @@ function DateJarPane({ data, update, personById, jarId, setJarId, drawn, setDraw
 }
 
 /* ---------------- Board: sticky notes + important dates ---------------- */
-function BoardView({ data, update, personById, todayKey, openNote, openDate }) {
+export function BoardView({ data, update, personById, todayKey, openNote, openDate }) {
   const isMobile = useMobile();
   const notes = data.notes;
   const removeNote = (id) => update((d) => { d.notes = d.notes.filter((n) => n.id !== id); return d; });
   const removeDate = (id) => update((d) => { d.dates = d.dates.filter((x) => x.id !== id); return d; });
 
-  const dates = (data.dates || [])
-    .map((d) => {
-      const when = nextOccurrence(d.date, d.annual, todayKey);
-      return { ...d, when, days: when ? daysBetween(todayKey, when) : null };
-    })
-    .sort((a, b) => (a.days ?? 9e9) - (b.days ?? 9e9));
+  /* A date that has gone by used to sit at the top of this list forever,
+     counting further and further negative. Split them: what is still ahead
+     stays a countdown, what is behind moves into a history you can still look
+     at. Annual dates never end up there -- `nextOccurrence` rolls them to next
+     year, which is what an anniversary actually does. */
+  const { upcoming: dates, past: pastDates } = partitionDates(
+    data.dates || [], todayKey, { resolve: nextOccurrence, diff: daysBetween });
+  const [showPast, setShowPast] = useState(false);
 
   return (
     <div className="pt-2 grid gap-5 md:gap-6 max-w-5xl mx-auto"
@@ -4187,12 +4230,12 @@ function BoardView({ data, update, personById, todayKey, openNote, openDate }) {
         {dates.length === 0 ? <Empty text="No dates yet. Add an anniversary or a trip." /> : (
           <div className="flex flex-col gap-2.5">
             {dates.map((d) => {
-              const soon = d.days !== null && d.days <= 7;
+              const u = styleFor(d.urgency);
               const w = d.when ? parseYMD(d.when) : null;
               return (
                 <div key={d.id} className="flex items-center gap-3 rounded-2xl px-4 py-3.5"
-                  style={{ background: T.panel, border: `1px solid ${soon ? T.brand : T.line}` }}>
-                  <div className="rounded-xl p-2.5 shrink-0" style={{ background: (soon ? T.brand : T.gold) + "1A", color: soon ? T.brand : T.gold }}>
+                  style={{ background: u.bg, border: `${u.bold ? 1.5 : 1}px solid ${u.border}` }}>
+                  <div className="rounded-xl p-2.5 shrink-0" style={{ background: u.fg + "1A", color: u.fg }}>
                     {d.days === 0 ? <PartyPopper size={19} /> : <Hourglass size={19} />}
                   </div>
                   <div className="flex-1 min-w-0">
@@ -4202,7 +4245,7 @@ function BoardView({ data, update, personById, todayKey, openNote, openDate }) {
                     {w && <div style={{ color: T.sub, fontSize: 13, fontWeight: 600 }}>{WD_SHORT[w.getDay()]}, {MO_LONG[w.getMonth()].slice(0, 3)} {w.getDate()}{d.annual ? ` ${w.getFullYear()}` : ""}</div>}
                   </div>
                   <span className="rounded-full px-3 py-1.5 text-sm font-bold shrink-0"
-                    style={{ background: soon ? T.brandSoft : T.panelAlt, color: soon ? T.brandInk : T.sub }}>
+                    style={{ background: u.bold ? "#FFFFFFAA" : T.panelAlt, color: u.bold ? u.ink : T.sub }}>
                     {d.days === null ? "—" : d.days === 0 ? "Today" : `${d.days}d`}
                   </span>
                   <button onClick={() => openDate(d)} className="tapfade p-1.5 shrink-0" style={{ color: T.sub }}><Settings size={17} /></button>
@@ -4210,6 +4253,45 @@ function BoardView({ data, update, personById, todayKey, openNote, openDate }) {
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {/* ---- dates that have already happened ---- */}
+        {pastDates.length > 0 && (
+          <div className="mt-4">
+            <button onClick={() => setShowPast((v) => !v)}
+              className="tapfade flex items-center gap-2 text-sm font-bold"
+              style={{ color: T.sub }}>
+              <History size={15} />
+              {showPast ? "Hide" : "Show"} history · {pastDates.length}
+            </button>
+            {showPast && (
+              <div className="flex flex-col gap-2 mt-2.5">
+                {pastDates.map((d) => {
+                  const w = d.when ? parseYMD(d.when) : null;
+                  return (
+                    <div key={d.id} className="flex items-center gap-3 rounded-2xl px-4 py-3"
+                      style={{ background: T.panelAlt, border: `1px solid ${T.line}` }}>
+                      <div className="rounded-xl p-2 shrink-0" style={{ background: T.faint + "1A", color: T.faint }}>
+                        <History size={17} />
+                      </div>
+                      <div className="flex-1 min-w-0">
+                        <div className="truncate" style={{ fontSize: 16, fontWeight: 600, color: T.sub }}>{d.title}</div>
+                        {w && (
+                          <div style={{ color: T.faint, fontSize: 12.5, fontWeight: 600 }}>
+                            {WD_SHORT[w.getDay()]}, {MO_LONG[w.getMonth()].slice(0, 3)} {w.getDate()} {w.getFullYear()} · {agoLabel(d.days)}
+                          </div>
+                        )}
+                      </div>
+                      {/* Still editable: a date put in the past by a typo has to
+                          be reachable, and so does one worth keeping. */}
+                      <button onClick={() => openDate(d)} className="tapfade p-1.5 shrink-0" style={{ color: T.faint }}><Settings size={16} /></button>
+                      <button onClick={() => removeDate(d.id)} className="tapfade p-1.5 shrink-0" style={{ color: T.faint }}><Trash2 size={16} /></button>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
       </div>

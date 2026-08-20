@@ -55,6 +55,11 @@ export function completionOf(mark) {
     source: mark.source || null,
     at: mark.at || null,
     locked: Boolean(mark.locked),
+    /* Whose turn this was, when somebody else covered it. Distinct from `by`,
+       which is who actually did the work. The rotation needs both: the work is
+       credited to the person who did it, but the turn belongs to -- and stays
+       with -- the person who owed it. */
+    onBehalfOf: mark.onBehalfOf ?? null,
   };
 }
 
@@ -103,7 +108,18 @@ export function canUncheck(mark, actor) {
   // None of these is a first-person claim, so nobody's word is being overridden
   // by undoing one.
   if (c.byType === "display" || c.byType === "legacy" || c.byType === "onBehalf") return true;
-  if (actor?.isDisplay) return false;             // a screen cannot undo a person's claim
+
+  /* A shared screen may undo a signed-in person's tick, which it could not at
+     first. The original reasoning -- that a screen cannot know who is standing
+     at it, so it should not overrule somebody's claim about themselves -- reads
+     well and failed in the kitchen. Somebody ticks the wrong row from their
+     phone; the only device in the room refuses to fix it; the list is wrong
+     until whoever did it finds a laptop.
+     
+     The screen is already trusted to tick a chore off. Untricking one is the
+     same act by the same anonymous person, and the archive still records what
+     happened rather than pretending it did not. */
+  if (actor?.isDisplay) return true;
   return c.actorUserId === actor?.userId;
 }
 
@@ -295,8 +311,14 @@ export function completeOnBehalf(doc, choreId, dateKey, personId, actor, { assig
     return attributeChore(doc, choreId, dateKey, personId, actor);
   }
 
+  /* Whose turn it was before anyone covered it. Captured here, from the
+     rotation as it stood, because once the completion is written the rotation
+     would compute a different answer from its own output. */
+  const owedBy = assigneeOf ? assigneeOf(chore, dateKey) : (chore.personId || "");
+
   const completion = {
     by: personId || "",
+    onBehalfOf: owedBy && owedBy !== personId ? owedBy : null,
     actorUserId: actor?.userId || null,
     byType: "onBehalf",
     source: actor?.isDisplay ? (actor.displayName || "Shared display") : null,
@@ -308,7 +330,7 @@ export function completeOnBehalf(doc, choreId, dateKey, personId, actor, { assig
     choreId,
     dateKey,
     title: chore.title,
-    assignedTo: assigneeOf ? assigneeOf(chore, dateKey) : (chore.personId || ""),
+    assignedTo: owedBy,
     by: completion.by,
     actorUserId: completion.actorUserId,
     byType: completion.byType,

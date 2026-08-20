@@ -13,6 +13,8 @@
 // parameter rather than one process-wide constant -- two households on the same
 // server can be in different zones, and neither of them is "the server's".
 
+import { ianaFromWindows, parseVTimezones, offsetFromVTimezone } from "./ics-zones.js";
+
 const pad = (n) => String(n).padStart(2, "0");
 export const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const addDays = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
@@ -102,7 +104,7 @@ function unfold(text) {
      trailing Z   an instant in UTC; convert into the household zone
      TZID=...     wall time in some other zone; convert into the household zone
      bare         already local wall time; use as-is                          */
-function parseDT(value, param, tz) {
+function parseDT(value, param, tz, zones) {
   const v = String(value || "").trim();
   const isDate = (param && param.VALUE === "DATE") || /^\d{8}$/.test(v);
   const m = v.match(/(\d{4})(\d{2})(\d{2})(?:T(\d{2})(\d{2})(\d{2})?)?/);
@@ -111,10 +113,30 @@ function parseDT(value, param, tz) {
 
   if (isDate) return { y: Y, mo: Mo, d: D, allDay: true };
   if (/Z$/.test(v)) return instantToHouseholdFields(new Date(Date.UTC(Y, Mo - 1, D, H, Mi)), tz);
+
   if (param && param.TZID) {
-    const from = param.TZID.replace(/^["']|["']$/g, "");
+    const from = param.TZID.replace(/^["']|["']$/g, "").trim();
     if (from && from !== tz) {
-      return instantToHouseholdFields(wallTimeToInstant(Y, Mo, D, H, Mi, from), tz);
+      /* Resolve the name, most trustworthy source first. The alias step is not
+         a nicety: Outlook and Exchange write Windows zone names, `Intl` does
+         not know them, and the offset lookup used to quietly answer zero for
+         anything it could not parse -- which read every one of those wall times
+         as UTC and moved the event by the household's whole offset. A 9am
+         appointment showed up at 4am and nothing anywhere reported a problem. */
+      const iana = isValidTimeZone(from) ? from : ianaFromWindows(from);
+      if (iana) return instantToHouseholdFields(wallTimeToInstant(Y, Mo, D, H, Mi, iana), tz);
+
+      // No such IANA zone, but the feed may state its own offsets.
+      const stated = offsetFromVTimezone(zones && zones.get(from), Y, Mo, D, H, Mi);
+      if (stated !== null && stated !== undefined) {
+        const instant = new Date(Date.UTC(Y, Mo - 1, D, H, Mi) - stated * 60000);
+        return instantToHouseholdFields(instant, tz);
+      }
+
+      /* Nothing identified the zone. Treat the time as floating -- i.e. already
+         household-local -- rather than as UTC. Both are guesses; this one is
+         wrong by however far the writer's zone differs from ours, while the UTC
+         reading is wrong by our full offset even when the zones agree. */
     }
   }
   return { y: Y, mo: Mo, d: D, h: H, mi: Mi, allDay: false };
@@ -122,6 +144,9 @@ function parseDT(value, param, tz) {
 const mkDate = (s) => new Date(s.y, s.mo - 1, s.d, s.h || 0, s.mi || 0);
 
 export function parseICS(text, tz = DEFAULT_TZ) {
+  // Read before the events, because a VEVENT may reference a zone the feed
+  // defines further down.
+  const zones = parseVTimezones(text);
   const lines = unfold(text).split("\n");
   let calName = "";
   const events = [];
@@ -140,18 +165,18 @@ export function parseICS(text, tz = DEFAULT_TZ) {
     const param = {};
     params.forEach((p) => { const [k, v] = p.split("="); param[k] = v; });
     if (name === "SUMMARY") cur.summary = value.replace(/\\,/g, ",").replace(/\\n/gi, " ").replace(/\\;/g, ";");
-    else if (name === "DTSTART") cur.start = parseDT(value, param, tz);
-    else if (name === "DTEND") cur.end = parseDT(value, param, tz);
+    else if (name === "DTSTART") cur.start = parseDT(value, param, tz, zones);
+    else if (name === "DTEND") cur.end = parseDT(value, param, tz, zones);
     else if (name === "UID") cur.uid = value.trim();
     else if (name === "STATUS") cur.status = value.trim().toUpperCase();
     // A moved or edited single occurrence of a series: this VEVENT replaces the
     // occurrence that would otherwise fall on RECURRENCE-ID's date.
-    else if (name === "RECURRENCE-ID") cur.recurrenceId = parseDT(value, param, tz);
+    else if (name === "RECURRENCE-ID") cur.recurrenceId = parseDT(value, param, tz, zones);
     // Dates removed from the series. The property can repeat and can also hold
     // a comma-separated list, so both forms have to accumulate.
     else if (name === "EXDATE") {
       cur.exdates = cur.exdates || [];
-      value.split(",").forEach((one) => { const p = parseDT(one, param, tz); if (p) cur.exdates.push(p); });
+      value.split(",").forEach((one) => { const p = parseDT(one, param, tz, zones); if (p) cur.exdates.push(p); });
     }
     else if (name === "RRULE") { const o = {}; value.split(";").forEach((p) => { const [k, v] = p.split("="); o[k] = v; }); cur.rrule = o; }
   }
