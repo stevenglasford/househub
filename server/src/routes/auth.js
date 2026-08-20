@@ -66,6 +66,8 @@ const loginSchema = z.object({
   email: emailSchema,
   authProof: b64(128),
   totp: z.string().max(16).optional(),
+  // A request to stay signed in, which the account's own policy may refuse.
+  remember: z.boolean().optional(),
 });
 
 /* ----------------------------------------------------------------- utils --- */
@@ -81,26 +83,49 @@ const parse = (schema, body) => {
 
 const bin = (b64str) => Buffer.from(b64str, "base64");
 
-function setSessionCookie(res, token) {
+/* A "never expires" policy still needs a number for the cookie, because
+   browsers have no such value. Ten years is indistinguishable from forever for
+   a household app and keeps the session row and the cookie in agreement. */
+const FOREVER_HOURS = 24 * 365 * 10;
+
+function setSessionCookie(res, token, hours = SESSION_TTL_HOURS) {
   res.cookie(SESSION_COOKIE, token, {
     httpOnly: true,                                  // unreachable from injected JS
     secure: IS_PROD || PUBLIC_URL.startsWith("https://"),
     sameSite: "strict",                              // primary CSRF defence
-    maxAge: SESSION_TTL_HOURS * 3600_000,
+    maxAge: hours * 3600_000,
     // Scoped to the mount point, so a hub at /beta does not hand its session
     // cookie to everything else on the same hostname.
     path: COOKIE_PATH,
   });
 }
 
-async function createSession(userId, req) {
+/**
+ * How long a session should last, given what the person asked for and what
+ * their account allows.
+ *
+ * Returns { hours, persistent, refused }. `refused` is the case the UI has to
+ * explain: they ticked "remember me" and their own settings forbid it, so they
+ * get an ordinary session and a message rather than silence.
+ */
+export function resolveSessionLifetime(policyHours, remember) {
+  if (!remember) return { hours: SESSION_TTL_HOURS, persistent: false, refused: false };
+  if (policyHours === null || policyHours === undefined) {
+    return { hours: SESSION_TTL_HOURS, persistent: false, refused: true };
+  }
+  const hours = policyHours === 0 ? FOREVER_HOURS : policyHours;
+  return { hours, persistent: true, refused: false };
+}
+
+async function createSession(userId, req, lifetime = null) {
+  const { hours, persistent } = lifetime || { hours: SESSION_TTL_HOURS, persistent: false };
   const token = newToken();
   const ipHash = createHmac("sha256", subkey("session/ip")).update(req.ip || "").digest();
   const uaHash = createHmac("sha256", subkey("session/ua")).update(req.get("user-agent") || "").digest();
   await q(
-    `INSERT INTO sessions (user_id, token_hash, ip_hash, ua_hash, expires_at)
-     VALUES ($1, $2, $3, $4, now() + ($5 || ' hours')::interval)`,
-    [userId, hashToken(token), ipHash, uaHash, String(SESSION_TTL_HOURS)]
+    `INSERT INTO sessions (user_id, token_hash, ip_hash, ua_hash, expires_at, persistent)
+     VALUES ($1, $2, $3, $4, now() + ($5 || ' hours')::interval, $6)`,
+    [userId, hashToken(token), ipHash, uaHash, String(hours), persistent]
   );
   return token;
 }
@@ -236,6 +261,7 @@ router.post("/login", wrap(async (req, res) => {
 
   const { rows } = await q(
     `SELECT id, password_hash, kdf_algo, kdf_iterations, kdf_salt,
+            session_persistence_hours,
             wrapped_master_key, public_key, enc_private_key,
             totp_enabled, totp_secret_enc, status, failed_logins, locked_until, is_super_admin
        FROM users WHERE email_bidx = $1`,
@@ -297,12 +323,23 @@ router.post("/login", wrap(async (req, res) => {
     [user.id, patch]
   );
 
-  const token = await createSession(user.id, req);
-  setSessionCookie(res, token);
-  await audit("login", { actorUserId: user.id });
+  /* "Remember me" is a request; the account's own policy decides. A refusal
+     still signs them in -- the password was right -- and says so, because a
+     tick that silently does nothing is how somebody ends up mystified about
+     being signed out a fortnight later. */
+  const lifetime = resolveSessionLifetime(user.session_persistence_hours, body.remember === true);
+  const token = await createSession(user.id, req, lifetime);
+  setSessionCookie(res, token, lifetime.hours);
+  await audit("login", { actorUserId: user.id, meta: { persistent: lifetime.persistent } });
 
   res.json({
     token,
+    persistence: {
+      requested: body.remember === true,
+      granted: lifetime.persistent,
+      refused: lifetime.refused,
+      hours: lifetime.persistent ? lifetime.hours : null,
+    },
     user: { id: user.id, isSuperAdmin: user.is_super_admin },
     identity: identityPayload(user),
   });
@@ -475,6 +512,69 @@ router.post("/totp/disable",
     await q("UPDATE users SET totp_enabled = FALSE, totp_secret_enc = NULL WHERE id = $1", [req.user.id]);
     await audit("totp_disabled", { actorUserId: req.user.id });
     res.json({ ok: true });
+  })
+);
+
+/* ------------------------------------------------ staying signed in ------- */
+
+/**
+ * The account's own policy for staying signed in.
+ *
+ * Per account rather than per server: whether it is acceptable for a browser to
+ * keep something that can open the household depends entirely on the device,
+ * and nobody else in the household is placed to judge that.
+ */
+router.get("/session-policy", requireAuth, wrap(async (req, res) => {
+  const { rows } = await q(
+    "SELECT session_persistence_hours FROM users WHERE id = $1", [req.user.id]);
+  const hours = rows[0]?.session_persistence_hours ?? null;
+  const { rows: devices } = await q(
+    `SELECT count(*)::int AS n FROM sessions
+      WHERE user_id = $1 AND persistent AND revoked_at IS NULL AND expires_at > now()`,
+    [req.user.id]
+  );
+  res.json({
+    enabled: hours !== null,
+    hours,                                   // 0 means never expires
+    rememberedDevices: devices[0].n,
+  });
+}));
+
+router.put("/session-policy",
+  requireAuth,
+  limit("session-policy", { capacity: 20, perSecond: 0.05, by: "user" }),
+  wrap(async (req, res) => {
+    const body = parse(z.object({
+      // null disables it; 0 means never expires; otherwise hours, capped at a
+      // decade so the column cannot be used to store nonsense.
+      hours: z.number().int().min(0).max(24 * 365 * 10).nullable(),
+    }), req.body);
+
+    await q("UPDATE users SET session_persistence_hours = $2 WHERE id = $1",
+      [req.user.id, body.hours]);
+
+    /* Turning it off must actually cut the remembered devices loose, not just
+       stop new ones being made. Somebody switching this off has usually just
+       realised a device is somewhere it should not be, and "no new ones" would
+       be a useless answer to that.
+
+       Ordinary sessions are left alone, so this does not sign them out of the
+       tab they are sitting in. */
+    let revoked = 0;
+    if (body.hours === null) {
+      const { rowCount } = await q(
+        `UPDATE sessions SET revoked_at = now()
+          WHERE user_id = $1 AND persistent AND revoked_at IS NULL`,
+        [req.user.id]
+      );
+      revoked = rowCount;
+    }
+
+    await audit("session_policy_changed", {
+      actorUserId: req.user.id,
+      meta: { hours: body.hours, revokedDevices: revoked },
+    });
+    res.json({ ok: true, enabled: body.hours !== null, hours: body.hours, revokedDevices: revoked });
   })
 );
 

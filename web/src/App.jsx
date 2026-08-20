@@ -22,6 +22,7 @@ import { useCheckinPrompt } from "./lib/useCheckinPrompt.js";
 import HouseholdPanel from "./components/HouseholdPanel.jsx";
 import ArchivePanel from "./components/ArchivePanel.jsx";
 import ImportPanel from "./components/ImportPanel.jsx";
+import SessionPolicyPanel from "./components/SessionPolicyPanel.jsx";
 import SuperAdminPanel from "./components/SuperAdminPanel.jsx";
 import HomeAssistantPanel from "./components/HomeAssistantPanel.jsx";
 import DisplaysPanel from "./components/DisplaysPanel.jsx";
@@ -6353,6 +6354,9 @@ function SettingsModal({ data, update, saveNow, syncCalendars, close, currentUse
       </Field>
       <Field label="Import from the old HouseHub">
         <ImportPanel theme={T} data={data} update={update} saveNow={saveNow} />
+      </Field>
+      <Field label="Staying signed in">
+        <SessionPolicyPanel theme={T} />
       </Field>
       <Field label="Your data">
         <PrivacyPanel theme={T} data={data} me={currentUser} />

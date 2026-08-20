@@ -23,6 +23,7 @@ import { limit } from "../middleware/ratelimit.js";
 import { requireAuth, loadHousehold, requireRole, atLeast, requireWritable } from "../middleware/auth.js";
 import { audit } from "../services/audit.js";
 import { VAULT_REVISIONS_KEPT } from "../config.js";
+import { recordWriteOutcome } from "../services/health.js";
 
 export const router = express.Router();
 
@@ -109,7 +110,12 @@ router.put("/:householdId/vault",
     const body = parse(documentSchema, req.body);
     const ciphertext = bin(body.ciphertext);
 
-    const result = await tx(async ({ q: query }) => {
+    /* A database can answer SELECT perfectly and refuse every write -- a full
+       disk, a failover replica, a revoked grant. Nothing else notices: the
+       client holds the decrypted document in memory and carries on.
+       Recording the outcome is what lets /api/health say the server is
+       unwell instead of cheerfully reporting ok. */
+    const result = await recordWriteOutcome(() => tx(async ({ q: query }) => {
       const { rows } = await query(
         `SELECT version, key_epoch, ciphertext, compression
            FROM vault_documents WHERE household_id = $1 FOR UPDATE`,
@@ -178,7 +184,7 @@ router.put("/:householdId/vault",
       );
 
       return { version: Number(updated[0].version) };
-    });
+    }));
 
     res.json({ version: result.version, keyEpoch: req.household.keyEpoch });
   })

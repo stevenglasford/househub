@@ -14,7 +14,7 @@ import { migrate } from "./db/migrate.js";
 import { closePool, q } from "./db/pool.js";
 import { securityHeaders, csrfGuard, noStore } from "./middleware/security.js";
 import { resolveSession } from "./middleware/auth.js";
-import { errorHandler, notFoundHandler } from "./middleware/errors.js";
+import { errorHandler, notFoundHandler, wrap } from "./middleware/errors.js";
 import { startMaintenance } from "./jobs/maintenance.js";
 
 import authRoutes from "./routes/auth.js";
@@ -31,6 +31,7 @@ import cameraRoutes from "./routes/cameras.js";
 import privacyRoutes from "./routes/privacy.js";
 import integrationRoutes from "./routes/integrations.js";
 import { loadDisplay } from "./routes/displays.js";
+import { checkHealth } from "./services/health.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const PUBLIC_DIR = join(here, "..", "public");
@@ -62,7 +63,13 @@ export function createApp() {
   // which security/pentest/run.js caught.
   app.use("/api", noStore);
 
-  app.get("/api/health", (req, res) => res.json({ ok: true, at: Date.now() }));
+  /* Actually asks the database, and answers 503 when it cannot do its job --
+     the Docker healthcheck reads this, and `{ ok: true }` from a server whose
+     writes are all failing is worse than no healthcheck at all. */
+  app.get("/api/health", wrap(async (req, res) => {
+    const health = await checkHealth();
+    res.status(health.ok ? 200 : 503).json(health);
+  }));
   app.get("/api/config", (req, res) => res.json(clientConfig()));
 
   app.use("/api/auth", authRoutes);

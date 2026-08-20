@@ -258,3 +258,52 @@ const RESERVED = new Set([
   "function", "class", "const", "let", "var", "await", "async", "yield", "of",
   "in", "delete", "void", "this", "super", "try", "catch", "finally", "throw",
 ]);
+
+/**
+ * A component imported and never rendered.
+ *
+ * This has now happened three times: an edit adds the import, the paired edit
+ * that would render it silently fails to match on indentation, and the result
+ * builds cleanly, passes every test, and ships a feature that simply is not
+ * there. The settings panel for staying signed in was imported into App.jsx and
+ * rendered nowhere; it reached the deployed bundle in that state.
+ *
+ * Nothing else catches it. The build is happy — an unused import is legal. The
+ * render tests only exercise what they are told to. Only the mismatch between
+ * "imported" and "used" shows it.
+ */
+test("every imported component is actually rendered", () => {
+  const problems = [];
+  for (const file of walk(SRC)) {
+    if (!file.endsWith(".jsx")) continue;
+    const src = stripComments(readFileSync(file, "utf8"));
+
+    /* Import lines are removed before looking for usage. Leaving them in means
+       the declaration counts as its own use and the check can never fire --
+       which is exactly how the first version of this test passed while the bug
+       it was written for was still present. */
+    const body = src.replace(/^import[^;]*;?$/gm, "");
+
+    for (const m of src.matchAll(/^import\s+([A-Z]\w*)\s+from\s+["']\.[^"']+\.jsx["'];?$/gm)) {
+      const name = m[1];
+      // Rendered as an element, or referenced as a value (passed as a prop,
+      // stored in a map of components, re-exported).
+      const used = new RegExp(`<${name}[\\s/>]|\\b${name}\\b`, "g");
+      const hits = [...body.matchAll(used)];
+      if (hits.length === 0) {
+        problems.push(`${file.split("/src/")[1]}: imports ${name} and never uses it`);
+      }
+    }
+  }
+  assert.deepEqual(problems, [],
+    `components imported but never rendered — the feature is missing:\n  ${problems.join("\n  ")}`);
+});
+
+test("that check notices an import with no render", () => {
+  const sample = `import SessionPolicyPanel from "./components/SessionPolicyPanel.jsx";
+    function Settings() { return <div>nothing here</div>; }`;
+  const m = /^import\s+([A-Z]\w*)\s+from\s+["']\.[^"']+\.jsx["'];?$/m.exec(sample);
+  assert.equal(m[1], "SessionPolicyPanel");
+  const hits = [...sample.matchAll(/<SessionPolicyPanel[\s/>]/g)];
+  assert.equal(hits.length, 0, "the sample must reproduce the unused import");
+});

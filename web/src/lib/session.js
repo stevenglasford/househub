@@ -16,6 +16,7 @@
 //      about encryption at all.
 
 import * as C from "./crypto.js";
+import * as REMEMBER from "./remember.js";
 
 const state = {
   token: null,
@@ -107,24 +108,89 @@ export async function register({ email, password, displayName, inviteToken }) {
   return res;
 }
 
-export async function signIn({ email, password, totp }) {
+export async function signIn({ email, password, totp, remember = false }) {
   // Two steps, because the browser needs the salt before it can produce a proof.
   // The server answers with plausible decoy parameters for addresses it does
   // not know, so this exchange does not reveal whether an account exists.
   const params = await request("POST", "api/auth/kdf-params", { email });
   const authProof = await C.loginProof(password, params);
 
-  const res = await request("POST", "api/auth/login", { email, authProof, totp });
+  const res = await request("POST", "api/auth/login", { email, authProof, totp, remember });
 
   state.token = res.token;
   state.user = res.user;
   state.keys = await C.unlockIdentity(password, res.identity);
+
+  /* Only keep anything if the *server* said the account allows it. The tick is
+     a request; the account's policy is the decision, and it is made server-side
+     so that turning persistence off cannot be undone by a client that simply
+     ignores the answer. */
+  if (res.persistence?.granted) {
+    await REMEMBER.remember({
+      userId: res.user.id,
+      privateKey: state.keys.privateKey,
+      publicKey: state.keys.publicKey,
+    });
+  } else {
+    // Covers the refusal case and the ordinary one: a device that is no longer
+    // permitted must not keep a key from a previous, permitted sign-in.
+    await REMEMBER.forget();
+  }
+
   emit();
+  return res;
+}
+
+/**
+ * Come back to an already-unlocked household, without the password.
+ *
+ * Both halves have to hold: a session the server still honours, and a key this
+ * browser kept. Either alone is useless -- the cookie without the key leaves
+ * ciphertext, and the key without the session has nothing to fetch.
+ *
+ * The stored key is checked against the account the server reports, so two
+ * people sharing a laptop can never inherit each other's household.
+ */
+export async function resumeRemembered() {
+  const kept = await REMEMBER.recall();
+  if (!kept) return null;
+
+  let me;
+  try {
+    me = await request("GET", "api/auth/me");
+  } catch {
+    // Session expired or revoked -- including by somebody turning persistence
+    // off from another device, which is exactly how that switch is meant to
+    // reach this machine.
+    await REMEMBER.forget();
+    return null;
+  }
+
+  if (!me?.id || me.id !== kept.userId) {
+    await REMEMBER.forget();
+    return null;
+  }
+
+  state.user = { id: me.id, email: me.email, displayName: me.displayName, isSuperAdmin: me.isSuperAdmin };
+  state.keys = { privateKey: kept.privateKey, publicKey: kept.publicKey };
+  emit();
+  return me;
+}
+
+/** The account's own staying-signed-in policy. */
+export const getSessionPolicy = () => request("GET", "api/auth/session-policy");
+
+/** Change it. Passing null disables it and cuts every remembered device loose. */
+export async function setSessionPolicy(hours) {
+  const res = await request("PUT", "api/auth/session-policy", { hours });
+  // Turning it off must forget this device too, not only the others.
+  if (hours === null) await REMEMBER.forget();
   return res;
 }
 
 export async function signOut() {
   try { await request("POST", "api/auth/logout"); } catch { /* going anyway */ }
+  await REMEMBER.forget();      // signing out means signing out, on this device too
   wipe();
 }
 

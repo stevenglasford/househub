@@ -65,6 +65,11 @@ export function SignIn({ onDone, allowSignup = true, chrome = true, startMode = 
   // Deliberately not remembered between renders of the form. Somebody creating
   // a second account should read it again.
   const [acceptedLoss, setAcceptedLoss] = useState(false);
+  const [remember, setRemember] = useState(false);
+  // Set when the account's own settings refused the request. Dismissable: the
+  // sign-in worked, so this is information, not an error to be cleared before
+  // continuing.
+  const [refused, setRefused] = useState(false);
 
   const set = (k) => (e) => setForm((f) => ({ ...f, [k]: e.target.value }));
 
@@ -164,6 +169,45 @@ export function SignIn({ onDone, allowSignup = true, chrome = true, startMode = 
             </span>
           </span>
         </label>
+      )}
+
+      {/* Only offered when signing in. On sign-up there is no account whose
+          policy could permit it yet, and the first thing a new person does
+          should not be to make their laptop a key to the household. */}
+      {mode === "in" && (
+        <label className="flex gap-3 items-center mb-4 text-sm text-slate-300">
+          <input
+            type="checkbox"
+            checked={remember}
+            onChange={(e) => { setRemember(e.target.checked); setRefused(false); }}
+            className="h-4 w-4 flex-none accent-indigo-500"
+          />
+          <span>
+            Keep me signed in on this device
+            <span className="block text-xs text-slate-500">
+              This browser keeps a key that can open your household. Only tick it on a
+              device you trust.
+            </span>
+          </span>
+        </label>
+      )}
+
+      {/* Dismissable, and deliberately not an error: the sign-in succeeded. */}
+      {refused && (
+        <div role="status" className="mb-4 rounded-lg border border-amber-700/60 bg-amber-950/40 p-3">
+          <div className="text-sm text-amber-100">
+            <strong>Staying signed in is switched off for this account.</strong> You are
+            signed in, but this device will not be remembered. To allow it, turn it on
+            under Settings → Account → Staying signed in, then sign in again.
+          </div>
+          <button
+            type="button"
+            onClick={async () => { setRefused(false); await onDone(); }}
+            className="mt-2 text-sm font-medium text-amber-200 underline hover:text-amber-100"
+          >
+            Continue
+          </button>
+        </div>
       )}
 
       <Button busy={busy} disabled={mode === "up" && !acceptedLoss}>

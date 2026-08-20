@@ -224,9 +224,20 @@ export default function Shell() {
 
   useEffect(() => {
     session.request("GET", "api/config").then(setConfig).catch(() => {});
-    // Keys are memory-only, so a reload always means signing in again. That is
-    // the cost of never persisting key material anywhere.
-    setStage("signin");
+
+    /* Keys are memory-only unless this device was explicitly remembered, so the
+       default remains "sign in again". `resumeRemembered` returns null in every
+       case except the one where both halves are present and agree -- a session
+       the server still honours, and a key this browser kept for that same
+       account. See lib/remember.js for what that costs. */
+    let cancelled = false;
+    (async () => {
+      const me = await session.resumeRemembered().catch(() => null);
+      if (cancelled) return;
+      if (me) await afterAuth();
+      else setStage("signin");
+    })();
+    return () => { cancelled = true; };
   }, []);
 
   // Let the app ask to come back here to switch households.

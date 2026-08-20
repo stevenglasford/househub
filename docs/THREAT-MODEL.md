@@ -168,6 +168,39 @@ Two consequences worth being explicit about:
   household has to do today. See [REMINDERS.md](REMINDERS.md) for why the
   original app's `/api/alerts/due` could not be ported.
 
+### Staying signed in
+
+Off for any device that has not explicitly asked, and controlled per account
+(Settings → Account → Staying signed in). Default policy is one week; it can be
+set to never expire, or disabled entirely.
+
+**What it costs, precisely.** A session cookie alone would have been useless
+here: it authenticates you to the API, but the key that decrypts the household
+is derived from your password, so you would come back "signed in" and still be
+looking at ciphertext. Staying signed in therefore means this browser keeps the
+identity private key in IndexedDB.
+
+Not as a non-extractable key handle — HouseHub's X25519 key is raw bytes used by
+`@noble/curves`, and in any case no arrangement lets a page unlock itself without
+the password while denying that same power to script running on the page.
+
+So:
+
+| | |
+|---|---|
+| Stolen or borrowed device | Gets into the household with no password. Inherent to every stay-signed-in feature. |
+| XSS while remembered | Can read the identity key, and so the household. The strict CSP is what stands in the way, unchanged. |
+| Stolen server or database | **Unchanged.** None of this is sent anywhere. |
+
+Turning the setting off revokes every remembered session immediately, not merely
+future ones — somebody switching it off has usually just realised a device is
+somewhere it should not be, and "no new ones" would be a useless answer to that.
+It deliberately leaves the current tab signed in.
+
+For a laptop only you touch, most households will judge this worth having. For
+the tablet by the front door it plainly is not, and the honest recommendation is
+to leave it off there.
+
 ### Display key escrow
 
 A display's private key, and its finished setup link, are stored sealed under
