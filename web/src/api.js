@@ -107,7 +107,14 @@ export function mergeDocuments(mine, theirs) {
   // Scalar settings: mine win, since I am the one who just changed something.
   for (const key of ["householdName", "grocerySort", "layoutMode", "noteDisplay",
                      "showBreakdown", "weather", "checkin", "upNextSources",
-                     "homeEntities", "homeDashboardUrl", "groceryStores"]) {
+                     "homeEntities", "homeDashboardUrl", "groceryStores",
+                     /* Missing from this list is why "you select one, but it
+                        doesn't actually display" -- the choice was written
+                        locally, then thrown away by the next merge, because
+                        `out` starts from `theirs` and only these keys let mine
+                        win. Silent, and indistinguishable from the setting not
+                        working at all. */
+                     "secondBlock", "lists"]) {
     if (mine[key] !== undefined) out[key] = mine[key];
   }
 
@@ -120,6 +127,31 @@ export const loadCalendarEvents = () =>
   session.isDisplay()
     ? session.request("GET", "api/display/calendar-events")
     : session.request("GET", `api/households/${session.householdId()}/calendar-events`);
+
+/* ------------------------------------------------------- two-way sync --- */
+
+const hh = () => session.householdId();
+
+export const loadCaldav = () => session.request("GET", `api/households/${hh()}/caldav`);
+
+export const connectCaldav = (body) =>
+  session.request("POST", `api/households/${hh()}/caldav`, body);
+
+export const disconnectCaldav = (accountId) =>
+  session.request("DELETE", `api/households/${hh()}/caldav/${accountId}`);
+
+export const setCaldavPush = (calendarId, pushEnabled) =>
+  session.request("PUT", `api/households/${hh()}/caldav/calendars/${calendarId}`, { pushEnabled });
+
+/**
+ * Send the complete set of events that belongs on a synced calendar.
+ *
+ * The whole set, not a delta: the server decides what to create, change and
+ * remove by comparing against what it previously wrote. Sent from here because
+ * the events live in the encrypted document, which the server cannot read.
+ */
+export const pushCaldav = (calendarId, events) =>
+  session.request("POST", `api/households/${hh()}/caldav/calendars/${calendarId}/push`, { events });
 
 /**
  * Add a calendar feed.

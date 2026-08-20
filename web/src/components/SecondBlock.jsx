@@ -14,22 +14,11 @@
 import React, { useState, useEffect, useCallback } from "react";
 import * as session from "../lib/session.js";
 import { suggestDateIdea } from "../lib/checkin.js";
+import { BLOCK_KINDS, PICKABLE, secondBlockFor } from "../lib/second-block.js";
 
-export const BLOCK_KINDS = [
-  ["none", "Nothing"],
-  ["grocery", "Grocery list"],
-  ["dateJar", "Date jar"],
-  ["camera", "Cameras"],
-  ["devices", "Lights & devices"],
-];
-
-/** What this filter is set to show. Tolerates the older string-only shape. */
-export function secondBlockFor(data, filter) {
-  const raw = (data.secondBlock || data.mealsSecondRow || {})[filter || "all"];
-  if (!raw) return { kind: "none", picks: [] };
-  if (typeof raw === "string") return { kind: raw, picks: [] };   // pre-picker saves
-  return { kind: raw.kind || "none", picks: Array.isArray(raw.picks) ? raw.picks : [] };
-}
+/* The shape of this setting lives in lib/second-block.js so it can be tested
+   without a DOM; re-exported here so existing importers are unaffected. */
+export { BLOCK_KINDS, PICKABLE, secondBlockFor } from "../lib/second-block.js";
 
 /* --------------------------------------------------------------- blocks --- */
 
@@ -280,14 +269,101 @@ export default function SecondBlock({ data, update, filter, theme: T }) {
   );
 }
 
+/**
+ * Which things a "Cameras" or "Lights & devices" row shows.
+ *
+ * Ryan asked for this directly: "there needs to be the option to choose which
+ * devices show on Today." Without it the row rendered every switchable entity
+ * Home Assistant knew about, capped at twelve -- so a house with more than a
+ * dozen lights got an arbitrary twelve of them, and no way to say which.
+ *
+ * An empty selection still means "all", which keeps the row working for anyone
+ * who never opens this and matches what the block already did.
+ */
+function PickList({ kind, picks, onToggle, T }) {
+  const [options, setOptions] = useState(null);
+
+  useEffect(() => {
+    let live = true;
+    const done = (list) => { if (live) setOptions(list); };
+    if (kind === "camera") {
+      session.listCameras()
+        .then((cs) => done((cs || []).map((c) => ({ id: c.id, name: c.name }))))
+        .catch(() => done([]));
+    } else {
+      session.homeEntities()
+        .then((es) => done((es || [])
+          .filter((e) => ["light", "switch", "fan", "cover"].includes(e.domain))
+          .map((e) => ({ id: e.entityId, name: e.name }))))
+        .catch(() => done([]));
+    }
+    return () => { live = false; };
+  }, [kind]);
+
+  if (!options) return <p style={{ color: T.faint, fontSize: 12 }}>Loading…</p>;
+  if (!options.length) {
+    return (
+      <p style={{ color: T.faint, fontSize: 12 }}>
+        {kind === "camera"
+          ? "No cameras yet. Connect CamWatch in Settings."
+          : "No devices yet. Connect Home Assistant in Settings."}
+      </p>
+    );
+  }
+
+  return (
+    <div style={{ width: "100%" }}>
+      <div style={{ color: T.faint, fontSize: 12, marginBottom: 4 }}>
+        {picks.length ? `Showing ${picks.length} of ${options.length}` : "Showing all — tap to choose"}
+      </div>
+      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+        {options.map((o) => {
+          const on = picks.includes(o.id);
+          return (
+            <button key={o.id} type="button" onClick={() => onToggle(o.id)} className="tapfade"
+              style={{
+                background: on ? T.brand : T.panelAlt,
+                color: on ? "#fff" : T.ink,
+                border: `1px solid ${on ? T.brand : T.line}`,
+                borderRadius: 999, padding: "5px 11px", fontSize: 13, fontWeight: 600,
+              }}>
+              {o.name}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /** The picker, for Settings. */
 export function SecondBlockSettings({ data, update, theme: T, people }) {
   const filters = [["all", "Everyone"], ...(people || []).map((p) => [p.id, p.name])];
 
-  const set = (filterId, kind) => update((d) => ({
-    ...d,
-    secondBlock: { ...(d.secondBlock || {}), [filterId]: { kind, picks: [] } },
-  }));
+  /* Changing to a different kind clears the selection, because a camera id
+     means nothing to the devices row. Re-choosing the same kind keeps it, so
+     brushing the dropdown does not silently wipe a considered list. */
+  const set = (filterId, kind) => update((d) => {
+    const prev = secondBlockFor(d, filterId);
+    return {
+      ...d,
+      secondBlock: {
+        ...(d.secondBlock || {}),
+        [filterId]: { kind, picks: prev.kind === kind ? prev.picks : [] },
+      },
+    };
+  });
+
+  const togglePick = (filterId, id) => update((d) => {
+    const prev = secondBlockFor(d, filterId);
+    const picks = prev.picks.includes(id)
+      ? prev.picks.filter((x) => x !== id)
+      : [...prev.picks, id];
+    return {
+      ...d,
+      secondBlock: { ...(d.secondBlock || {}), [filterId]: { kind: prev.kind, picks } },
+    };
+  });
 
   return (
     <div>
@@ -311,6 +387,14 @@ export function SecondBlockSettings({ data, update, theme: T, people }) {
           >
             {BLOCK_KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
           </select>
+          {PICKABLE.includes(secondBlockFor(data, id).kind) && (
+            <PickList
+              kind={secondBlockFor(data, id).kind}
+              picks={secondBlockFor(data, id).picks}
+              onToggle={(pid) => togglePick(id, pid)}
+              T={T}
+            />
+          )}
         </div>
       ))}
     </div>

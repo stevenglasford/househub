@@ -153,6 +153,41 @@ what you are told. No preamble.`,
     pick: (data) => ({ idea: String(data.idea || "").trim() }),
   },
 
+  /* Several ideas at once, steered by whatever the household types.
+     Ryan: "make it so that you can give the AI a prompt to make some more
+     additions to the different date jars." The single-idea task above answers
+     "give me one"; this answers "give me five like THIS", which is a different
+     request and needs the household's own words in the prompt rather than only
+     the jar name. */
+  date_ideas: {
+    system: `You suggest things a household can do together. Each idea is under 25 words,
+concrete and actionable. Never assume gender, relationship structure, or budget beyond
+what you are told. Follow the household's own request closely. No preamble.`,
+    schema: { ideas: "string[]" },
+    build(ctx) {
+      const n = Math.min(Math.max(Number(ctx.count) || 5, 1), 12);
+      return [
+        `Suggest ${n} different things to do together for the "${ctx.jar || "any"}" category.`,
+        // The household's own words carry the most weight, so they go first
+        // among the constraints and are quoted rather than paraphrased.
+        ctx.prompt ? `They asked for: "${String(ctx.prompt).slice(0, 400)}".` : "",
+        ctx.season ? `It is ${ctx.season}.` : "",
+        `Household of ${ctx.householdSize || 2}.`,
+        ctx.existing?.length
+          ? `They already have these, suggest different ones: ${ctx.existing.slice(0, 15).map((t) => `"${t}"`).join("; ")}.`
+          : "",
+        "Vary them. No two alike.",
+        `Reply as JSON: {"ideas": ["...", "..."]}`,
+      ].filter(Boolean).join("\n");
+    },
+    pick: (data) => ({
+      ideas: (Array.isArray(data.ideas) ? data.ideas : [])
+        .map((s) => String(s).trim())
+        .filter(Boolean)
+        .slice(0, 12),
+    }),
+  },
+
   /* Replaces the original keyword table for guessing a grocery aisle. */
   grocery_categorize: {
     system: `You sort grocery items into store sections. Reply only with JSON.`,

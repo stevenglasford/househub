@@ -180,6 +180,39 @@ export async function suggestDateIdea(doc, { jar, existing } = {}) {
 }
 
 /**
+ * Several date ideas at once, steered by a prompt the household types.
+ *
+ * The singular version above answers "give me one". This answers "give me five
+ * like this" -- Ryan asked to be able to tell the AI what he is after rather
+ * than pressing a button and hoping. The free text is passed through to the
+ * model as the household's own request; everything else is context.
+ *
+ * Runs against the household's local Ollama, like every other AI call here.
+ */
+export async function suggestDateIdeas(doc, { jar, existing, prompt, count = 5 } = {}) {
+  const season = ["winter", "winter", "spring", "spring", "spring", "summer",
+                  "summer", "summer", "autumn", "autumn", "autumn", "winter"][new Date().getMonth()];
+  const res = await session.generate("date_ideas", {
+    jar: jar || "any",
+    season,
+    prompt: String(prompt || "").slice(0, 400),
+    existing: (existing || []).slice(0, 15),
+    householdSize: (doc.people || []).length || 2,
+    count: Math.min(Math.max(Number(count) || 5, 1), 12),
+  }, {
+    instructions: doc.dateIdeaInstructions || doc.checkin?.instructions || undefined,
+    audience: "private",
+  });
+  const ideas = Array.isArray(res?.ideas) ? res.ideas : [];
+  // Never hand back a duplicate of something already in the jar: the model is
+  // asked not to, and sometimes does anyway.
+  const seen = new Set((existing || []).map((e) => String(e).trim().toLowerCase()));
+  return ideas
+    .map((s) => String(s).trim())
+    .filter((s) => s && !seen.has(s.toLowerCase()));
+}
+
+/**
  * The list of things tonight's walkthrough will go through.
  *
  * Worked out ONCE, when the walkthrough opens, and then held still. It used to

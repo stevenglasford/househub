@@ -114,6 +114,8 @@ export function seed() {
     homeDashboardUrl: "",      // optional link out to HA's own dashboard
     upNextSources: null,       // null/empty = every source
     calendars: [],             // { id, name, color, personId, url, icsText, lastSync, error }
+    secondBlock: {},           // filterId -> { kind, picks[] } for the extra Today row
+    lists: [],                 // { id, title, icon, color, items[], createdOn, updatedOn }
     // Shared reminder snoozes: { "c<choreId>" | "t<taskId>": epochMs }.
     //
     // In the document rather than in each browser's local storage, because the
@@ -164,6 +166,8 @@ export function normalize(state) {
   if (!Array.isArray(state.homeEntities)) state.homeEntities = [];
   if (typeof state.homeDashboardUrl !== "string") state.homeDashboardUrl = "";
   if (!Array.isArray(state.calendars)) state.calendars = [];
+  if (!state.secondBlock || typeof state.secondBlock !== "object") state.secondBlock = {};
+  if (!Array.isArray(state.lists)) state.lists = [];
   if (!state.alertSnooze || typeof state.alertSnooze !== "object") state.alertSnooze = {};
   if (!state.alertRelayed || typeof state.alertRelayed !== "object") state.alertRelayed = {};
   if (!state.reminderRelay || typeof state.reminderRelay !== "object") {

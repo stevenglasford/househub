@@ -58,7 +58,7 @@ export function isBlockedAddress(ip) {
   return true;  // not an IP literal: fail closed
 }
 
-async function resolveAndCheck(hostname) {
+export async function resolveAndCheck(hostname) {
   // A literal address skips DNS but not the check.
   if (isIP(hostname)) {
     if (isBlockedAddress(hostname)) {
