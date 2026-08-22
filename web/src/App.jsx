@@ -6,6 +6,7 @@ import {
   RefreshCw, CalendarDays, Lock, Repeat, ChefHat, ShoppingCart,
   Cloud, CloudRain, CloudSnow, CloudLightning, CloudFog, CloudDrizzle,
   Thermometer, MapPin, StickyNote, PartyPopper, Hourglass, Mic, Copy, ListChecks,
+  ArrowLeftRight,
   Video, Lightbulb, LockKeyhole, DoorOpen, ExternalLink, Sofa,
   MessageCircle, Hammer, Wallet, History, Archive, ShoppingBag, CopyPlus, Utensils,
   Wrench, Inbox, ListTodo, BellRing, Volume2, VolumeX, Dices, Wine,
@@ -41,6 +42,15 @@ import * as SUB from "./lib/subtasks.js";
 import { urgencyOf, partitionDates, agoLabel } from "./lib/dates.js";
 import * as ROT from "./lib/rotation.js";
 import { projectEvents, eventsForSync } from "./lib/project-events.js";
+import { decorateFeedEvents, whenLabel } from "./lib/feed-events.js";
+import * as CADENCE from "./lib/cadence.js";
+import * as NOTES from "./lib/notes.js";
+
+/* An event that is a view of something else -- a subscribed calendar, or a
+   dated project stage. Its authority lives elsewhere, so it opens for reading
+   rather than editing. Routing on source === "ics" alone sent project events to
+   the editor, where saving would have written a second, unlinked copy. */
+const isReadOnlyEvent = (ev) => ev?.source === "ics" || ev?.source === "project";
 import { suggestDateIdeas } from "./lib/checkin.js";
 import * as LISTS from "./lib/lists.js";
 import { buildCheckinSteps } from "./lib/checkin.js";
@@ -317,23 +327,7 @@ const stageCount = (p) => {
 --------------------------------------------------------------- */
 const daysInMonth = (y, m) => new Date(y, m + 1, 0).getDate();
 
-function choreDueOn(chore, dateKey) {
-  const c = chore.cadence;
-  if (!c || c.type === "daily") return true;
-  const d = parseYMD(dateKey);
-  if (c.type === "weekly") return (c.days || []).includes(d.getDay());
-  if (c.type === "monthly") {
-    const want = Math.min(c.dayOfMonth || 1, daysInMonth(d.getFullYear(), d.getMonth()));
-    return d.getDate() === want;
-  }
-  if (c.type === "interval") {
-    const n = Math.max(1, c.everyN || 2);
-    const start = parseYMD(c.start || dateKey);
-    const diff = Math.round((d - start) / 86400000);
-    return diff >= 0 && diff % n === 0;
-  }
-  return true;
-}
+const choreDueOn = (chore, dateKey) => CADENCE.dueOn(chore, dateKey);
 
 /* ---------------------------------------------------------------
    Completion records live in chore.done, keyed by date:
@@ -352,6 +346,25 @@ const { SKIPPED, isSkipped, isCompletion } = COMPLETION;
 // display. Resolved against the document so an account can be matched to the
 // person it belongs to.
 const actorFor = (doc) => session.currentActor(doc);
+
+/**
+ * Who to put in the "who" box on something brand new.
+ *
+ * A default, never a lock -- every caller feeds it to a PersonPicker the person
+ * can change before saving. It is applied only when there is no id yet, because
+ * an existing item assigned to nobody also has an empty personId, and quietly
+ * reassigning that to whoever opened it would rewrite other people's things.
+ *
+ * A shared display has no signed-in person and gets "", which the pickers
+ * already render as Everyone -- the same as before this existed. So does a
+ * member who has not linked their account to anybody in the household.
+ */
+const defaultPersonId = (people) => {
+  if (session.isDisplay()) return "";
+  const userId = session.snapshot().user?.id;
+  if (!userId) return "";
+  return (people || []).find((p) => p.userId === userId)?.id || "";
+};
 
 // The most recent scheduled day strictly before dateKey.
 function previousOccurrence(chore, dateKey, lookback = 400) {
@@ -914,8 +927,16 @@ export default function HouseholdHub() {
     return () => { live = false; };
   }, [data?.householdName]);
 
-    const allEvents = data
-    ? [...(data.events || []), ...importedEvents, ...projectEvents(data.projects)]
+    /* Subscribed events arrive from the server tagged only with a feedId -- it
+     cannot read the document, so it does not know whose calendar that is.
+     Joining them back to the household's own calendar list is what makes the
+     person and colour chosen in settings actually apply. */
+  const allEvents = data
+    ? [
+        ...(data.events || []),
+        ...decorateFeedEvents(importedEvents, data.calendars),
+        ...projectEvents(data.projects),
+      ]
     : [];
 
   /* ---- time-of-day reminders ----
@@ -1083,7 +1104,10 @@ export default function HouseholdHub() {
     + data.tasks.filter((t) => inFilter(t.personId) && taskDueToday(t)).length
     + projectsToday;
   const groceryLeft = data.grocery.filter((g) => !g.done).length;
-  const noteCount = data.notes.length;
+  /* Notes still on the board, not every note ever written. A note with an end
+     date leaves the board by itself and joins its history; counting the history
+     in the badge would keep advertising things nobody can see. */
+  const noteCount = NOTES.partitionNotes(data.notes, todayKey).up.length;
   // Unticked items across every list — what is actually outstanding.
   const listsOpen = LISTS.listsOf(data)
     .reduce((n, l) => n + LISTS.itemsOf(l).filter((i) => !i.done).length, 0);
@@ -1148,7 +1172,7 @@ export default function HouseholdHub() {
             taskDueToday={taskDueToday}
             openMeal={(k, slot) => setModal({ type: "meal", key: k, slot })}
             openEvent={() => setModal({ type: "event", payload: { date: todayKey } })}
-            viewEvent={(ev) => setModal({ type: "viewEvent", payload: ev })}
+            viewEvent={(ev) => setModal({ type: isReadOnlyEvent(ev) ? "viewEvent" : "event", payload: ev })}
             openNote={(n) => setModal({ type: "note", payload: n || {} })}
             gotoBoard={() => setTab("board")}
             openProject={(pr) => setModal({ type: "project", payload: pr || {} })}
@@ -1167,7 +1191,7 @@ export default function HouseholdHub() {
             shiftWeek={(n) => setWeekAnchor(ymd(addDays(weekStart, n * 7)))}
             resetWeek={() => setWeekAnchor(ymd(startOfWeek(new Date())))}
             openEvent={(d) => setModal({ type: "event", payload: { date: d } })}
-            editEvent={(ev) => setModal({ type: ev.source === "ics" ? "viewEvent" : "event", payload: ev })} />
+            editEvent={(ev) => setModal({ type: isReadOnlyEvent(ev) ? "viewEvent" : "event", payload: ev })} />
         )}
         {tab === "meals" && (
           <MealsView weekDays={weekDays} data={data} todayKey={todayKey} personById={personById} filter={filter}
@@ -1203,8 +1227,14 @@ export default function HouseholdHub() {
         )}
       </main>
 
-      {modal?.type === "event" && <EventModal payload={modal.payload} people={people} update={update} close={() => setModal(null)} />}
-      {modal?.type === "viewEvent" && <ViewEventModal ev={modal.payload} personById={personById} close={() => setModal(null)} />}
+      {modal?.type === "event" && <EventModal payload={modal.payload} people={people} update={update} calendars={syncTargets} close={() => setModal(null)} />}
+      {modal?.type === "viewEvent" && (
+        <ViewEventModal ev={modal.payload} personById={personById} close={() => setModal(null)}
+          openProject={(pid) => {
+            const pr = (data.projects || []).find((x) => x.id === pid);
+            if (pr) setModal({ type: "project", payload: pr });
+          }} />
+      )}
       {modal?.type === "meal" && <MealModal mealKey={modal.key} slot={modal.slot} data={data} update={update} close={() => setModal(null)} />}
       {modal?.type === "chore" && <ChoreModal payload={modal.payload} people={people} update={update} close={() => setModal(null)} />}
       {modal?.type === "choreDay" && (() => {
@@ -1727,6 +1757,30 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
     } catch (err) { setCreditError(err.message); }
   };
 
+  /* Which row has its "somebody else did this" picker open. Separate from
+     creditOpen: that one corrects a completion that already exists, this one
+     records who did it as the completion is made. */
+  const [coverOpen, setCoverOpen] = useState(null);
+
+  /* "Sam did it, but it was my turn."
+     Ticking the circle yourself writes a first-person claim -- byType 'user',
+     locked -- which cannot be reattributed afterwards, and rightly so. That is
+     why there was no way to say somebody else did it: the only route in was to
+     tick it and then try to correct a record that refuses corrections.
+
+     completeOnBehalf takes the other route. It records who did the work and,
+     separately, whose turn it was, so the rotation still owes that turn to the
+     person who missed it -- and because the claim is second-hand it stays open
+     to correction rather than being locked. */
+  const coverChore = (id, personId) => {
+    setCreditError(null);
+    try {
+      update((d) => COMPLETION.completeOnBehalf(
+        d, id, viewKey, personId, actorFor(d), { assigneeOf: choreAssignee }));
+      setCoverOpen(null);
+    } catch (err) { setCreditError(err.message); }
+  };
+
   const toggleChore = (id) => update((d) => COMPLETION.toggleChore(d, id, viewKey, actorFor(d), { assigneeOf: choreAssignee }))
   // doneAt records which day it was ticked, so a completed task can sit under
   // that day's "done" list instead of vanishing from the view entirely
@@ -1750,6 +1804,12 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
         // whoever actually did it.
         person: personById(isSkipped(mark) ? "" : COMPLETION.completedBy(mark)) || null,
         skipped: isSkipped(mark),
+        // Whose day it was, so the row can say when somebody else did it.
+        assignedTo: choreAssignee(c, viewKey),
+        onBehalfOf: (() => {
+          const r = COMPLETION.completionOf(mark);
+          return r?.onBehalfOf && r.onBehalfOf !== r.by ? r.onBehalfOf : null;
+        })(),
         editable: COMPLETION.canReattribute(mark, actorFor(data)),
         toggle: () => toggleChore(c.id),
       };
@@ -1761,16 +1821,35 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
   ];
   const restChores = chores.filter((c) => !isChoreLate(c) && !c.done[viewKey]);
   const restTasks = dueTasks.filter((t) => !(t.date && t.date < viewKey));
+  /* Overdue rows carry the same three actions as the rows below them: the
+     circle completes, the words open, and a chore can be skipped. They used to
+     carry only `toggle`, because the whole row was one button -- which meant an
+     overdue item was the one thing on this screen you could not open to find
+     out what it involved or why it was missed.
+
+     `open` and `skip` both act on viewKey rather than on the day the item was
+     missed, matching `toggle` and `skipChore`. Skipping is defined over every
+     owed occurrence anyway, so an overdue chore and a due one behave the same
+     way -- which is the point. */
   const overdueItems = [
     ...chores.filter(isChoreLate).map((c) => ({
-      key: "c" + c.id, title: c.title, person: personById(choreAssignee(c, viewKey)),
+      key: "c" + c.id, id: c.id, kind: "chore", title: c.title, rotating: isRotating(c),
+      person: personById(choreAssignee(c, viewKey)),
       lateDays: daysBetween(choreState(c, viewKey).missedSince, viewKey),
       toggle: () => toggleChore(c.id),
+      open: () => openChoreDay(c, viewKey),
+      skip: () => skipChore(c.id),
+      cover: (personId) => coverChore(c.id, personId),
     })),
     ...dueTasks.filter((t) => t.date && t.date < viewKey).map((t) => ({
-      key: "t" + t.id, title: t.title, person: personById(t.personId),
+      key: "t" + t.id, kind: "task", title: t.title, person: personById(t.personId),
       lateDays: daysBetween(t.date, viewKey),
       toggle: () => toggleTask(t.id),
+      open: () => openTask(t),
+      // No skip for a one-off task: there is no next occurrence to defer to, and
+      // "skipped" is a shape only chores store. Deleting it is the honest verb,
+      // and that already lives in the editor the row now opens.
+      skip: null,
     })),
   ].sort((a, b) => b.lateDays - a.lateDays);
   const overdueCount = overdueItems.length;
@@ -1808,6 +1887,16 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
     });
     return d;
   });
+
+  /* Only the notes actually on the board. BoardView already partitioned these;
+     the Today screen renders the same board and did not, so a note past its end
+     date stayed up here -- on the wall display, which is the one screen the end
+     date exists for.
+
+     Keyed to today rather than the day being browsed: these are ambient, and
+     having them wink in and out while somebody pages through next week reads as
+     a glitch rather than as information. */
+  const notesUp = NOTES.partitionNotes(data.notes, todayKey).up;
 
   const noteMode = data.noteDisplay || "overlay";
   const noteStyle = noteMode === "off" ? "off" : (noteMode === "overlay" && !isMobile) ? "overlay" : "row";
@@ -1853,7 +1942,7 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
 
       <div className="shrink-0">
         <CountdownStrip dates={data.dates} todayKey={viewKey} />
-        {noteStyle === "row" && <NoteRow notes={data.notes} personById={personById} openNote={openNote} onOverflow={gotoBoard} />}
+        {noteStyle === "row" && <NoteRow notes={notesUp} personById={personById} openNote={openNote} onOverflow={gotoBoard} />}
       </div>
 
       <div className={`grid gap-3 md:gap-4 pt-2 ${isMobile ? "" : "flex-1 min-h-0"}`}
@@ -1864,7 +1953,7 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
               {todaysEvents.map((e) => {
                 const p = personById(e.personId);
                 return (
-                  <button key={e.id} onClick={() => e.source === "ics" ? viewEvent(e) : null}
+                  <button key={e.id} onClick={() => viewEvent(e)}
                     className="tapfade flex items-center gap-3 rounded-xl px-3 py-2.5 text-left w-full"
                     style={{ background: T.panelAlt, borderLeft: `4px solid ${colorFor(e)}` }}>
                     <div className="w-16 shrink-0">
@@ -1968,22 +2057,54 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
                 <>
                   <div style={{ color: "#E86A4C", fontSize: 10.5, fontWeight: 800, letterSpacing: 1 }} className="uppercase mb-0.5">Overdue</div>
                   {overdueItems.map((it) => (
-                    <button key={it.key} onClick={it.toggle}
-                      className="tapfade flex items-center gap-2.5 rounded-xl px-2.5 py-2 text-left"
+                    /* Not a button. The whole row used to be one, so reaching
+                       for the person's name ticked the item off -- and an
+                       overdue thing is precisely the one you want to open and
+                       read before deciding anything about it. */
+                    <div key={it.key} className="rounded-xl px-2.5 py-2"
                       style={{ background: "#E86A4C12", borderLeft: "3px solid #E86A4C" }}>
-                      <Circle size={25} style={{ color: "#E86A4C" }} className="shrink-0" />
-                      <div className="flex-1 min-w-0">
-                        <div style={{ fontSize: 15.5, fontWeight: 700 }} className="truncate">{it.title}</div>
-                        <div style={{ color: "#C2542F", fontSize: 11.5, fontWeight: 700 }}>{lateLabel(it.lateDays)}</div>
+                      <div className="flex items-center gap-2.5">
+                        <button onClick={it.toggle} aria-label={`Mark ${it.title} done`}
+                          className="tapfade shrink-0" style={{ color: "#E86A4C" }}>
+                          <Circle size={25} />
+                        </button>
+                        <button onClick={it.open} aria-label={`Open ${it.title}`}
+                          className="tapfade flex-1 min-w-0 text-left">
+                          <div style={{ fontSize: 15.5, fontWeight: 700 }} className="truncate">{it.title}</div>
+                          <div style={{ color: "#C2542F", fontSize: 11.5, fontWeight: 700 }}>{lateLabel(it.lateDays)}</div>
+                        </button>
+                        {/* name, not just a colour dot — with a rotation you need to see who still owes it.
+                            On a chore it doubles as the "somebody else did this" control, as below. */}
+                        {it.cover ? (
+                          <button onClick={() => setCoverOpen(coverOpen === it.key ? null : it.key)}
+                            aria-label={it.person ? `${it.person.name}'s turn — say who did ${it.title}` : `Say who did ${it.title}`}
+                            title="Someone else did this?"
+                            className="tapfade shrink-0 rounded-full px-2 py-0.5"
+                            style={it.person
+                              ? { background: it.person.color + "1F", color: it.person.color, fontSize: 11, fontWeight: 800 }
+                              : { background: T.panelAlt, border: `1px solid ${T.line}`, color: T.faint, fontSize: 11, fontWeight: 800 }}>
+                            {it.person ? it.person.name : "Who?"}
+                          </button>
+                        ) : it.person ? (
+                          <span className="shrink-0 rounded-full px-2 py-0.5"
+                            style={{ background: it.person.color + "1F", color: it.person.color, fontSize: 11, fontWeight: 800 }}>
+                            {it.person.name}
+                          </span>
+                        ) : null}
+                        {it.skip && (
+                          <button onClick={it.skip} title="Skip this one"
+                            aria-label={`Skip ${it.title}`} className="tapfade px-2 py-0.5 rounded-full shrink-0"
+                            style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.sub, fontSize: 11, fontWeight: 700 }}>
+                            Skip
+                          </button>
+                        )}
                       </div>
-                      {/* name, not just a colour dot — with a rotation you need to see who still owes it */}
-                      {it.person && (
-                        <span className="shrink-0 rounded-full px-2 py-0.5"
-                          style={{ background: it.person.color + "1F", color: it.person.color, fontSize: 11, fontWeight: 800 }}>
-                          {it.person.name}
-                        </span>
+                      {it.cover && coverOpen === it.key && (
+                        <CreditPicker people={data.people} currentId={it.person?.id || ""}
+                          onPick={(pid) => it.cover(pid)}
+                          note={creditError || (it.rotating && it.person ? `${it.person.name} keeps their turn — this does not use it up.` : null)} />
                       )}
-                    </button>
+                    </div>
                   ))}
                   {(restChores.length > 0 || restTasks.length > 0) && <div className="my-1" style={{ borderTop: `1px dashed ${T.line}` }} />}
                 </>
@@ -2018,17 +2139,32 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
                         )}
                       </button>
                       {isRotating(c) && <Repeat size={11} style={{ color: T.faint }} className="shrink-0" />}
-                      {p && (
-                        <span className="shrink-0 rounded-full px-2 py-0.5" style={{ background: p.color + "1F", color: p.color, fontSize: 11, fontWeight: 800 }}>
-                          {p.name}
-                        </span>
-                      )}
+                      {/* The name is the control for "somebody else did this".
+                          It already says whose turn it is, so tapping it to say
+                          who actually did it needs no extra furniture on a row
+                          that is short of room -- and a chore nobody is assigned
+                          still gets the slot, or the capability would be
+                          unreachable for exactly the chores anyone might do. */}
+                      <button onClick={() => setCoverOpen(coverOpen === c.id ? null : c.id)}
+                        aria-label={p ? `${p.name}'s turn — say who did ${c.title}` : `Say who did ${c.title}`}
+                        title="Someone else did this?"
+                        className="tapfade shrink-0 rounded-full px-2 py-0.5"
+                        style={p
+                          ? { background: p.color + "1F", color: p.color, fontSize: 11, fontWeight: 800 }
+                          : { background: T.panelAlt, border: `1px solid ${T.line}`, color: T.faint, fontSize: 11, fontWeight: 800 }}>
+                        {p ? p.name : "Who?"}
+                      </button>
                       <button onClick={() => skipChore(c.id)} title="Skip this one"
                         aria-label={`Skip ${c.title}`} className="tapfade px-2 py-0.5 rounded-full shrink-0"
                         style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.sub, fontSize: 11, fontWeight: 700 }}>
                         Skip
                       </button>
                     </div>
+                    {coverOpen === c.id && (
+                      <CreditPicker people={data.people} currentId={p?.id || ""}
+                        onPick={(pid) => coverChore(c.id, pid)}
+                        note={creditError || (isRotating(c) && p ? `${p.name} keeps their turn — this does not use it up.` : null)} />
+                    )}
                   </div>
                 );
               })}
@@ -2175,14 +2311,32 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
                           className="tapfade shrink-0" style={{ color: T.brand }}>
                           <CheckCircle2 size={22} />
                         </button>
-                        <span className="flex-1 min-w-0 truncate" style={{ fontSize: 14.5, fontWeight: 500, textDecoration: "line-through" }}>{it.title}</span>
+                        <span className="flex-1 min-w-0">
+                          <span style={{ fontSize: 14.5, fontWeight: 500, textDecoration: "line-through", display: "block" }}
+                            className="truncate">{it.title}</span>
+                          {it.onBehalfOf && (
+                            <span style={{ color: T.gold, fontSize: 11, fontWeight: 700, display: "block" }}>
+                              covered for {personById(it.onBehalfOf)?.name || "someone"}
+                            </span>
+                          )}
+                        </span>
                         {it.skipped ? (
                           <span style={{ color: T.faint, fontSize: 11, fontWeight: 700 }} className="shrink-0">skipped</span>
                         ) : it.editable ? (
                           <CreditChip mark={it.mark} personById={personById} open={creditOpen === it.key}
+                            assignedTo={it.assignedTo}
                             onOpen={() => setCreditOpen(creditOpen === it.key ? null : it.key)} />
                         ) : it.person ? (
-                          <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ background: it.person.color }} />
+                          /* The name, not a colour dot. A dot is a legend nobody
+                             has, and this screen is read from across a kitchen by
+                             people who did not choose the palette. Locked
+                             completions still show without buttons -- shown, but
+                             not up for editing. */
+                          <span className="shrink-0 rounded-full px-2 py-0.5"
+                            title="They ticked this off themselves, so it stands"
+                            style={{ background: it.person.color + "1F", color: it.person.color, fontSize: 11, fontWeight: 800 }}>
+                            {it.person.name}
+                          </span>
                         ) : null}
                       </div>
                       {it.editable && creditOpen === it.key && (
@@ -2199,7 +2353,7 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
         </Card>
       </div>
       {noteStyle === "overlay" && (
-        <NoteOverlay notes={data.notes} update={update} personById={personById}
+        <NoteOverlay notes={notesUp} update={update} personById={personById}
           openNote={openNote} onOverflow={gotoBoard} />
       )}
     </div>
@@ -2426,32 +2580,46 @@ function MealsView({ weekDays, data, todayKey, shiftWeek, resetWeek, openMeal, p
    is actually noticed ("that was me, not you"), there was no way to make it at
    all. The people appear below the item rather than in a modal because on a
    display the thing being corrected needs to stay on screen while you do it. */
-function CreditChip({ mark, personById, open, onOpen }) {
+export function CreditChip({ mark, personById, open, onOpen, assignedTo }) {
   const rec = COMPLETION.completionOf(mark);
   if (!rec) return null;
   const credited = personById(rec.by);
+
+  /* Somebody else did it. Worth showing plainly, because it is the thing a
+     household actually wants to know from a glance at the list -- and because
+     the rotation deliberately does NOT move on in that case, so the row would
+     otherwise look like the queue had stalled for no reason. */
+  const covered = rec.onBehalfOf && rec.onBehalfOf !== rec.by;
+  const owed = covered ? personById(rec.onBehalfOf) : null;
+  const mismatch = covered || (assignedTo && rec.by && rec.by !== assignedTo);
 
   const label = credited ? credited.name : "Who did it?";
   const colour = credited ? credited.color : T.sub;
 
   return (
-    <>
-      <button
-        onClick={onOpen}
-        aria-expanded={open}
-        aria-label={credited ? `Change who did this — currently ${credited.name}` : "Say who did this"}
-        className="tapfade shrink-0 rounded-full px-2.5 py-1"
-        style={{
-          background: credited ? colour + "1F" : T.panelAlt,
-          color: colour,
-          border: `1px solid ${open ? colour : "transparent"}`,
-          fontSize: 12,
-          fontWeight: 800,
-        }}
-      >
-        {label}
-      </button>
-    </>
+    <button
+      onClick={onOpen}
+      aria-expanded={open}
+      aria-label={
+        credited
+          ? `Change who did this — currently ${credited.name}${owed ? `, covering for ${owed.name}` : ""}`
+          : "Say who did this"
+      }
+      className="tapfade shrink-0 rounded-full pl-2.5 pr-2 py-1 flex items-center gap-1"
+      style={{
+        background: credited ? colour + "1F" : T.panelAlt,
+        color: colour,
+        border: `1px solid ${open ? colour : (mismatch ? colour + "66" : "transparent")}`,
+        fontSize: 12,
+        fontWeight: 800,
+      }}
+    >
+      {mismatch && <ArrowLeftRight size={11} aria-hidden="true" />}
+      <span>{label}</span>
+      {/* A guess the screen made, not something anybody said. Shown so it reads
+          as "probably you, tap to fix" rather than as a statement of fact. */}
+      {rec.presumed && <span style={{ opacity: .65, fontWeight: 700 }}>?</span>}
+    </button>
   );
 }
 
@@ -2527,6 +2695,19 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
     } catch (err) {
       setCreditError(err.message);
     }
+  };
+  /* The same "somebody else did this" control as Today. Correcting afterwards
+     only works on completions that are open to correction, and your own tick is
+     not one -- so a chore you ticked for somebody else could never be put right
+     here either. This records it correctly at the point it happens. */
+  const [coverOpen, setCoverOpen] = useState(null);
+  const coverChore = (id, personId) => {
+    setCreditError(null);
+    try {
+      update((d) => COMPLETION.completeOnBehalf(
+        d, id, todayKey, personId, actorFor(d), { assigneeOf: choreAssignee }));
+      setCoverOpen(null);
+    } catch (err) { setCreditError(err.message); }
   };
   const removeChore = (id) => update((d) => { d.chores = d.chores.filter((c) => c.id !== id); return d; });
 
@@ -2636,13 +2817,20 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
                       </div>
                     )}
                   </div>
-                  {up && !mark && (
-                    <span className="shrink-0 rounded-full px-2.5 py-1" style={{ background: up.color + "1F", color: up.color, fontSize: 12, fontWeight: 800 }}>
-                      {isRotating(c) ? `${up.name}'s turn` : up.name}
-                    </span>
+                  {!mark && (
+                    <button onClick={() => setCoverOpen(coverOpen === c.id ? null : c.id)}
+                      title="Someone else did this?"
+                      aria-label={up ? `${up.name}'s turn — say who did ${c.title}` : `Say who did ${c.title}`}
+                      className="tapfade shrink-0 rounded-full px-2.5 py-1"
+                      style={up
+                        ? { background: up.color + "1F", color: up.color, fontSize: 12, fontWeight: 800 }
+                        : { background: T.panelAlt, border: `1px solid ${T.line}`, color: T.faint, fontSize: 12, fontWeight: 800 }}>
+                      {up ? (isRotating(c) ? `${up.name}'s turn` : up.name) : "Who?"}
+                    </button>
                   )}
                   {isDone && (canFixCredit ? (
                     <CreditChip mark={mark} personById={personById} open={creditOpen === c.id}
+                      assignedTo={choreAssignee(c, todayKey)}
                       onOpen={() => setCreditOpen(creditOpen === c.id ? null : c.id)} />
                   ) : creditedTo ? (
                     <span className="shrink-0 rounded-full px-2.5 py-1"
@@ -2672,6 +2860,18 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
                       onPick={(pid) => { creditChore(c.id, pid); setCreditOpen(null); }}
                       note={creditError || (COMPLETION.completionOf(mark)?.byType === "display"
                         ? `Ticked on ${COMPLETION.completionOf(mark).source || "a shared display"}.`
+                        : null)}
+                    />
+                  </div>
+                )}
+                {!mark && coverOpen === c.id && (
+                  <div className="pl-11">
+                    <CreditPicker
+                      people={data.people}
+                      currentId={up?.id || ""}
+                      onPick={(pid) => coverChore(c.id, pid)}
+                      note={creditError || (isRotating(c) && up
+                        ? `${up.name} keeps their turn — this does not use it up.`
                         : null)}
                     />
                   </div>
@@ -4514,7 +4714,12 @@ export function ListsView({ data, update, personById }) {
 /* ---------------- Board: sticky notes + important dates ---------------- */
 export function BoardView({ data, update, personById, todayKey, openNote, openDate }) {
   const isMobile = useMobile();
-  const notes = data.notes;
+  /* A note with an end date leaves the board by itself and joins a history
+     recording how long it was up. Without this the board silts up with things
+     that mattered for a week in March -- and taking one down by hand needs
+     somebody to notice it, which nobody does after the thirtieth time past. */
+  const { up: notes, down: pastNotes } = NOTES.partitionNotes(data.notes, todayKey);
+  const [showPastNotes, setShowPastNotes] = useState(false);
   const removeNote = (id) => update((d) => { d.notes = d.notes.filter((n) => n.id !== id); return d; });
   const removeDate = (id) => update((d) => { d.dates = d.dates.filter((x) => x.id !== id); return d; });
 
@@ -4557,6 +4762,53 @@ export function BoardView({ data, update, personById, todayKey, openNote, openDa
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {pastNotes.length > 0 && (
+          <div className="mt-4">
+            <button onClick={() => setShowPastNotes((v) => !v)}
+              className="tapfade flex items-center gap-2 text-sm font-bold" style={{ color: T.sub }}>
+              <History size={15} />
+              {showPastNotes ? "Hide" : "Show"} note history · {pastNotes.length}
+            </button>
+            {showPastNotes && (
+              <div className="flex flex-col gap-2 mt-2.5">
+                {pastNotes.map((n) => {
+                  const span = NOTES.displayedSpan(n, todayKey);
+                  const who = personById(n.personId);
+                  const from = span.from ? parseYMD(span.from) : null;
+                  const to = span.to ? parseYMD(span.to) : null;
+                  return (
+                    <div key={n.id} className="rounded-xl px-3.5 py-2.5"
+                      style={{ background: T.panelAlt, border: `1px solid ${T.line}`, borderLeft: `4px solid ${n.color || NOTE_COLORS[0]}` }}>
+                      <div style={{ fontSize: 14.5, color: T.sub, whiteSpace: "pre-wrap" }}>{n.text}</div>
+                      <div style={{ color: T.faint, fontSize: 11.5, fontWeight: 700, marginTop: 3 }}>
+                        {from && to
+                          ? `${MO_LONG[from.getMonth()].slice(0, 3)} ${from.getDate()} – ${MO_LONG[to.getMonth()].slice(0, 3)} ${to.getDate()} ${to.getFullYear()}`
+                          : "dates unknown"}
+                        {span.days ? ` · up for ${NOTES.spanLabel(span.days)}` : ""}
+                        {who ? ` · ${who.name}` : ""}
+                      </div>
+                      <div className="flex gap-3 mt-1.5">
+                        {/* Putting it back is a real need: a note comes down the
+                            week before the thing it was about actually happens. */}
+                        <button onClick={() => update((d) => ({
+                          ...d,
+                          notes: d.notes.map((x) => x.id === n.id ? { ...x, until: undefined } : x),
+                        }))} className="tapfade" style={{ color: T.brand, fontSize: 12, fontWeight: 700 }}>
+                          Put it back up
+                        </button>
+                        <button onClick={() => removeNote(n.id)}
+                          className="tapfade" style={{ color: T.faint, fontSize: 12, fontWeight: 700 }}>
+                          Delete
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
       </div>
@@ -5643,20 +5895,28 @@ const SaveBar = ({ onSave, onDelete, saveLabel = "Save" }) => (
   </div>
 );
 
-function EventModal({ payload, people, update, close }) {
+function EventModal({ payload, people, update, close, calendars }) {
   const editing = !!payload.id;
   const [title, setTitle] = useState(payload.title || "");
   const [date, setDate] = useState(payload.date || ymd(new Date()));
   const [time, setTime] = useState(payload.time || "");
   const [endTime, setEndTime] = useState(payload.endTime || "");
-  const [personId, setPersonId] = useState(payload.personId || "");
+  const [personId, setPersonId] = useState(payload.personId || (payload.id ? "" : defaultPersonId(people)));
+  /* Which real calendar this event is written out to, if any.
+     Projects have had this since two-way sync landed; events never did -- and
+     `eventsForSync` only includes an event whose `calendarId` matches the
+     calendar being pushed. With nothing able to set it, no event ever entered a
+     push set, which is why they did not appear, and then why editing or
+     deleting one changed nothing at the far end: there was nothing there to
+     change. */
+  const [calendarId, setCalendarId] = useState(payload.calendarId || "");
   const save = () => {
     if (!title.trim()) return;
     // an end with no start is meaningless, and an end before the start is a typo
     const end = time && endTime && endTime > time ? endTime : "";
     update((d) => {
-      if (editing) d.events = d.events.map((e) => e.id === payload.id ? { ...e, title, date, time, endTime: end, personId } : e);
-      else d.events = [...d.events, { id: uid(), title, date, time, endTime: end, personId }];
+      if (editing) d.events = d.events.map((e) => e.id === payload.id ? { ...e, title, date, time, endTime: end, personId, calendarId } : e);
+      else d.events = [...d.events, { id: uid(), title, date, time, endTime: end, personId, calendarId }];
       return d;
     });
     close();
@@ -5677,32 +5937,84 @@ function EventModal({ payload, people, update, close }) {
         </Field>
       </div>
       <Field label="Who"><PersonPicker people={people} value={personId} onChange={setPersonId} /></Field>
+      <Field label="Also write this to">
+        <select value={calendarId} onChange={(e) => setCalendarId(e.target.value)}
+          className="w-full px-4 py-3 rounded-xl outline-none" style={inputStyle}>
+          <option value="">HouseHub only</option>
+          {(calendars || []).map((c) => (
+            <option key={c.id} value={c.id}>{c.name || "Calendar"}{c.writable ? "" : " (read-only)"}</option>
+          ))}
+        </select>
+        {(calendars || []).length === 0 && (
+          <p style={{ color: T.faint, fontSize: 12, marginTop: 6 }}>
+            This event always appears on the HouseHub calendar. To also write it out to a
+            real calendar, connect one under
+            <strong style={{ color: T.sub }}> Settings → Two-way calendar sync</strong>,
+            turn on writing for it, and it will appear here.
+          </p>
+        )}
+      </Field>
       <SaveBar onSave={save} onDelete={editing ? del : null} />
     </Overlay>
   );
 }
 
-function ViewEventModal({ ev, personById, close }) {
+export function ViewEventModal({ ev, personById, close, openProject }) {
   const p = personById(ev.personId);
   const d = parseYMD(ev.date);
+  const fromProject = ev.source === "project";
+
   return (
     <Overlay close={close}>
       <ModalHead title={ev.title} close={close} />
       <div className="flex flex-col gap-3">
-        <InfoRow icon={<CalendarDays size={18} />} text={`${WD_LONG[d.getDay()]}, ${MO_LONG[d.getMonth()]} ${d.getDate()}`} />
-        <InfoRow icon={<Clock size={18} />} text={
-          ev.spanDays > 1
-            ? `${ev.time ? fmtTime(ev.time) + " start · " : ""}day ${ev.spanIndex + 1} of ${ev.spanDays}`
-            : ev.time
-              ? (ev.endTime ? `${fmtTime(ev.time)} – ${fmtTime(ev.endTime)}` : fmtTime(ev.time))
-              : "All day"
-        } />
-        <InfoRow icon={<Link2 size={18} />} text={`From ${ev.calName}`} color={ev.color} />
-        {p && <InfoRow icon={<Users size={18} />} text={p.name} color={p.color} />}
+        <InfoRow icon={<CalendarDays size={18} />}
+          text={`${WD_LONG[d.getDay()]}, ${MO_LONG[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`} />
+
+        {/* Start and end, not just start. An event people are deciding their
+            evening around needs to say when it finishes. */}
+        <InfoRow icon={<Clock size={18} />} text={whenLabel(ev, fmtTime)} />
+
+        {ev.location && <InfoRow icon={<MapPin size={18} />} text={ev.location} />}
+
+        {/* Which calendar it belongs to. This used to read "From undefined":
+            the server never sent a name and the document was never consulted. */}
+        {!fromProject && (
+          <InfoRow icon={<Link2 size={18} />} text={`From ${ev.calName || "Calendar"}`} color={ev.color} />
+        )}
+        {fromProject && <InfoRow icon={<Hammer size={18} />} text="From a project" color={T.brand} />}
+
+        <InfoRow icon={<Users size={18} />}
+          text={p ? p.name : "Everyone"}
+          color={p ? p.color : undefined} />
       </div>
-      <div className="mt-6 rounded-2xl px-4 py-3 flex items-center gap-2" style={{ background: T.panelAlt, color: T.sub }}>
-        <Lock size={16} /><span style={{ fontSize: 14 }}>Synced from a calendar — edit it in Google or Apple Calendar.</span>
-      </div>
+
+      {ev.notes && (
+        <div className="mt-4 rounded-2xl px-4 py-3"
+          style={{ background: T.panelAlt, border: `1px solid ${T.line}` }}>
+          <div style={{ fontSize: 11.5, fontWeight: 800, color: T.faint, letterSpacing: .5, marginBottom: 4 }}>
+            DETAILS
+          </div>
+          <div style={{ fontSize: 14.5, color: T.ink, whiteSpace: "pre-wrap", lineHeight: 1.45 }}>
+            {ev.notes}
+          </div>
+        </div>
+      )}
+
+      {fromProject ? (
+        <button onClick={() => { close(); openProject && openProject(ev.projectId); }}
+          className="tapfade w-full mt-6 py-3 rounded-xl font-bold"
+          style={{ background: T.brand, color: "#fff" }}>
+          Open the project
+        </button>
+      ) : (
+        <div className="mt-6 rounded-2xl px-4 py-3 flex items-center gap-2" style={{ background: T.panelAlt, color: T.sub }}>
+          <Lock size={16} />
+          <span style={{ fontSize: 14 }}>
+            Synced from {ev.calName || "a calendar"} — edit it there and it will update here.
+          </span>
+        </div>
+      )}
     </Overlay>
   );
 }
@@ -6173,6 +6485,9 @@ export function ChoreDayModal({ chore, dateKey, people, personById, update, clos
       <div className="px-1 pb-2" style={{ color: T.sub, fontSize: 13.5, fontWeight: 600 }}>
         {WD_LONG[when.getDay()]}, {MO_LONG[when.getMonth()]} {when.getDate()}
         {owed && <> · {owed.name}'s turn</>}
+        <span style={{ display: "block", color: T.faint, fontSize: 12.5, fontWeight: 600 }}>
+          {CADENCE.describeCadence(chore, (id) => personById(id)?.name)}
+        </span>
       </div>
 
       {(done || skipped) && (
@@ -6235,6 +6550,58 @@ export function ChoreDayModal({ chore, dateKey, people, personById, update, clos
         </Field>
       )}
 
+      {/* "I did it today, and the every-two-days clock should start from now."
+          Only offered for an interval chore, because that is the only kind with
+          an anchor to move -- doing the bins on a Wednesday does not make bin
+          day Wednesday, so weekly and monthly are left alone rather than given
+          a control that quietly does nothing. */}
+      {CADENCE.canResetAnchor(chore) && (
+        <Field label="Schedule">
+          <button
+            onClick={() => {
+              update((d) => {
+                const anchored = {
+                  ...d,
+                  chores: (d.chores || []).map((c) =>
+                    c.id === chore.id ? CADENCE.resetAnchor(c, dateKey) : c),
+                };
+                /* "Did it today" is a claim about today as much as about the
+                   schedule, and re-anchoring alone does not record it. An
+                   interval restarted from today is due today by definition
+                   (0 % n === 0), so moving the anchor on its own left the chore
+                   sitting there unticked while the button underneath promised
+                   it was not wanted for another two days.
+
+                   Completing it also credits somebody and advances a rotation,
+                   which re-anchoring silently would not -- and the person who
+                   just took the bins out is the person the tally should show. */
+                const after = anchored.chores.find((c) => c.id === chore.id);
+                if (COMPLETION.isCompletion(after?.done?.[dateKey])) return anchored;
+                return COMPLETION.toggleChore(
+                  anchored, chore.id, dateKey, actorFor(anchored),
+                  { assigneeOf: choreAssignee },
+                );
+              });
+              close();
+            }}
+            className="tapfade w-full py-3 rounded-xl font-semibold text-left px-4"
+            style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.ink }}>
+            <span style={{ display: "block", fontSize: 14.5, fontWeight: 700 }}>
+              Did it today — restart the schedule
+            </span>
+            <span style={{ display: "block", color: T.sub, fontSize: 12.5 }}>
+              {CADENCE.describeCadence(chore)} · next due{" "}
+              {(() => {
+                const next = CADENCE.nextAfterReset(chore, dateKey);
+                if (!next) return "later";
+                const n = parseYMD(next);
+                return `${WD_SHORT[n.getDay()]}, ${MO_LONG[n.getMonth()].slice(0, 3)} ${n.getDate()}`;
+              })()}
+            </span>
+          </button>
+        </Field>
+      )}
+
       <div className="flex gap-2 px-1 pt-1">
         <button onClick={save} className="tapfade flex-1 py-3 rounded-xl font-bold"
           style={{ background: T.brand, color: "#fff" }}>Done</button>
@@ -6247,10 +6614,10 @@ export function ChoreDayModal({ chore, dateKey, people, personById, update, clos
   );
 }
 
-function ChoreModal({ payload, people, update, close }) {
+export function ChoreModal({ payload, people, update, close }) {
   const editing = !!payload.id;
   const [title, setTitle] = useState(payload.title || "");
-  const [personId, setPersonId] = useState(payload.personId || "");
+  const [personId, setPersonId] = useState(payload.personId || (payload.id ? "" : defaultPersonId(people)));
   const [rotation, setRotation] = useState(Array.isArray(payload.rotation) ? payload.rotation.filter(Boolean) : []);
   const [cad, setCad] = useState(payload.cadence || { type: "daily" });
   const [alert, setAlert] = useState(payload.alert || null);
@@ -6264,8 +6631,22 @@ function ChoreModal({ payload, people, update, close }) {
     type === "weekly" ? { type, days: cad.days?.length ? cad.days : [new Date().getDay()] }
       : type === "monthly" ? { type, dayOfMonth: cad.dayOfMonth || new Date().getDate() }
         : type === "interval" ? { type, everyN: cad.everyN || 2, start: cad.start || ymd(new Date()) }
-          : { type: "daily" }
+          : type === "perPerson" ? { type, people: cad.people || {} }
+            : { type: "daily" }
   );
+
+  /* Each person in the rotation picks their own days. Unlike a rotation, where
+     the turn moves along as people do it, here the day names the person: Steven
+     has Mondays, Ryan has Thursdays, and one of them missing a week does not
+     make it the other's. */
+  const togglePersonDay = (personId, dow) => setCad((c) => {
+    const people = { ...(c.people || {}) };
+    const cur = Array.isArray(people[personId]?.days) ? people[personId].days : [];
+    const next = cur.includes(dow) ? cur.filter((d) => d !== dow) : [...cur, dow].sort((a, b) => a - b);
+    if (next.length) people[personId] = { days: next };
+    else delete people[personId];
+    return { ...c, people };
+  });
   const toggleDay = (d) => setCad((c) => {
     const days = new Set(c.days || []);
     days.has(d) ? days.delete(d) : days.add(d);
@@ -6291,7 +6672,10 @@ function ChoreModal({ payload, people, update, close }) {
       <Field label="Chore"><input autoFocus value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Empty dishwasher" className="w-full px-4 py-3.5 rounded-xl text-lg outline-none" style={inputStyle} /></Field>
       <Field label="Repeats">
         <div className="flex flex-wrap gap-2">
-          {[["daily", "Every day"], ["weekly", "Certain days"], ["monthly", "Monthly"], ["interval", "Every N days"]].map(([v, l]) => (
+          {[["daily", "Every day"], ["weekly", "Weekly"], ["monthly", "Monthly"],
+            ["interval", "Every N days"],
+            ...(rotation.length > 1 ? [["perPerson", "Each person's own day"]] : []),
+           ].map(([v, l]) => (
             <button key={v} onClick={() => setType(v)} className="tapfade px-4 py-2.5 rounded-full font-semibold"
               style={{ background: cad.type === v ? T.brand : T.panelAlt, color: cad.type === v ? "#fff" : T.ink, border: `1px solid ${cad.type === v ? T.brand : T.line}` }}>{l}</button>
           ))}
@@ -6308,6 +6692,47 @@ function ChoreModal({ payload, people, update, close }) {
               );
             })}
           </div>
+        </Field>
+      )}
+      {cad.type === "perPerson" && (
+        <Field label="Who does it, and when">
+          <div className="flex flex-col gap-2.5">
+            {rotation.map((pid) => {
+              const person = people.find((x) => x.id === pid);
+              const mine = cad.people?.[pid]?.days || [];
+              return (
+                <div key={pid}>
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <span className="w-2.5 h-2.5 rounded-full" style={{ background: person?.color || T.faint }} />
+                    <span style={{ fontSize: 14, fontWeight: 700 }}>{person?.name || "Someone"}</span>
+                    {mine.length === 0 && (
+                      <span style={{ color: T.faint, fontSize: 12 }}>no days yet</span>
+                    )}
+                  </div>
+                  <div className="flex gap-1.5">
+                    {WD_SHORT.map((w, i) => {
+                      const on = mine.includes(i);
+                      return (
+                        <button key={i} onClick={() => togglePersonDay(pid, i)}
+                          aria-label={`${person?.name || "Someone"} on ${w}`}
+                          className="tapfade flex-1 py-2.5 rounded-xl font-bold"
+                          style={{
+                            background: on ? (person?.color || T.brand) : T.panelAlt,
+                            color: on ? "#fff" : T.sub,
+                            border: `1px solid ${on ? (person?.color || T.brand) : T.line}`,
+                            fontSize: 13,
+                          }}>{w[0]}</button>
+                      );
+                    })}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+          <p style={{ color: T.faint, fontSize: 13 }} className="mt-2">
+            The day decides whose it is, so nobody's turn carries over. Two people
+            can share a day if you both do it together.
+          </p>
         </Field>
       )}
       {cad.type === "monthly" && (
@@ -6395,7 +6820,7 @@ function TaskModal({ payload, people, update, close }) {
   const editing = !!payload.id;
   const [title, setTitle] = useState(payload.title || "");
   const [date, setDate] = useState(payload.date || "");
-  const [personId, setPersonId] = useState(payload.personId || "");
+  const [personId, setPersonId] = useState(payload.personId || (payload.id ? "" : defaultPersonId(people)));
   const [alert, setAlert] = useState(payload.alert || null);
   const [steps, setSteps] = useState(Array.isArray(payload.steps) ? payload.steps : []);
   const [note, setNote] = useState(SUB.taskNote(payload));
@@ -6428,16 +6853,17 @@ function TaskModal({ payload, people, update, close }) {
   );
 }
 
-function NoteModal({ payload, people, update, close }) {
+export function NoteModal({ payload, people, update, close }) {
   const editing = !!payload.id;
   const [text, setText] = useState(payload.text || "");
   const [color, setColor] = useState(payload.color || NOTE_COLORS[0]);
-  const [personId, setPersonId] = useState(payload.personId || "");
+  const [personId, setPersonId] = useState(payload.personId || (payload.id ? "" : defaultPersonId(people)));
+  const [until, setUntil] = useState(payload.until || "");
   const save = () => {
     if (!text.trim()) return;
     update((d) => {
-      if (editing) d.notes = d.notes.map((n) => n.id === payload.id ? { ...n, text: text.trim(), color, personId } : n);
-      else d.notes = [{ id: uid(), text: text.trim(), color, personId, at: Date.now() }, ...d.notes];
+      if (editing) d.notes = d.notes.map((n) => n.id === payload.id ? { ...n, text: text.trim(), color, personId, until: until || undefined } : n);
+      else d.notes = [{ id: uid(), text: text.trim(), color, personId, at: Date.now(), from: ymd(new Date()), until: until || undefined }, ...d.notes];
       return d;
     });
     close();
@@ -6450,6 +6876,29 @@ function NoteModal({ payload, people, update, close }) {
         <textarea autoFocus value={text} onChange={(e) => setText(e.target.value)} rows={4}
           placeholder="e.g. Vet appointment moved to Thursday — can you take him?"
           className="w-full px-4 py-3.5 rounded-xl text-lg outline-none resize-none" style={inputStyle} />
+      </Field>
+      <Field label="Take it down on">
+        <div className="flex gap-2 items-center flex-wrap">
+          <input type="date" value={until} onChange={(e) => setUntil(e.target.value)}
+            className="flex-1 min-w-0 px-4 py-3 rounded-xl outline-none" style={inputStyle} />
+          {until ? (
+            <button onClick={() => setUntil("")} className="tapfade px-3 py-2 rounded-xl font-semibold"
+              style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.sub, fontSize: 13 }}>
+              Leave it up
+            </button>
+          ) : (
+            <button onClick={() => setUntil(NOTES.suggestedUntil(ymd(new Date())))}
+              className="tapfade px-3 py-2 rounded-xl font-semibold"
+              style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.sub, fontSize: 13 }}>
+              In 2 weeks
+            </button>
+          )}
+        </div>
+        <p style={{ color: T.faint, fontSize: 12.5 }} className="mt-2">
+          {until
+            ? "It comes down by itself after this day, and moves into the note history."
+            : "Optional. Without one it stays on the board until somebody removes it."}
+        </p>
       </Field>
       <Field label="Paper color">
         <div className="flex gap-2 flex-wrap">
@@ -6517,6 +6966,10 @@ export function HistoryModal({ data, update, personById, close }) {
   const [days, setDays] = useState(14);
   const [who, setWho] = useState("all");
   const [error, setError] = useState("");
+  // Off by default. A running tally of who is not pulling their weight is a
+  // thing to go and look at deliberately, not something a shared screen should
+  // put in front of the household every time somebody opens their history.
+  const [showReport, setShowReport] = useState(false);
   const todayKey = ymd(new Date());
   const actor = actorFor(data);
 
@@ -6536,6 +6989,11 @@ export function HistoryModal({ data, update, personById, close }) {
       items.push({
         id: "c" + c.id, kind: "chore", title: c.title, personId: rec?.by || "",
         chore: c, mark,
+        /* Whose turn it was, when somebody else did it. Without this the
+           history said only who did the work, so a week where one person
+           quietly covered three of another's chores read exactly like a week
+           where everyone did their own. */
+        onBehalfOf: rec?.onBehalfOf && rec.onBehalfOf !== rec.by ? rec.onBehalfOf : null,
         // A locked completion is somebody's own claim about themselves. It is
         // shown, but not up for editing by whoever happens to be looking.
         editable: COMPLETION.canReattribute(mark, actor),
@@ -6573,6 +7031,51 @@ export function HistoryModal({ data, update, personById, close }) {
     for (const t of data.tasks || []) if (t.done && t.doneAt === k && t.personId) tally[t.personId] = (tally[t.personId] || 0) + 1;
     for (const pr of data.projects || []) if (pr.doneOn === k && pr.personId) tally[pr.personId] = (tally[pr.personId] || 0) + 1;
   }
+
+  /* Who is doing whose chores.
+     Two questions, and the second is the one that actually gets asked: who is
+     covering for other people, and who is not doing theirs. Both are already
+     recorded -- a cover stores the doer and the person owed separately, and an
+     assigned turn that was never completed is simply a due day with no mark --
+     they had just never been counted up.
+
+     Only chores are counted. A one-off task has no turn to owe and no next
+     occurrence to miss, so folding tasks in here would inflate "missed" with
+     things nobody was ever scheduled to do. */
+  const coverStats = useMemo(() => {
+    const blank = () => ({ did: 0, coveredFor: 0, coveredBy: 0, missed: 0, skipped: 0 });
+    const per = {};
+    const at = (id) => (per[id] ||= blank());
+    for (let i = 0; i < days; i++) {
+      const k = ymd(addDays(parseYMD(todayKey), -i));
+      for (const c of data.chores || []) {
+        // assigneeFor returns the person owed even once somebody covered it,
+        // so this stays the turn's owner rather than the doer.
+        const owed = choreAssignee(c, k);
+        const mark = c.done?.[k];
+
+        /* A completion is counted wherever it was recorded, due day or not.
+           Ticking an overdue chore writes it under today, and today is very
+           often not one of its due days -- a weekly Monday chore done on the
+           Friday, say. Gating this on dueOn dropped exactly those, which is
+           the case the report is most likely to be opened about. */
+        if (mark !== undefined) {
+          if (COMPLETION.isSkipped(mark)) { if (owed) at(owed).skipped++; continue; }
+          const rec = COMPLETION.completionOf(mark);
+          if (rec) {
+            if (rec.by) at(rec.by).did++;
+            if (owed && rec.by && owed !== rec.by) { at(rec.by).coveredFor++; at(owed).coveredBy++; }
+          }
+          continue;
+        }
+
+        // Missing something is only meaningful on a day it was actually owed,
+        // and today is still in play.
+        if (choreDueOn(c, k) && k < todayKey && owed) at(owed).missed++;
+      }
+    }
+    return per;
+  }, [data.chores, days, todayKey]);
 
   const recredit = (x, dateKey, personId) => {
     setError("");
@@ -6628,6 +7131,65 @@ export function HistoryModal({ data, update, personById, close }) {
               <span style={{ fontSize: 13, fontWeight: 700, color: T.ink }}>{pp.name} {tally[pp.id] || 0}</span>
             </span>
           ))}
+          <button onClick={() => setShowReport((v) => !v)}
+            className="tapfade ml-auto px-3 py-1.5 rounded-full font-semibold"
+            style={{ background: showReport ? T.brand : T.panel, color: showReport ? "#fff" : T.sub,
+              border: `1px solid ${showReport ? T.brand : T.line}`, fontSize: 12.5 }}>
+            {showReport ? "Hide report" : "Report"}
+          </button>
+        </div>
+      )}
+
+      {showReport && (
+        <div className="rounded-xl px-3 py-3 mb-3" style={{ background: T.panel, border: `1px solid ${T.line}` }}>
+          <div style={{ color: T.sub, fontSize: 11.5, fontWeight: 800, letterSpacing: 0.5 }} className="uppercase mb-2">
+            Chores over {days === 7 ? "the last week" : days === 14 ? "the last fortnight" : `the last ${days} days`}
+          </div>
+          <div style={{ overflowX: "auto" }}>
+            <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13.5 }}>
+              <thead>
+                <tr style={{ color: T.faint, fontSize: 11, fontWeight: 800, letterSpacing: 0.4 }}>
+                  <th style={{ textAlign: "left", padding: "4px 8px 6px 0" }} className="uppercase">Person</th>
+                  <th style={{ textAlign: "right", padding: "4px 8px 6px" }} className="uppercase">Did</th>
+                  <th style={{ textAlign: "right", padding: "4px 8px 6px" }} className="uppercase">Covered&nbsp;for</th>
+                  <th style={{ textAlign: "right", padding: "4px 8px 6px" }} className="uppercase">Covered&nbsp;by</th>
+                  <th style={{ textAlign: "right", padding: "4px 8px 6px" }} className="uppercase">Skipped</th>
+                  <th style={{ textAlign: "right", padding: "4px 0 6px 8px" }} className="uppercase">Missed</th>
+                </tr>
+              </thead>
+              <tbody>
+                {data.people.map((pp) => {
+                  const s = coverStats[pp.id] || { did: 0, coveredFor: 0, coveredBy: 0, missed: 0, skipped: 0 };
+                  const num = (n, colour) => (
+                    <td style={{ textAlign: "right", padding: "5px 8px", fontWeight: 700, color: n ? (colour || T.ink) : T.faint }}
+                      className="tabular-nums">{n}</td>
+                  );
+                  return (
+                    <tr key={pp.id} style={{ borderTop: `1px solid ${T.line}` }}>
+                      <td style={{ padding: "5px 8px 5px 0" }}>
+                        <span className="flex items-center gap-1.5">
+                          <span className="rounded-full shrink-0" style={{ width: 8, height: 8, background: pp.color }} />
+                          <span style={{ fontWeight: 700, color: T.ink }}>{pp.name}</span>
+                        </span>
+                      </td>
+                      {num(s.did)}
+                      {num(s.coveredFor, T.gold)}
+                      {num(s.coveredBy, T.gold)}
+                      {num(s.skipped, T.sub)}
+                      {num(s.missed, "#C2542F")}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <p style={{ color: T.faint, fontSize: 12 }} className="mt-2">
+            <strong>Covered for</strong> is chores they did that were somebody else's turn.
+            <strong> Covered by</strong> is their own turns that somebody else did.
+            <strong> Missed</strong> counts turns that came round and were never
+            ticked or skipped — today is not counted, since it is still going.
+            Recurring chores only: a one-off task is nobody's turn.
+          </p>
         </div>
       )}
 
@@ -6650,8 +7212,19 @@ export function HistoryModal({ data, update, personById, close }) {
                         style={{ background: T.panel, border: `1px solid ${T.line}`, opacity: x.skipped ? 0.6 : 1 }}>
                         <div className="flex items-center gap-2">
                           <span style={{ color: T.faint }} className="shrink-0">{kindIcon(x.kind)}</span>
-                          <span style={{ fontSize: 14.5, fontWeight: 600, color: T.ink, textDecoration: x.skipped ? "line-through" : "none" }}
-                            className="truncate flex-1">{x.title}</span>
+                          <span className="min-w-0 flex-1">
+                            <span style={{ fontSize: 14.5, fontWeight: 600, color: T.ink, textDecoration: x.skipped ? "line-through" : "none", display: "block" }}
+                              className="truncate">{x.title}</span>
+                            {/* Said plainly rather than with a marker to decode:
+                                the whole point is that somebody reading back
+                                over a fortnight can see it without being told
+                                what to look for. */}
+                            {x.onBehalfOf && (
+                              <span style={{ color: T.gold, fontSize: 11.5, fontWeight: 700, display: "block" }}>
+                                covered for {personById(x.onBehalfOf)?.name || "someone"}
+                              </span>
+                            )}
+                          </span>
                           {x.skipped ? (
                             <span style={{ color: T.faint, fontSize: 11.5, fontWeight: 700 }}>skipped</span>
                           ) : x.editable ? (
@@ -6709,7 +7282,7 @@ export function ProjectModal({ payload, people, update, close, calendars }) {
   const editStage = (id, patch) => setStages((cur) => cur.map((x) => x.id === id ? { ...x, ...patch } : x));
   const toggleStage = (id) => setStages((cur) => cur.map((x) => x.id === id ? { ...x, done: !x.done } : x));
   const dropStage = (id) => setStages((cur) => cur.filter((x) => x.id !== id));
-  const [personId, setPersonId] = useState(payload.personId || "");
+  const [personId, setPersonId] = useState(payload.personId || (payload.id ? "" : defaultPersonId(people)));
   const [newDate, setNewDate] = useState("");
   /* Which synced calendar these dates belong on. Empty means "stays in
      HouseHub", and that is the default deliberately: a renovation plan should
@@ -6814,10 +7387,24 @@ export function ProjectModal({ payload, people, update, close, calendars }) {
             <option key={c.id} value={c.id}>{c.name || "Calendar"}{c.writable ? "" : " (read-only)"}</option>
           ))}
         </select>
-        <p style={{ color: T.faint, fontSize: 12, marginTop: 6 }}>
-          Dated stages always appear on the HouseHub calendar. Choosing a synced
-          calendar also writes them out to it, if that calendar allows writing.
-        </p>
+        {(calendars || []).length === 0 ? (
+          /* Saying why the list is empty. It read as "there are no options",
+             when the real state is "no account has been connected yet" -- and
+             nothing on this screen said where to go and do that. */
+          <p style={{ color: T.faint, fontSize: 12, marginTop: 6 }}>
+            Dated stages always appear on the HouseHub calendar. To also write them
+            out to a real calendar, connect one under
+            <strong style={{ color: T.sub }}> Settings → Two-way calendar sync</strong>,
+            turn on writing for it, and it will appear here.
+          </p>
+        ) : (
+          <p style={{ color: T.faint, fontSize: 12, marginTop: 6 }}>
+            Dated stages always appear on the HouseHub calendar. Choosing a synced
+            calendar also writes them out to it. Changes made here flow outward;
+            edits made in the other calendar are not read back, so the project
+            stays the record of what is planned.
+          </p>
+        )}
       </Field>
       {stages.length === 0 && (
       <Field label="Days planned">

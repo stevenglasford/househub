@@ -25,8 +25,26 @@ export const PICKABLE = ["camera", "devices"];
  * kind string with no selection alongside it.
  */
 export function secondBlockFor(data, filter) {
-  const raw = (data?.secondBlock || data?.mealsSecondRow || {})[filter || "all"];
+  const all = data?.secondBlock || data?.mealsSecondRow || {};
+
+  /* Fall back to the "Everyone" setting when this filter has none of its own.
+     Without it the row was set up under Everyone, and then disappeared the
+     moment anybody filtered Today to a person -- which is the whole of "you
+     select one, but it doesn't actually display". Per-person overrides still
+     win where they exist; this only fills the gap, which is the common case. */
+  const raw = all[filter || "all"] ?? all.all;
   if (!raw) return { kind: "none", picks: [] };
   if (typeof raw === "string") return { kind: raw, picks: [] };
   return { kind: raw.kind || "none", picks: Array.isArray(raw.picks) ? raw.picks : [] };
+}
+
+/**
+ * Is this filter showing its own choice, or Everyone's?
+ *
+ * The settings screen needs to say which, or "Nothing" next to a person's name
+ * looks like a contradiction of the row they can see on Today.
+ */
+export function isInherited(data, filter) {
+  const all = data?.secondBlock || data?.mealsSecondRow || {};
+  return Boolean(filter && filter !== "all" && all[filter] === undefined && all.all);
 }

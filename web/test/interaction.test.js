@@ -212,3 +212,52 @@ test("that check would notice the old markup", needs, async () => {
   assert.equal(hits.length, 1);
   assert.match(hits[0][1], /flex items-center/);
 });
+
+/* ------------------------------------------------- who did it, on a screen --- */
+
+test("REGRESSION: a display tick names somebody instead of asking", needs, async () => {
+  /* Ryan: "After a todo item has been checked off on the display, it changes to
+     'who did it' — it should say the person who did it."
+
+     A shared screen genuinely cannot know who pressed it, and the old code was
+     strictly truthful about that: it credited nobody. In a kitchen that meant
+     the row asked a question forever, because nobody goes back to answer the
+     wall. It now assumes whoever's turn it was and marks that as an assumption. */
+  const C = await import("../src/lib/completion.js");
+  const display = { isDisplay: true, displayName: "Hall iPad" };
+
+  let doc = {
+    people: [{ id: "p1", name: "Steven" }, { id: "p2", name: "Alex" }],
+    chores: [{ id: "c1", title: "Bins out", personId: "p1", done: {} }],
+    archiveSettings: { chores: true }, archive: {},
+  };
+  doc = C.toggleChore(doc, "c1", "2026-08-21", display, { assigneeOf: (c) => c.personId });
+
+  const rec = C.completionOf(doc.chores[0].done["2026-08-21"]);
+  assert.equal(rec.by, "p1", "the assignee is credited rather than nobody");
+  assert.equal(rec.presumed, true, "and it is recorded as an assumption, not a claim");
+  assert.equal(rec.byType, "display", "the origin is still the screen");
+});
+
+test("correcting the credit clears the assumption", needs, async () => {
+  const C = await import("../src/lib/completion.js");
+  const display = { isDisplay: true, displayName: "Hall iPad" };
+  let doc = {
+    people: [{ id: "p1" }, { id: "p2" }],
+    chores: [{ id: "c1", title: "Bins out", personId: "p1", done: {} }],
+    archiveSettings: { chores: true }, archive: {},
+  };
+  doc = C.toggleChore(doc, "c1", "2026-08-21", display, { assigneeOf: (c) => c.personId });
+  doc = C.attributeChore(doc, "c1", "2026-08-21", "p2", display);
+
+  const rec = C.completionOf(doc.chores[0].done["2026-08-21"]);
+  assert.equal(rec.by, "p2");
+  assert.equal(rec.presumed, false, "somebody has said who it was, so it is no longer a guess");
+});
+
+test("a signed-in person's own tick is never a presumption", needs, async () => {
+  const C = await import("../src/lib/completion.js");
+  const rec = C.completionOf(C.markCompleted({ userId: "u1", personId: "p1", isDisplay: false }));
+  assert.equal(rec.presumed, false);
+  assert.equal(rec.locked, true, "it is a statement about themselves and it stands");
+});

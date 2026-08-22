@@ -60,6 +60,10 @@ export function completionOf(mark) {
        credited to the person who did it, but the turn belongs to -- and stays
        with -- the person who owed it. */
     onBehalfOf: mark.onBehalfOf ?? null,
+    /* True when nobody said who did it and the assignee was assumed. The
+       difference matters: a presumed credit is a good guess to be corrected,
+       a stated one is somebody's account of themselves. */
+    presumed: Boolean(mark.presumed),
   };
 }
 
@@ -73,10 +77,17 @@ export const completedBy = (mark) => completionOf(mark)?.by || "";
  */
 export function markCompleted(actor, { fallbackPersonId = "" } = {}) {
   if (actor?.isDisplay) {
+    /* A shared screen cannot know who pressed it, so it assumes the person
+       whose turn it was -- and records that this is an assumption.
+       
+       It used to name nobody, which was strictly more truthful and worse in
+       practice: the row read "Who did it?" forever, because in a kitchen nobody
+       goes back to answer a question the wall is asking. Naming the likely
+       person and flagging it as presumed gets the common case right, keeps the
+       uncommon case visible, and leaves it one tap to correct. */
     return {
-      // Nobody is named yet -- a shared screen cannot know who pressed it.
-      // Somebody can attribute it afterwards.
-      by: "",
+      by: fallbackPersonId || "",
+      presumed: Boolean(fallbackPersonId),
       actorUserId: null,
       byType: "display",
       source: actor.displayName || "Shared display",
@@ -152,6 +163,10 @@ export function reattribute(mark, personId, actor) {
   return {
     ...c,
     by: personId || "",
+    // Somebody has now said who it was, so it is no longer an assumption --
+    // otherwise a corrected row would keep wearing the "assumed" marker and
+    // invite the same correction again.
+    presumed: false,
     // Kept, so the archive still shows the completion came off a screen and was
     // attributed later rather than claimed at the time.
     attributedBy: actor?.userId || null,

@@ -44,7 +44,7 @@ export const router = express.Router();
 // Every field a caller may send, spelled out. Anything else is dropped by zod
 // before it can reach a prompt -- an allowlist, so adding a field is a
 // deliberate act rather than something a client can do unilaterally.
-const contextSchema = z.object({
+export const contextSchema = z.object({
   householdSize: z.number().int().min(1).max(30).optional(),
   togetherYears: z.number().int().min(0).max(100).optional(),
   hasDependents: z.boolean().optional(),
@@ -65,6 +65,12 @@ const contextSchema = z.object({
 
   count: z.number().int().min(1).max(20).optional(),
   jar: z.string().max(40).optional(),
+  /* What the household typed when asking for date ideas in their own words.
+     Household content, so it is capped and goes to the local model only -- the
+     same footing as `instructions`. Its absence here is what made the date-jar
+     prompt fail with "Unsupported field: prompt": the schema is strict, so the
+     request was refused at the route and never reached the model. */
+  prompt: z.string().max(400).optional(),
   season: z.enum(["spring", "summer", "autumn", "winter"]).optional(),
   budget: z.enum(["free", "cheap", "moderate", "splurge"]).optional(),
   indoor: z.boolean().optional(),
@@ -74,7 +80,7 @@ const contextSchema = z.object({
   aisles: z.array(z.string().max(40)).max(30).optional(),
 }).strict();
 
-const generateSchema = z.object({
+export const generateSchema = z.object({
   kind: z.enum(KIND_NAMES),
   context: contextSchema.default({}),
   // The household's own steer, from their encrypted document. Capped, and

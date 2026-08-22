@@ -164,7 +164,15 @@ export function parseICS(text, tz = DEFAULT_TZ) {
     const [name, ...params] = left.split(";");
     const param = {};
     params.forEach((p) => { const [k, v] = p.split("="); param[k] = v; });
-    if (name === "SUMMARY") cur.summary = value.replace(/\\,/g, ",").replace(/\\n/gi, " ").replace(/\\;/g, ";");
+    /* iCalendar escapes these four, and unescaping is not optional: a title
+       with a comma in it arrives as "Dinner\, drinks" and is shown verbatim
+       otherwise. Backslash last, or "\\n" would turn into a newline. */
+    const unesc = (v) => String(v)
+      .replace(/\\n/gi, "\n").replace(/\\,/g, ",").replace(/\\;/g, ";").replace(/\\\\/g, "\\");
+
+    if (name === "SUMMARY") cur.summary = unesc(value).replace(/\n/g, " ");
+    else if (name === "LOCATION") cur.location = unesc(value).slice(0, 300);
+    else if (name === "DESCRIPTION") cur.description = unesc(value).slice(0, 2000);
     else if (name === "DTSTART") cur.start = parseDT(value, param, tz, zones);
     else if (name === "DTEND") cur.end = parseDT(value, param, tz, zones);
     else if (name === "UID") cur.uid = value.trim();
@@ -214,9 +222,21 @@ export function expandEvents(parsed, winStart, winEnd, tz = DEFAULT_TZ) {
         && ev.end.h !== undefined && span === 1)
         ? `${pad(ev.end.h)}:${pad(ev.end.mi)}` : "";
       out.push({
+        /* A stable id per occurrence. React needs a key, and the detail sheet
+           needs to be able to find the event it was opened for -- neither
+           worked while these arrived anonymous. */
+        id: `ics:${ev.uid || ev.summary || "?"}:${dstr}:${time}`,
+        uid: ev.uid || "",
         title: ev.summary || "(No title)", date: dstr, time, endTime,
         allDay: !!ev.start.allDay || i > 0,
         spanDays: span, spanIndex: i, cont: i > 0,
+        location: ev.location || "",
+        notes: ev.description || "",
+        /* The calendar this came from, and the marker the client colours by.
+           Their absence is why every subscribed event drew grey and belonged to
+           nobody, whatever the household had assigned that calendar to. */
+        calName: parsed.calName || "",
+        source: "ics",
       });
     }
   };
