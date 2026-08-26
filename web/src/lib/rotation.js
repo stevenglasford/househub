@@ -22,6 +22,7 @@
 //     not the same as taking their place in the queue.
 
 import { completionOf, isCompletion } from "./completion.js";
+import { scheduledPerson, isPerPerson } from "./cadence.js";
 
 /** The rotation list, or [] for a chore with a fixed assignee. */
 export const rotationOf = (chore) =>
@@ -56,6 +57,15 @@ export function lastCompletion(chore, beforeKey) {
  *   3. with no history at all, the first person in the list is up
  */
 export function assigneeFor(chore, dateKey) {
+  /* A per-person schedule answers this outright: the day names the person, so
+     there is no turn to work out. Checked before the rotation because the two
+     would otherwise disagree, and the schedule is the thing people set on
+     purpose. */
+  if (isPerPerson(chore)) {
+    const scheduled = scheduledPerson(chore, dateKey);
+    if (scheduled) return scheduled;
+  }
+
   const rot = rotationOf(chore);
   if (!rot.length) return chore?.personId || "";
   if (rot.length === 1) return rot[0];

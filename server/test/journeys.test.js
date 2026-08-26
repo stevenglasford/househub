@@ -426,7 +426,8 @@ describe("a family with a child and a wall display", () => {
     const doc = await C.openDocument(home.hk, { ...got.body, ...ctx(home.id, got.body.version) });
 
     const next = COMPLETION.toggleChore(doc, "c-room", "2026-08-11",
-      { isDisplay: true, displayName: "Kitchen iPad" });
+      { isDisplay: true, displayName: "Kitchen iPad" },
+      { assigneeOf: (c) => c.personId });
 
     const put = await api("PUT", "/api/display/vault", {
       token: display.token,
@@ -441,7 +442,17 @@ describe("a family with a child and a wall display", () => {
     const entry = after.archive.chores.at(-1);
     assert.equal(entry.byType, "display");
     assert.equal(entry.source, "Kitchen iPad");
-    assert.equal(entry.by, "", "a screen cannot know who pressed it");
+
+    /* This assertion used to be `by === ""`, on the reasoning that a screen
+       cannot know who pressed it. True, and it left the row reading "Who did
+       it?" forever -- in a kitchen nobody goes back to answer a question the
+       wall is asking. The screen now assumes whoever's turn it was and records
+       that it IS an assumption, so the common case is right and the uncommon
+       one stays visible and one tap from being corrected. */
+    assert.equal(entry.by, "p-kid", "the screen credits whoever's turn it was");
+    const mark = COMPLETION.completionOf(
+      after.chores.find((c) => c.id === "c-room").done["2026-08-11"]);
+    assert.equal(mark.presumed, true, "and flags it as a guess, not a claim");
   });
 
   test("a parent attributes it to the child afterwards", async () => {

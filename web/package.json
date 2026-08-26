@@ -6,6 +6,7 @@
   "description": "HouseHub front-end — wall display, phone UI, and the end-to-end encryption layer",
   "scripts": {
     "dev": "vite",
+    "dev:sandbox": "vite --mode sandbox",
     "build": "vite build",
     "preview": "vite preview",
     "test": "node --test test/",

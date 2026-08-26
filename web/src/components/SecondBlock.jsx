@@ -14,11 +14,11 @@
 import React, { useState, useEffect, useCallback } from "react";
 import * as session from "../lib/session.js";
 import { suggestDateIdea } from "../lib/checkin.js";
-import { BLOCK_KINDS, PICKABLE, secondBlockFor } from "../lib/second-block.js";
+import { BLOCK_KINDS, PICKABLE, secondBlockFor, isInherited } from "../lib/second-block.js";
 
 /* The shape of this setting lives in lib/second-block.js so it can be tested
    without a DOM; re-exported here so existing importers are unaffected. */
-export { BLOCK_KINDS, PICKABLE, secondBlockFor } from "../lib/second-block.js";
+export { BLOCK_KINDS, PICKABLE, secondBlockFor, isInherited } from "../lib/second-block.js";
 
 /* --------------------------------------------------------------- blocks --- */
 
@@ -387,6 +387,11 @@ export function SecondBlockSettings({ data, update, theme: T, people }) {
           >
             {BLOCK_KINDS.map(([k, l]) => <option key={k} value={k}>{l}</option>)}
           </select>
+          {isInherited(data, id) && (
+            <span style={{ color: T.faint, fontSize: 11.5, width: "100%" }}>
+              Following Everyone. Pick something here to override it just for {label}.
+            </span>
+          )}
           {PICKABLE.includes(secondBlockFor(data, id).kind) && (
             <PickList
               kind={secondBlockFor(data, id).kind}

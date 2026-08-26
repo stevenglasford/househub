@@ -74,3 +74,33 @@ test("every document setting the app writes is carried by the merge", () => {
   assert.deepEqual(dropped, [],
     `these settings would be silently discarded on the next sync: ${dropped.join(", ")}`);
 });
+
+/* ------------------------------------------- the other half of the bug --- */
+
+test("REGRESSION: a person filter inherits the Everyone row", async () => {
+  /* Making the setting survive a save was necessary and not sufficient. Ryan
+     set the row under "Everyone", then filtered Today to a person — and it
+     vanished, because the lookup was per-filter with no fallback. That is the
+     rest of "you select one, but it doesn't actually display". */
+  const { secondBlockFor, isInherited } = await import("../src/lib/second-block.js");
+  const data = { secondBlock: { all: { kind: "devices", picks: ["light.hall"] } } };
+
+  assert.equal(secondBlockFor(data, "all").kind, "devices");
+  assert.equal(secondBlockFor(data, "p2").kind, "devices", "filtering to a person must not empty the row");
+  assert.deepEqual(secondBlockFor(data, "p2").picks, ["light.hall"], "including which devices");
+  assert.equal(isInherited(data, "p2"), true);
+});
+
+test("a per-person choice still overrides Everyone", async () => {
+  const { secondBlockFor, isInherited } = await import("../src/lib/second-block.js");
+  const data = { secondBlock: { all: { kind: "devices", picks: [] }, p2: { kind: "grocery", picks: [] } } };
+  assert.equal(secondBlockFor(data, "p2").kind, "grocery");
+  assert.equal(isInherited(data, "p2"), false);
+});
+
+test("choosing Nothing for one person is respected, not overridden", async () => {
+  // The fallback must fill a gap, never overrule a decision.
+  const { secondBlockFor } = await import("../src/lib/second-block.js");
+  const data = { secondBlock: { all: { kind: "devices", picks: [] }, p2: { kind: "none", picks: [] } } };
+  assert.equal(secondBlockFor(data, "p2").kind, "none");
+});
