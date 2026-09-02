@@ -38,10 +38,16 @@ A right only some people can exercise is not a right.
 ## Before opening a PR
 
 ```bash
-cd server && npm test          # 93 tests
-cd ../web && npm test          # 25 tests
+cd server && npm test          # 216 tests
+cd ../web && npm test          # 374 tests
 node security/pentest/run.js   # 91 probes, non-zero exit on HIGH+
 ```
+
+**Run the server suite on its own.** Those tests share state, so two of them
+running at once fail in bulk and for no reason either run can tell you about —
+a concurrent pair here reported 65 failures that a single run reported as zero.
+If you see a wall of server failures, check nothing else is running before
+believing any of it.
 
 The end-to-end suite asserts the architecture directly rather than testing
 handlers: that the database holds no plaintext, that a wrapped key cannot be
