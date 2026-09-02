@@ -261,3 +261,84 @@ test("a signed-in person's own tick is never a presumption", needs, async () => 
   assert.equal(rec.presumed, false);
   assert.equal(rec.locked, true, "it is a statement about themselves and it stands");
 });
+
+/* ------------------------------------------- who did a task --- */
+// Ryan: "on an overdue task, from Today. I can't change the person who did it
+// after i check it off."
+//
+// That was not a locking rule — there was nothing to correct. A completed task
+// stored `done` and `doneAt` and nothing about who did it, so the name on the
+// row was the *assignee*, and the picker was hard-coded off because there was
+// no record for it to edit. Tasks now carry the same completion record chores
+// do, which is what makes the same rules apply to both.
+
+test("ticking a task records who did it, not just when", needs, async () => {
+  const { markCompleted, canReattribute, reattribute, completedBy } =
+    await import("../src/lib/completion.js");
+
+  // A signed-in member's own tick: a first-person claim, and it stands.
+  const mine = markCompleted({ personId: "p1", userId: "u1" }, { fallbackPersonId: "p1" });
+  assert.equal(completedBy(mine), "p1");
+  assert.equal(mine.locked, true);
+  assert.equal(canReattribute(mine, { personId: "p1" }), false,
+    "nothing anonymous rewrites somebody's statement about themselves");
+
+  // A shared display: somebody's word for who was there, and correctable.
+  const wall = markCompleted({ isDisplay: true, displayName: "Kitchen wall" }, { fallbackPersonId: "p2" });
+  assert.equal(wall.byType, "display");
+  assert.equal(wall.presumed, true, "it names the likely person and flags the assumption");
+  assert.equal(canReattribute(wall, { isDisplay: true }), true);
+
+  const fixed = reattribute(wall, "p3", { isDisplay: true, displayName: "Kitchen wall" });
+  assert.equal(completedBy(fixed), "p3");
+  assert.equal(fixed.presumed, false, "once somebody has said, it is no longer an assumption");
+});
+
+test("a task with no doer recorded falls back to the assignee, not to nobody", needs, async () => {
+  // Every task completed before this existed has no `doneBy`. Showing a blank
+  // where a name used to be would read as data loss.
+  const { completedBy } = await import("../src/lib/completion.js");
+  const legacy = { id: "t1", title: "Post the form", done: true, doneAt: "2026-09-01", personId: "p2" };
+  assert.equal(completedBy(legacy.doneBy), "", "there is genuinely no doer on record");
+  const shown = completedBy(legacy.doneBy) || legacy.personId;
+  assert.equal(shown, "p2", "so the row shows who it was assigned to");
+});
+
+test("a tick from a session with nobody behind it can be corrected", needs, async () => {
+  // Ryan: "it was a chore and i'm not signed in in the sandbox. i cannot change
+  // who did it from Today for an overdue chore."
+  //
+  // `markCompleted` locked unconditionally on the non-display branch. Locking
+  // exists so that a statement somebody made ABOUT THEMSELVES stands — but an
+  // actor with no personId has no self to make one about. The completion was
+  // credited to the assignee, locked, and correctable by nobody.
+  //
+  // This is not sandbox-only: a real member whose account is not linked to
+  // anybody in the household takes the identical path.
+  const { markCompleted, canReattribute, completedBy } = await import("../src/lib/completion.js");
+
+  const nobody = markCompleted({ isDisplay: false, userId: null, personId: "" },
+    { fallbackPersonId: "p2" });
+  assert.equal(nobody.locked, false, "no self, so no first-person claim to protect");
+  assert.equal(completedBy(nobody), "p2", "still credited to whoever it was assigned to");
+  assert.equal(nobody.presumed, true, "and flagged as the assumption it is");
+  assert.equal(canReattribute(nobody, {}), true, "so it can be put right");
+
+  // The case locking actually exists for is untouched.
+  const mine = markCompleted({ isDisplay: false, userId: "u1", personId: "p1" },
+    { fallbackPersonId: "p1" });
+  assert.equal(mine.locked, true);
+  assert.equal(mine.presumed, false, "nothing presumed — they said so themselves");
+  assert.equal(canReattribute(mine, { personId: "p1" }), false);
+});
+
+test("every unlocked completion is correctable, whatever its byType", needs, async () => {
+  // canReattribute used to require one of an enumerated list of byTypes as well
+  // as being unlocked, so the flag and the list could disagree — and they did,
+  // leaving a correctable record with no way to correct it.
+  const { canReattribute } = await import("../src/lib/completion.js");
+  for (const byType of ["user", "display", "legacy", "onBehalf"]) {
+    assert.equal(canReattribute({ by: "p1", byType, locked: false }, {}), true, byType);
+    assert.equal(canReattribute({ by: "p1", byType, locked: true }, {}), false, byType + " (locked)");
+  }
+});

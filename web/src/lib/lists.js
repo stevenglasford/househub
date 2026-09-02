@@ -26,9 +26,76 @@ const nowStamp = (at) => (typeof at === "number" ? at : Date.now());
 
 export const LIST_ICONS = ["list", "cart", "plane", "home", "gift", "book", "tool", "heart"];
 
+/* ------------------------------------------------------- who did it --- */
+//
+// Ryan: "mark who made or started the list or added an item. If they're logged
+// in then just log it automatically, if they are on a display, then it should
+// prompt for who's entering it."
+//
+// This is the same problem chore attribution already solved, so it uses the
+// same rules rather than inventing a second set. From completion.js:
+//
+//   A signed-in member acting as themselves is a FIRST-PERSON CLAIM. It is
+//   recorded silently and locked -- nothing anonymous later gets to rewrite
+//   who added the milk.
+//
+//   A shared display has no signed-in person, so it has to ask. What it
+//   records is somebody's word for who was standing there, which is worth
+//   having and is NOT a first-person claim -- so it stays correctable.
+//
+// An entry with nobody attached is allowed and stays that way. A list that
+// predates this, or one added from a screen where nobody answered, should read
+// as "we do not know" rather than being quietly assigned to whoever is first
+// in the household.
+
+/**
+ * Who to record for an entry being made right now.
+ *
+ * @param actor { personId, isDisplay, displayName }
+ */
+export function attribute(actor = {}, at) {
+  const personId = String(actor.personId || "");
+  const isDisplay = Boolean(actor.isDisplay);
+  if (!personId && !isDisplay) return null;
+  return {
+    personId,
+    // "user" is somebody speaking for themselves; "display" is a screen
+    // reporting who said they were there.
+    type: isDisplay ? "display" : "user",
+    locked: !isDisplay && Boolean(personId),
+    source: isDisplay ? (actor.displayName || "a shared display") : null,
+    at: nowStamp(at),
+  };
+}
+
+/** Whether somebody may correct who this was recorded against. */
+export const canReattribute = (mark) => Boolean(mark) && !mark.locked;
+
+/**
+ * Correct who an entry is attributed to.
+ *
+ * Refuses on a locked mark rather than silently doing nothing, matching what
+ * completion.js does -- a refusal the caller can show beats a button that
+ * appears to work and does not.
+ */
+export function reattributed(mark, personId, actor = {}) {
+  if (mark && mark.locked) {
+    throw new Error("That was recorded by the person themselves, so it cannot be reassigned.");
+  }
+  return {
+    ...(mark || {}),
+    personId: String(personId || ""),
+    type: mark?.type || "display",
+    locked: false,
+    source: mark?.source || (actor.isDisplay ? (actor.displayName || "a shared display") : null),
+    at: mark?.at || nowStamp(),
+    correctedAt: nowStamp(),
+  };
+}
+
 /* ------------------------------------------------------------- the list --- */
 
-export function createList(title, { icon = "list", color = "", at } = {}) {
+export function createList(title, { icon = "list", color = "", at, by = null } = {}) {
   const text = String(title || "").trim();
   return {
     id: newId(),
@@ -38,6 +105,7 @@ export function createList(title, { icon = "list", color = "", at } = {}) {
     items: [],
     createdOn: nowStamp(at),
     updatedOn: nowStamp(at),
+    by,                      // who started it; null when nobody is known
   };
 }
 
@@ -54,11 +122,12 @@ const touch = (list, items, at) => ({ ...list, items, updatedOn: nowStamp(at) })
 
 /* ------------------------------------------------------------- the items --- */
 
-export function addItem(list, text, { at } = {}) {
+export function addItem(list, text, { at, by = null } = {}) {
   const t = String(text || "").trim();
   if (!t) return list;
   return touch(list, [...itemsOf(list), {
     id: newId(), text: t, done: false, note: "", doneAt: null, createdAt: nowStamp(at),
+    by,                    // who added it; null when nobody is known
   }], at);
 }
 
@@ -79,6 +148,12 @@ export function editItem(list, itemId, patch, { at } = {}) {
 
 export function removeItem(list, itemId, { at } = {}) {
   return touch(list, itemsOf(list).filter((i) => i.id !== itemId), at);
+}
+
+/** Correct who added an item. Throws on a member's own locked entry. */
+export function attributeItem(list, itemId, personId, actor = {}, { at } = {}) {
+  return touch(list, itemsOf(list).map((i) =>
+    i.id === itemId ? { ...i, by: reattributed(i.by, personId, actor) } : i), at);
 }
 
 /**
