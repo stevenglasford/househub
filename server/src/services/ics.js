@@ -143,6 +143,15 @@ function parseDT(value, param, tz, zones) {
 }
 const mkDate = (s) => new Date(s.y, s.mo - 1, s.d, s.h || 0, s.mi || 0);
 
+/** A UTC iCalendar stamp ("20260901T120000Z") as epoch ms, or 0. */
+export function icsInstant(value) {
+  const m = String(value || "").trim().match(/^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z?$/);
+  if (!m) return 0;
+  const [, y, mo, d, h, mi, sec] = m.map(Number);
+  const t = Date.UTC(y, mo - 1, d, h, mi, sec);
+  return Number.isFinite(t) ? t : 0;
+}
+
 export function parseICS(text, tz = DEFAULT_TZ) {
   // Read before the events, because a VEVENT may reference a zone the feed
   // defines further down.
@@ -176,6 +185,15 @@ export function parseICS(text, tz = DEFAULT_TZ) {
     else if (name === "DTSTART") cur.start = parseDT(value, param, tz, zones);
     else if (name === "DTEND") cur.end = parseDT(value, param, tz, zones);
     else if (name === "UID") cur.uid = value.trim();
+    /* When the far end says this event was written. CREATED is the truthful
+       answer and is often absent; DTSTAMP is always present and is close
+       enough, being the moment the feed was generated for a new event. Without
+       either, a subscribed event has no age at all and can never be shown as
+       new -- which is the honest outcome, not a reason to invent one. */
+    else if (name === "CREATED" || name === "DTSTAMP") {
+      const t = icsInstant(value);
+      if (t && (name === "CREATED" || !cur.addedAt)) cur.addedAt = t;
+    }
     else if (name === "STATUS") cur.status = value.trim().toUpperCase();
     // A moved or edited single occurrence of a series: this VEVENT replaces the
     // occurrence that would otherwise fall on RECURRENCE-ID's date.
@@ -230,6 +248,7 @@ export function expandEvents(parsed, winStart, winEnd, tz = DEFAULT_TZ) {
         title: ev.summary || "(No title)", date: dstr, time, endTime,
         allDay: !!ev.start.allDay || i > 0,
         spanDays: span, spanIndex: i, cont: i > 0,
+        addedAt: ev.addedAt || 0,
         location: ev.location || "",
         notes: ev.description || "",
         /* The calendar this came from, and the marker the client colours by.
