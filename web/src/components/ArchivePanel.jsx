@@ -1,7 +1,19 @@
 // ArchivePanel.jsx — the record of who actually did what.
 //
-// Two jobs. It shows the archive, and it is where an admin turns archiving on
-// and off — which are very different acts and are presented as such.
+// Two jobs, and they are now in two places, because they belong to two
+// different people at two different moments.
+//
+//   ArchiveRecord   the record itself. Lives in the To-Dos tab alongside
+//                   History and Report, which is where somebody goes when the
+//                   question is "who did what" -- they should not have to know
+//                   that part of the answer is filed under Settings.
+//
+//   ArchivePanel    the admin controls: what gets recorded, and the proposal
+//                   flow for turning it off. These stay in Settings, and
+//                   deliberately do NOT follow the record onto a tab a shared
+//                   display can reach. Turning the archive off destroys it
+//                   permanently, and a wall tablet in a hallway is not where
+//                   that decision should be one tap away.
 //
 // Turning it ON is one click. Turning it OFF destroys the record permanently, so
 // it needs every admin to agree first (routes/proposals.js). That asymmetry is
@@ -174,15 +186,73 @@ export default function ArchivePanel({ theme: T, data, update, me }) {
         );
       })}
 
-      {/* ---- the record ---- */}
+      {/* The record now lives in To-Dos → History → Archive, which is where
+          somebody goes when the question is "who did what". Repeating all of it
+          here would give the household two places to read the same thing and
+          two places to keep in step. */}
       <h4 style={{ fontWeight: 700, margin: "18px 0 8px", color: T.ink }}>
-        Completed chores ({entries.length})
+        The record ({(data.archive?.chores || []).length})
       </h4>
+      <p style={{ color: T.faint, fontSize: 13 }}>
+        Kept completions are shown in <strong style={{ color: T.ink }}>To-Dos → History → Archive</strong>,
+        alongside the rest of the history, where they can also be reattributed.
+      </p>
 
-      {!settings.chores && !entries.length && (
+    </div>
+  );
+}
+
+/**
+ * The archive itself: every recorded completion, with who did it.
+ *
+ * Split out so the To-Dos tab can show it without also showing the controls
+ * that can destroy it. Takes no `me` and no proposal machinery — it reads.
+ */
+export function ArchiveRecord({ theme: T, data, update, showEmptyHint = true }) {
+  const [filter, setFilter] = useState("all");
+  const [error, setError] = useState(null);
+
+  const settings = data.archiveSettings || {};
+  const entries = useMemo(
+    () => [...(data.archive?.chores || [])].sort((a, b) => (b.completedAt || b.at) - (a.completedAt || a.at)),
+    [data.archive]
+  );
+  const personById = useCallback(
+    (id) => (data.people || []).find((p) => p.id === id) || null,
+    [data.people]
+  );
+  const card = {
+    background: T.panel, border: `1px solid ${T.line}`, borderRadius: 10,
+    padding: "10px 12px", marginBottom: 8,
+  };
+
+  /* Correcting who a completion is credited to. Goes through
+     C.attributeChore, which refuses on a signed-in member's own locked claim —
+     so this cannot quietly rewrite a first-person record. */
+  const attribute = (entry, personId) => {
+    setError(null);
+    try {
+      update((d) => C.attributeChore(d, entry.choreId, entry.dateKey, personId, session.currentActor(d)));
+    } catch (e) {
+      setError(e?.message || "That could not be reassigned.");
+    }
+  };
+
+  const shown = filter === "all" ? entries : entries.filter((e) => e.by === filter);
+
+  return (
+    <div>
+      {error && (
+        <div role="alert" style={{ ...card, background: "#fdecea", borderColor: "#f0b4ae", color: "#7a1c12" }}>
+          {error}
+        </div>
+      )}
+
+      {showEmptyHint && !settings.chores && !entries.length && (
         <p style={{ color: T.faint, fontSize: 13 }}>
-          Nothing is being recorded yet. Turn the chores archive on above and completions
-          will start being kept, along with who ticked each one off.
+          Nothing is being recorded yet. Turn the chores archive on in
+          Settings → Archive and completions will start being kept, along with
+          who ticked each one off.
         </p>
       )}
 
@@ -191,6 +261,7 @@ export default function ArchivePanel({ theme: T, data, update, me }) {
           <select
             value={filter}
             onChange={(e) => setFilter(e.target.value)}
+            aria-label="Filter the archive by person"
             style={{ background: T.panel, color: T.ink, border: `1px solid ${T.line}`, borderRadius: 8, padding: "6px 8px" }}
           >
             <option value="all">Everyone</option>
@@ -201,7 +272,6 @@ export default function ArchivePanel({ theme: T, data, update, me }) {
       )}
 
       {shown.slice(0, 300).map((e) => {
-        const doer = personById(e.by);
         const assignee = personById(e.assignedTo);
         // The interesting case, and the reason both are stored: somebody did a
         // chore that was not theirs.
@@ -225,7 +295,7 @@ export default function ArchivePanel({ theme: T, data, update, me }) {
                 </div>
               </div>
 
-              {editable && (
+              {editable ? (
                 <select
                   value={e.by || ""}
                   onChange={(ev) => attribute(e, ev.target.value)}
@@ -235,8 +305,7 @@ export default function ArchivePanel({ theme: T, data, update, me }) {
                   <option value="">Not attributed</option>
                   {(data.people || []).map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
                 </select>
-              )}
-              {!editable && (
+              ) : (
                 <span style={{ color: T.faint, fontSize: 12, alignSelf: "center" }} title="Recorded while signed in — cannot be reassigned">
                   signed in ✓
                 </span>
@@ -252,3 +321,4 @@ export default function ArchivePanel({ theme: T, data, update, me }) {
     </div>
   );
 }
+

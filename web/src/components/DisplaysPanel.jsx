@@ -33,7 +33,7 @@ const SCOPES = [
   ["projects", "Projects", "House projects"],
   ["notes", "Notes", "Sticky notes"],
   ["countdowns", "Countdowns", "Dates being counted down to"],
-  ["agenda", "Agenda", "Things to talk about tonight"],
+  ["agenda", "Together", "Things to talk about tonight"],
   ["weather", "Weather", "Forecast"],
   ["home", "Home", "Cameras, lights and sensors"],
   ["checkin", "Check-in", "The nightly walkthrough"],
