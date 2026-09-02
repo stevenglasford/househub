@@ -7,7 +7,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildSeries, splitRuns, trend, scoreOf, gapDaysFor } from "../src/lib/status.js";
+import { buildSeries, splitRuns, trend, scoreOf, gapDaysFor, axisTicks } from "../src/lib/status.js";
 
 const pad = (n) => String(n).padStart(2, "0");
 const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -140,4 +140,56 @@ test("a rise is reported as a rise", () => {
   const t = trend(points);
   assert.equal(t.direction, "up");
   assert.match(t.label, /up \d\.\d/);
+});
+
+/* ------------------------------------------------------------ axis dates --- */
+// Ryan: "make it so that the 'agenda' has dates associated with the history on
+// the bottom of the graph so we can tell what day was what."
+//
+// The graph reserved a band at the bottom and drew nothing in it, so the shape
+// of a fortnight was readable and which fortnight was not.
+
+test("a week is labelled by weekday, every day", () => {
+  const ticks = axisTicks("2026-09-01", 7); // a Tuesday
+  assert.equal(ticks.length, 7, "a week is short enough to label every day");
+  assert.equal(ticks[0].label, "Wed", "seven days back from Tuesday is a Wednesday");
+  assert.equal(ticks[ticks.length - 1].label, "today");
+});
+
+test("a month is labelled by date, thinned out", () => {
+  const ticks = axisTicks("2026-09-01", 30);
+  assert.ok(ticks.length <= 8, `expected a readable number of ticks, got ${ticks.length}`);
+  assert.match(ticks[0].label, /^\d{1,2} [A-Z][a-z]{2}$/, "e.g. '7 Aug'");
+  assert.equal(ticks[ticks.length - 1].label, "today");
+});
+
+test("a long window is labelled by month, at the boundaries", () => {
+  // An evenly spaced "23 Jul" is a date nobody navigates by. Month starts are.
+  const ticks = axisTicks("2026-09-01", 90);
+  assert.deepEqual(ticks.map((t) => t.label), ["Jun", "Jul", "Aug", "today"]);
+});
+
+test("today is always labelled, and never doubled up", () => {
+  for (const days of [7, 14, 30, 60, 90, 180]) {
+    const ticks = axisTicks("2026-09-01", days);
+    const todays = ticks.filter((t) => t.label === "today");
+    assert.equal(todays.length, 1, `${days}-day window should label today exactly once`);
+    assert.equal(todays[0].x, days - 1, "and at the right-hand end, where today is");
+
+    const xs = ticks.map((t) => t.x);
+    assert.deepEqual([...xs].sort((a, b) => a - b), xs, `${days}: ticks must run left to right`);
+    assert.equal(new Set(xs).size, xs.length, `${days}: no two ticks share a position`);
+  }
+});
+
+test("ticks stay inside the plotted window", () => {
+  const days = 30;
+  for (const t of axisTicks("2026-09-01", days)) {
+    assert.ok(t.x >= 0 && t.x <= days - 1, `tick at ${t.x} is outside 0..${days - 1}`);
+  }
+});
+
+test("a nonsense window produces no labels rather than throwing", () => {
+  assert.deepEqual(axisTicks("", 30), []);
+  assert.deepEqual(axisTicks("2026-09-01", 0), []);
 });

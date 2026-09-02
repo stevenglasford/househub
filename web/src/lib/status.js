@@ -61,6 +61,68 @@ export function scoreOf(entry, dimension) {
   return values.reduce((a, b) => a + b, 0) / values.length;
 }
 
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+
+/**
+ * Labels for the x-axis, as { x, label } in the same day-index space the series
+ * uses.
+ *
+ * The graph reserved room at the bottom for these and then drew nothing there,
+ * so the shape of a fortnight was readable and *which* fortnight was not. That
+ * is most of the value of the graph gone: "we dipped" is only useful next to
+ * "that was the week your mother stayed".
+ *
+ * Density is chosen by window rather than fixed, because the same number of
+ * ticks that reads well across a week is an unreadable smear across three
+ * months:
+ *
+ *   a week      every day, by weekday -- "Mon", "Tue"
+ *   a month     roughly weekly, by date -- "12 Aug"
+ *   longer      the first of each month -- "Aug", "Sep"
+ *
+ * Today is always labelled. It is the one date a reader is certain to want to
+ * find, and without it the right-hand end of the line is unanchored.
+ */
+export function axisTicks(todayKey, days, { maxTicks = 7 } = {}) {
+  const [y, m, d] = String(todayKey).split("-").map(Number);
+  if (!y || !m || !d || !(days > 0)) return [];
+  const end = new Date(y, m - 1, d);
+  const dateAt = (x) => addDays(end, -(days - 1 - x));
+
+  const out = [];
+  const push = (x, label) => { if (x >= 0 && x <= days - 1) out.push({ x, label }); };
+
+  if (days <= 7) {
+    for (let x = 0; x < days; x++) push(x, WEEKDAYS[dateAt(x).getDay()]);
+  } else if (days <= 45) {
+    const step = Math.max(1, Math.ceil(days / maxTicks));
+    for (let x = days - 1; x >= 0; x -= step) {
+      const dt = dateAt(x);
+      push(x, `${dt.getDate()} ${MONTHS[dt.getMonth()]}`);
+    }
+    out.reverse();
+  } else {
+    // Month boundaries, which are the landmarks people actually navigate by
+    // over a long window -- an evenly spaced "23 Jul" means nothing to anybody.
+    let lastMonth = -1;
+    for (let x = 0; x < days; x++) {
+      const dt = dateAt(x);
+      if (dt.getMonth() !== lastMonth) { push(x, MONTHS[dt.getMonth()]); lastMonth = dt.getMonth(); }
+    }
+  }
+
+  // Today, always, and never doubled up on a tick already there.
+  const todayX = days - 1;
+  const crowded = out.some((t) => Math.abs(t.x - todayX) < Math.max(1, days / 14));
+  if (crowded) {
+    while (out.length && Math.abs(out[out.length - 1].x - todayX) < Math.max(1, days / 14)) out.pop();
+  }
+  push(todayX, "today");
+
+  return out;
+}
+
 /**
  * Split a series into runs, so a stretch with no check-ins becomes a gap in the
  * line rather than a confident straight segment drawn across it.
