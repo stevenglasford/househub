@@ -90,6 +90,11 @@ two of them would only drift apart.
 
 `config/custom_sentences/en/househub.yaml`:
 
+Each block sets a static `action` slot, and that is load-bearing rather than
+decoration: `intent_script` renders its templates with **only the slots** in
+scope, so there is no variable anywhere holding the sentence that was actually
+said. The verb has to be carried as a slot or it is simply lost.
+
 ```yaml
 language: en
 intents:
@@ -97,8 +102,16 @@ intents:
     data:
       - sentences:
           - "(set|start) a timer {phrase}"
+        slots:
+          action: "set a timer"
+      - sentences:
           - "timer {phrase}"
+        slots:
+          action: "timer"
+      - sentences:
           - "(stop|cancel|silence) {phrase}"
+        slots:
+          action: "stop"
 lists:
   phrase:
     wildcard: true
@@ -113,7 +126,7 @@ intent_script:
       - event: househub_voice
         event_data:
           # the whole sentence, for HouseHub's own parser
-          text: "{{ trigger_sentence | default('set a timer ' ~ phrase) }}"
+          text: "{{ action }} {{ phrase }}"
           # optional: name the screen that should act. Leave it out and every
           # listening screen acts, which is what you want with one wall tablet.
           display: "Kitchen wall"
@@ -125,11 +138,23 @@ Restart Home Assistant, then check it with **Developer tools → Events → List
 to events → `househub_voice`** and say the phrase at a satellite. If the event
 shows up with your words in `text`, Home Assistant's half is done.
 
-> Written against Home Assistant's current custom-sentence syntax and **not
-> tested on your instance** — there is no Home Assistant on the machine this was
-> written on. If the wildcard does not come through as expected, the thing to
-> check is what `Developer tools → Events` actually shows in `event_data`; the
-> HouseHub side reads `text`, `command` or `transcript`, whichever is present.
+> **Tested against Home Assistant 2026.8.1.** The config above validates with
+> `check_config`, loads without error, and `custom_sentences/en/` is the
+> directory that release actually reads (it commits to one language variant, and
+> resolves `en` to `en`). What is *not* yet tested is a real satellite: the
+> sentence matching was exercised with hassil directly rather than by speaking.
+>
+> An earlier draft of this page used
+> `text: "{{ trigger_sentence | default('set a timer ' ~ phrase) }}"`. There is
+> no `trigger_sentence` variable in Home Assistant — `intent_script` renders with
+> only the slots — so the default fired every time and every stop phrase arrived
+> with its verb replaced: "cancel the pasta timer" reached HouseHub as
+> "set a timer the pasta timer", which `parseStopCommand` rejects. The timer
+> never stopped and nothing was logged. Hence the `action` slot.
+>
+> If a phrase does not come through as expected, check what
+> `Developer tools → Events` shows in `event_data`; the HouseHub side reads
+> `text`, `command` or `transcript`, whichever is present.
 
 ## 4. Turn it on for a screen
 
