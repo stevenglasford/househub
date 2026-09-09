@@ -86,6 +86,11 @@ export function mergeDocuments(mine, theirs) {
   const LISTS = [
     "people", "events", "chores", "tasks", "projects", "grocery", "notes",
     "dates", "agenda", "agendaArchive", "agendaPrompts", "dateJars", "dateIdeas",
+    /* Timers merge by id like any other row. They need no special case
+       because nothing about their state is a flag somebody writes: two
+       screens editing the same timer both write timestamps, and the later
+       write is the one that happened later, which is the right answer. */
+    "timers",
   ];
   for (const key of LISTS) {
     const a = Array.isArray(mine[key]) ? mine[key] : [];
@@ -100,7 +105,10 @@ export function mergeDocuments(mine, theirs) {
   }
 
   // Date-keyed maps merge per date, then per slot.
-  for (const key of ["meals", "status", "groceryHistory"]) {
+  /* seenCalendar merges per person, not wholesale: two people looking at the
+     calendar on two devices at the same moment must not overwrite each other's
+     mark, which is what a scalar merge would do. */
+  for (const key of ["meals", "status", "groceryHistory", "seenCalendar"]) {
     out[key] = { ...(theirs[key] || {}), ...(mine[key] || {}) };
   }
 
@@ -122,6 +130,32 @@ export function mergeDocuments(mine, theirs) {
 }
 
 /* ------------------------------------------------------------- calendars --- */
+
+/* ------------------------------------------------------------ voice --- */
+
+/**
+ * Where this household's Home Assistant is, and a token to subscribe to it.
+ *
+ * Handed to the client rather than proxied, because proxying is exactly what
+ * this must not do: a spoken command relayed through this server would be the
+ * household's own words in the clear on the one machine the design keeps them
+ * off. The display talks to Home Assistant directly instead. See
+ * lib/ha-voice.js and docs/VOICE.md.
+ *
+ * Resolves to null rather than throwing when the server does not implement it
+ * -- a household on an older server simply has no wake-word voice, and should
+ * not see an error about a feature nobody told them about.
+ */
+export async function loadVoiceLink() {
+  const path = session.isDisplay()
+    ? "api/display/home/voice"
+    : `api/households/${session.householdId()}/home/voice`;
+  try {
+    return await session.request("GET", path);
+  } catch (e) {
+    return null;
+  }
+}
 
 export const loadCalendarEvents = () =>
   session.isDisplay()

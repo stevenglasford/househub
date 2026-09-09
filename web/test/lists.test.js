@@ -143,3 +143,81 @@ test("escaping covers backslash, comma, semicolon and newline", () => {
   assert.equal(L.escapeICS("a\nb"), `a${B}nb`);
   assert.equal(L.escapeICS(`a${B}b`), `a${B}${B}b`);
 });
+
+/* ---------------------------------------------------------- attribution --- */
+// Ryan: "mark who made or started the list or added an item. If they're logged
+// in then just log it automatically, if they are on a display, then it should
+// prompt for who's entering it."
+//
+// The rules are deliberately the same as chore attribution's, so the two do not
+// drift into meaning different things by the word "who".
+
+test("a signed-in member's entry is recorded silently, and locked", () => {
+  const mark = L.attribute({ personId: "p1" }, 1000);
+  assert.equal(mark.personId, "p1");
+  assert.equal(mark.type, "user");
+  assert.equal(mark.locked, true, "a first-person claim is not up for reassignment");
+  assert.equal(mark.source, null);
+  assert.equal(L.canReattribute(mark), false);
+});
+
+test("a display's entry says who was named, and stays correctable", () => {
+  const mark = L.attribute({ personId: "p2", isDisplay: true, displayName: "Kitchen wall" }, 1000);
+  assert.equal(mark.personId, "p2");
+  assert.equal(mark.type, "display");
+  assert.equal(mark.locked, false, "a screen reports somebody's word, not their own claim");
+  assert.equal(mark.source, "Kitchen wall", "and the record says which screen");
+  assert.equal(L.canReattribute(mark), true);
+});
+
+test("nobody known is recorded as nobody, not as a guess", () => {
+  // A list predating this, or an entry from a screen where nobody answered,
+  // has to read as "we do not know" rather than being quietly assigned to
+  // whoever happens to be first in the household.
+  assert.equal(L.attribute({}), null);
+  assert.equal(L.attribute({ personId: "" }), null);
+  assert.equal(L.canReattribute(null), false);
+});
+
+test("a list and an item both carry who made them", () => {
+  const me = L.attribute({ personId: "p1" }, 1000);
+  const list = L.createList("Packing", { by: me, at: 1000 });
+  assert.equal(list.by.personId, "p1");
+
+  const them = L.attribute({ personId: "p2", isDisplay: true, displayName: "Kitchen wall" }, 2000);
+  const withItem = L.addItem(list, "Passports", { by: them, at: 2000 });
+  assert.equal(L.itemsOf(withItem)[0].by.personId, "p2");
+  assert.equal(withItem.by.personId, "p1", "and the list still belongs to whoever started it");
+});
+
+test("existing lists and items are untouched", () => {
+  // Everything written before this feature has no `by` at all, and must not
+  // start claiming somebody.
+  const list = L.createList("Old list", { at: 1000 });
+  assert.equal(list.by, null);
+  const withItem = L.addItem(list, "Milk", { at: 1000 });
+  assert.equal(L.itemsOf(withItem)[0].by, null);
+});
+
+test("a display's entry can be corrected afterwards", () => {
+  const list = L.addItem(L.createList("Shopping", { at: 1 }), "Milk", {
+    by: L.attribute({ personId: "p2", isDisplay: true, displayName: "Kitchen wall" }, 1), at: 1,
+  });
+  const itemId = L.itemsOf(list)[0].id;
+
+  const fixed = L.attributeItem(list, itemId, "p3", { isDisplay: true, displayName: "Kitchen wall" });
+  const item = L.itemsOf(fixed)[0];
+  assert.equal(item.by.personId, "p3");
+  assert.equal(item.by.source, "Kitchen wall", "the record still says it came off a screen");
+  assert.ok(item.by.correctedAt, "and that it was corrected later");
+});
+
+test("a member's own entry refuses to be reassigned", () => {
+  // Refusing loudly rather than doing nothing: App's `update` catches and shows
+  // the reason, and a button that silently fails is the worse outcome.
+  const list = L.addItem(L.createList("Shopping", { at: 1 }), "Milk", {
+    by: L.attribute({ personId: "p1" }, 1), at: 1,
+  });
+  const itemId = L.itemsOf(list)[0].id;
+  assert.throws(() => L.attributeItem(list, itemId, "p9", { isDisplay: true }), /cannot be reassigned/);
+});

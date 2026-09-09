@@ -9,7 +9,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { parseICS, expandEvents, zoneOffsetMinutes, isValidTimeZone } from "../src/services/ics.js";
+import { parseICS, expandEvents, zoneOffsetMinutes, isValidTimeZone, icsInstant } from "../src/services/ics.js";
 
 const CHI = "America/Chicago";
 const WIN = [new Date(2026, 7, 1), new Date(2026, 7, 31)];
@@ -125,4 +125,59 @@ test("malformed input yields no events rather than throwing", () => {
     assert.doesNotThrow(() => expandEvents(parseICS(junk, CHI), WIN[0], WIN[1], CHI));
   }
   assert.equal(run(vevent(["UID:bad", "SUMMARY:No start"])).length, 0);
+});
+
+/* --------------------------------------------------------- added when? --- */
+// So the client can show "what has been added since you last looked"
+// (web/src/lib/new-events.js). A subscribed event with no age at all can never
+// be shown as new, which is the honest outcome rather than a reason to guess.
+
+test("an event carries when the feed says it was written", () => {
+  const ics = [
+    "BEGIN:VCALENDAR",
+    "BEGIN:VEVENT",
+    "UID:a1",
+    "DTSTAMP:20260901T090000Z",
+    "CREATED:20260830T140000Z",
+    "SUMMARY:Dentist",
+    "DTSTART:20260905T090000Z",
+    "DTEND:20260905T093000Z",
+    "END:VEVENT",
+    "END:VCALENDAR",
+  ].join("\r\n");
+
+  const parsed = parseICS(ics, "UTC");
+  const out = expandEvents(parsed, new Date(2026, 8, 1), new Date(2026, 8, 30), "UTC");
+  assert.equal(out.length, 1);
+  assert.equal(out[0].addedAt, Date.UTC(2026, 7, 30, 14, 0, 0),
+    "CREATED is the truthful answer and wins over DTSTAMP");
+});
+
+test("DTSTAMP stands in when CREATED is absent", () => {
+  const ics = [
+    "BEGIN:VCALENDAR", "BEGIN:VEVENT", "UID:a2",
+    "DTSTAMP:20260901T090000Z", "SUMMARY:Standup",
+    "DTSTART:20260905T090000Z", "DTEND:20260905T091500Z",
+    "END:VEVENT", "END:VCALENDAR",
+  ].join("\r\n");
+
+  const out = expandEvents(parseICS(ics, "UTC"), new Date(2026, 8, 1), new Date(2026, 8, 30), "UTC");
+  assert.equal(out[0].addedAt, Date.UTC(2026, 8, 1, 9, 0, 0));
+});
+
+test("an event with neither has no age, and says so", () => {
+  const ics = [
+    "BEGIN:VCALENDAR", "BEGIN:VEVENT", "UID:a3", "SUMMARY:Old thing",
+    "DTSTART:20260905T090000Z", "DTEND:20260905T093000Z",
+    "END:VEVENT", "END:VCALENDAR",
+  ].join("\r\n");
+
+  const out = expandEvents(parseICS(ics, "UTC"), new Date(2026, 8, 1), new Date(2026, 8, 30), "UTC");
+  assert.equal(out[0].addedAt, 0, "zero, not now — guessing would mark it new forever");
+});
+
+test("a malformed stamp is not a date", () => {
+  assert.equal(icsInstant("not a date"), 0);
+  assert.equal(icsInstant(""), 0);
+  assert.equal(icsInstant("20260901"), 0, "a bare date is not an instant");
 });

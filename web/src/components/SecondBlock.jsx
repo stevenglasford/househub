@@ -156,7 +156,7 @@ function BlockDateJar({ data, update, T }) {
       {!drawn && !suggestion && !ideas.length && (
         <p style={{ color: T.faint, fontSize: 13 }}>
           This jar is empty. Press <strong>Suggest one</strong> for an idea, or add your own
-          under Agenda → Date jar.
+          under Together → Date jar.
         </p>
       )}
     </div>

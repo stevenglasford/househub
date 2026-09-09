@@ -95,14 +95,30 @@ export function markCompleted(actor, { fallbackPersonId = "" } = {}) {
       locked: false,
     };
   }
+  /* A completion is locked when, and only when, somebody was making a statement
+     ABOUT THEMSELVES. That is the entire justification for it standing: you do
+     not get to rewrite what a person said they did.
+     
+     `locked: true` used to be unconditional here, which quietly extended that
+     protection to a case it does not describe. An actor with no `personId` --
+     a session whose account is not linked to anybody in the household, and the
+     dev sandbox -- has no self to make a claim about. The record was credited
+     to whoever the chore was assigned to, locked, and could not be corrected by
+     anyone: the reported "I can't change who did it, and I'm not signed in".
+     
+     Note `actorUserId` is null on exactly those records, so the data always
+     said no identified person stood behind them; only the flag disagreed. */
+  const claimant = actor?.personId || "";
   return {
-    by: actor?.personId || fallbackPersonId || "",
+    by: claimant || fallbackPersonId || "",
+    // Credited to the assignee because nobody said otherwise -- the same
+    // assumption a shared display makes, and flagged the same way.
+    presumed: !claimant && Boolean(fallbackPersonId),
     actorUserId: actor?.userId || null,
     byType: "user",
     source: null,
     at: Date.now(),
-    // A signed-in completion is a statement about yourself. It stands.
-    locked: true,
+    locked: Boolean(claimant),
   };
 }
 
@@ -154,7 +170,13 @@ export function canUncheck(mark, actor) {
 export function canReattribute(mark, actor) {
   const c = completionOf(mark);
   if (!c) return false;
-  return !c.locked && (c.byType === "display" || c.byType === "legacy" || c.byType === "onBehalf");
+  /* Unlocked is the whole test. It used to also require one of a list of
+     byTypes, which excluded an unlocked `user` record -- a shape that could not
+     previously exist and now can: a tick from a session with nobody behind it.
+     Enumerating the allowed types alongside the flag meant the two could
+     disagree, and here they did, leaving a correctable record with no way to
+     correct it. */
+  return !c.locked;
 }
 
 export function reattribute(mark, personId, actor) {

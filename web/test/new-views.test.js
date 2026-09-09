@@ -267,7 +267,12 @@ test("the board shows note history once notes have come down", needs, async () =
 
 test("the chore editor offers weekly by name, and per-person days", needs, async () => {
   /* "Weekly" existed as "Certain days", which is why it was reported missing.
-     Per-person only appears once there is a rotation to divide up. */
+     
+     Per-person days USED to appear only once there was a rotation to divide up.
+     That gating is gone, at Ryan's request: "choosing the day of the week to do
+     it should be an option for any chore, not just those that you take turns
+     on." It also left a per-person chore that had no rotation renderable on
+     Today and impossible to edit — its schedule simply invisible. */
   const { ChoreModal } = await load("src/App.jsx", ["ChoreModal"]);
   const React = (await import("react")).default;
   const { renderToStaticMarkup } = await import("react-dom/server");
@@ -279,8 +284,8 @@ test("the chore editor offers weekly by name, and per-person days", needs, async
   }));
   assert.match(solo, /Weekly/);
   assert.doesNotMatch(solo, /Certain days/);
-  assert.doesNotMatch(solo, /Each person's own day|Each person&#x27;s own day/,
-    "with no rotation there is nothing to divide");
+  assert.match(solo, /Each person's own day|Each person&#x27;s own day/,
+    "offered without a rotation — a household of one still gets to say Thursdays are theirs");
 
   const rotating = renderToStaticMarkup(React.createElement(ChoreModal, {
     payload: { id: "c2", title: "Bins", rotation: ["p1", "p2"],
@@ -291,6 +296,46 @@ test("the chore editor offers weekly by name, and per-person days", needs, async
   assert.match(rotating, /Who does it, and when/);
   assert.match(rotating, /Steven/);
   assert.match(rotating, /Alex/);
+});
+
+test("weekly can repeat every other week, and monthly can pick a weekday", needs, async () => {
+  // Ryan: "there should also be a way so that we could say to do it every other
+  // week or monthly, but we get to choose the day (monday through sunday)".
+  const { ChoreModal } = await load("src/App.jsx", ["ChoreModal"]);
+  const React = (await import("react")).default;
+  const { renderToStaticMarkup } = await import("react-dom/server");
+  const people = [{ id: "p1", name: "Steven", color: "#111" }];
+
+  const weekly = renderToStaticMarkup(React.createElement(ChoreModal, {
+    payload: { id: "c1", title: "Bins", cadence: { type: "weekly", days: [2], everyNWeeks: 2 } },
+    people, update: () => {}, close: () => {},
+  }));
+  assert.match(weekly, /Every other/, "the every-other-week control is on the weekly editor");
+  assert.match(weekly, /Counting from the week of/, "and says which week it counts from");
+
+  const monthlyDay = renderToStaticMarkup(React.createElement(ChoreModal, {
+    payload: { id: "c2", title: "Bins", cadence: { type: "monthlyDay", dow: 1, nth: 1 } },
+    people, update: () => {}, close: () => {},
+  }));
+  assert.match(monthlyDay, /Which weekday of the month/);
+  assert.match(monthlyDay, /Last/, "including the last one of the month");
+  assert.match(monthlyDay, /Monthly, the 1st Mon/, "and it reads back in words");
+});
+
+test("a chore can be paused for a season", needs, async () => {
+  const { ChoreModal } = await load("src/App.jsx", ["ChoreModal"]);
+  const React = (await import("react")).default;
+  const { renderToStaticMarkup } = await import("react-dom/server");
+
+  const paused = renderToStaticMarkup(React.createElement(ChoreModal, {
+    payload: { id: "c3", title: "Mow the lawn", cadence: { type: "weekly", days: [6] },
+               pause: { from: "2026-11-01", until: "2027-03-31", annual: true, paused: true } },
+    people: [{ id: "p1", name: "Steven", color: "#111" }], update: () => {}, close: () => {},
+  }));
+  assert.match(paused, /Paused each year/);
+  assert.match(paused, /Every year — seasonal|Every year/);
+  assert.match(paused, /will not come due or go overdue/,
+    "the reason it is a pause and not a standing skip");
 });
 
 test("the occurrence sheet offers a schedule reset only where it means something", needs, async () => {
@@ -314,4 +359,120 @@ test("the occurrence sheet offers a schedule reset only where it means something
   assert.doesNotMatch(weekly, /restart the schedule/,
     "a weekly chore has no anchor to move, so the control would do nothing");
   assert.match(weekly, /Every Mon/);
+});
+
+test("the day sheet can move one occurrence, and says how often it really comes round", needs, async () => {
+  // Ryan: "there should be a 'reschedule this occurrence' of a chore if we want
+  // or need to push it to another day that week" and "we want to see the amount
+  // of time between when different chores have been completed".
+  const { ChoreDayModal } = await load("src/App.jsx", ["ChoreDayModal"]);
+  const React = (await import("react")).default;
+  const { renderToStaticMarkup } = await import("react-dom/server");
+
+  const feeder = {
+    id: "cat", title: "Fill the cat feeder",
+    cadence: { type: "interval", everyN: 4, start: "2026-08-01" },
+    done: {
+      "2026-08-01": { by: "p1", at: 1, byType: "user" },
+      "2026-08-04": { by: "p1", at: 1, byType: "user" },
+      "2026-08-06": { by: "p1", at: 1, byType: "user" },
+      "2026-08-09": { by: "p1", at: 1, byType: "user" },
+      "2026-08-11": { by: "p1", at: 1, byType: "user" },
+    },
+  };
+  const args = {
+    chore: feeder, dateKey: "2026-09-01",
+    people: [{ id: "p1", name: "Steven", color: "#111" }],
+    personById: (id) => (id === "p1" ? { id, name: "Steven", color: "#111" } : null),
+    update: () => {}, close: () => {}, openChore: () => {},
+  };
+
+  const html = renderToStaticMarkup(React.createElement(ChoreDayModal, args));
+
+  assert.match(html, /Move this one/, "an outstanding occurrence can be pushed");
+  assert.match(html, /the schedule itself does not change/,
+    "and it is clear that this is one occurrence, not the cadence");
+
+  assert.match(html, /How often, in practice/);
+  assert.match(html, /usually every 2.5 days/, "the cat feeder question, answered");
+  assert.match(html, /Set to every 4 days/, "and the schedule is checked against it");
+});
+
+test("a finished occurrence cannot be moved", needs, async () => {
+  // Moving something already done would be rewriting history, not planning.
+  const { ChoreDayModal } = await load("src/App.jsx", ["ChoreDayModal"]);
+  const React = (await import("react")).default;
+  const { renderToStaticMarkup } = await import("react-dom/server");
+
+  const html = renderToStaticMarkup(React.createElement(ChoreDayModal, {
+    chore: { id: "c1", title: "Bins", cadence: { type: "weekly", days: [2] },
+             done: { "2026-09-01": { by: "p1", at: 1, byType: "user" } } },
+    dateKey: "2026-09-01",
+    people: [{ id: "p1", name: "Steven", color: "#111" }],
+    personById: (id) => (id === "p1" ? { id, name: "Steven", color: "#111" } : null),
+    update: () => {}, close: () => {}, openChore: () => {},
+  }));
+  assert.doesNotMatch(html, /Move this one/);
+});
+
+test("Today shows what was finished, and a display can correct who did it", needs, async () => {
+  /* Ryan: "any todo or chore on the today screen, overdue or not, needs to be
+     reflected on that day and also you need to be able to say who did it (if
+     it's not the person who was assigned) while on display mode."
+     
+     Both halves in one test, because they are one screen: an overdue chore is
+     completed under TODAY (not under the day it was owed), so if `choreState`
+     drops it for not being due today, there is nothing for the picker to be
+     attached to and the second half cannot be tested at all. */
+  const { TodayView } = await load("src/App.jsx", ["TodayView"]);
+  const React = (await import("react")).default;
+  const { renderToStaticMarkup } = await import("react-dom/server");
+
+  const TODAY = "2026-09-02";                 // a Wednesday
+  const people = [
+    { id: "p1", name: "Ryan", color: "#2f6f4f" },
+    { id: "p2", name: "Alex", color: "#8a4326" },
+  ];
+  const onDisplay = { by: "p1", byType: "display", source: "Kitchen wall", locked: false, presumed: true, at: 1 };
+
+  const data = {
+    people, events: [], projects: [], grocery: [], notes: [], dates: [],
+    meals: {}, lists: [], timers: [], secondBlock: {}, status: {}, agenda: [],
+    chores: [{
+      id: "c1", title: "Take the bins out", personId: "p1", createdOn: "2026-08-01",
+      cadence: { type: "weekly", days: [1] },  // Mondays — overdue, and not due today
+      done: { [TODAY]: onDisplay },
+    }],
+    tasks: [{
+      id: "t1", title: "Post the form", date: "2026-08-28", done: true, doneAt: TODAY,
+      personId: "p2", doneBy: { ...onDisplay, by: "p2" },
+    }],
+  };
+
+  const html = renderToStaticMarkup(React.createElement(TodayView, {
+    data, allEvents: [], now: new Date(2026, 8, 2, 10, 0),
+    personById: (id) => people.find((p) => p.id === id) || null,
+    todayKey: TODAY, viewKey: TODAY, viewOffset: 0, setViewOffset: () => {},
+    filter: "all", inFilter: () => true, colorFor: () => "#999", update: () => {},
+    taskDueToday: (t) => !t.done && t.date && t.date <= TODAY,
+    openMeal: () => {}, openEvent: () => {}, viewEvent: () => {}, openNote: () => {},
+    gotoBoard: () => {}, openProject: () => {}, openTask: () => {},
+    openChore: () => {}, openChoreDay: () => {},
+  }));
+
+  // Reflected on the day they were finished, both kinds.
+  assert.match(html, /Done · 2/, "both the chore and the task are on the day they were done");
+  assert.match(html, /Take the bins out/,
+    "an overdue chore completed today must not vanish — it is recorded under today, not under the day it was owed");
+  assert.match(html, /Post the form/);
+
+  // And a display can say who really did it.
+  assert.match(html, /Ryan/);
+  assert.match(html, /Alex/);
+  // The picker is a button whose label says what it does. Matching on that
+  // rather than on styling, so a restyle does not fail this and a removal does.
+  assert.match(html, /Change who did this/,
+    "an unlocked completion offers the picker — this is the whole of 'say who did it on a display'");
+  assert.equal((html.match(/Change who did this/g) || []).length, 2,
+    "on both rows: the overdue chore and the overdue task");
 });

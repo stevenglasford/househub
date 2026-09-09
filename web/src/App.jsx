@@ -22,7 +22,7 @@ import {
 import { getConfig } from "./config.js";
 import { useCheckinPrompt } from "./lib/useCheckinPrompt.js";
 import HouseholdPanel from "./components/HouseholdPanel.jsx";
-import ArchivePanel from "./components/ArchivePanel.jsx";
+import ArchivePanel, { ArchiveRecord } from "./components/ArchivePanel.jsx";
 import ImportPanel from "./components/ImportPanel.jsx";
 import SessionPolicyPanel from "./components/SessionPolicyPanel.jsx";
 import SuperAdminPanel from "./components/SuperAdminPanel.jsx";
@@ -32,6 +32,12 @@ import CamerasPanel from "./components/CamerasPanel.jsx";
 import DevicesPanel from "./components/DevicesPanel.jsx";
 import AiPanel from "./components/AiPanel.jsx";
 import SecondBlock, { SecondBlockSettings } from "./components/SecondBlock.jsx";
+import { TimerBar, TimerAlarm } from "./components/TimersPanel.jsx";
+import * as TM from "./lib/timers.js";
+import * as NEW from "./lib/new-events.js";
+import { patternDataUri } from "./lib/chime-wav.js";
+import * as SOUNDS from "./lib/alert-sounds.js";
+import * as INTERVALS from "./lib/chore-intervals.js";
 import CaldavPanel from "./components/CaldavPanel.jsx";
 import PrivacyPanel from "./components/PrivacyPanel.jsx";
 import * as COMPLETION from "./lib/completion.js";
@@ -389,6 +395,15 @@ function oldestOwed(chore, dateKey, lookback = 400) {
     const k = ymd(addDays(t, -i));
     if (floor && k < floor) break;
     if (chore.done?.[k]) break;                 // done or skipped: chain ends
+    /* So does a pause. Without this, pausing the hoover left every occurrence
+       it already owed still on the list -- the chore was "not due" and "three
+       days late" at the same time, so it never left the screen, which is what
+       "pausing it doesn't take it off the chores list" was.
+       
+       It also matters on the way out: a chore paused for the winter would
+       otherwise wake in April and surface November's missed occurrence, which
+       is precisely the nagging the pause was meant to stop. */
+    if (CADENCE.isPausedOn(chore, k)) break;
     if (choreDueOn(chore, k)) owed = k;
   }
   return owed;
@@ -397,10 +412,29 @@ function oldestOwed(chore, dateKey, lookback = 400) {
 /* An unfinished occurrence carries forward as overdue even onto days that are
    themselves scheduled — a daily chore you skipped yesterday is both due today
    and late. It's still one chore, so it renders as a single row. */
-function choreState(chore, dateKey) {
+export function choreState(chore, dateKey) {
   const dueToday = choreDueOn(chore, dateKey);
   const mark = chore.done?.[dateKey];
-  if (mark) return { dueToday, missedSince: null, active: dueToday, mark };
+  /* Paused: off the board entirely, and owing nothing. Checked after the mark
+     below would be wrong -- but before `missedSince`, because a paused chore
+     that is also "3 days late" is the contradiction that kept it on screen. */
+  if (!mark && CADENCE.isPausedOn(chore, dateKey)) {
+    return { dueToday: false, missedSince: null, active: false, mark: null, paused: true };
+  }
+  /* A day this chore was marked on is a day it belongs to, whether or not it
+     was scheduled for it.
+     
+     `active: dueToday` was the bug behind "an overdue task ticked on Today
+     disappears". An overdue chore is completed *under today* -- today is
+     usually not one of its due days -- so the moment it was ticked, dueToday
+     was false, `active` went false, and it dropped out of the list Today builds
+     both its open rows and its done group from. It did not move to the done
+     group; it left the screen. On a shared display that reads as "did that
+     save?", and it gets done twice.
+     
+     The three "how many are left" counts all pair `.active` with
+     `!c.done[key]`, so none of them changes. */
+  if (mark) return { dueToday, missedSince: null, active: true, mark };
   const missedSince = oldestOwed(chore, dateKey);
   return { dueToday, missedSince, active: dueToday || !!missedSince, mark: null };
 }
@@ -946,7 +980,11 @@ export default function HouseholdHub() {
 
      Snoozes come from data.alertSnooze, which is part of the synced document,
      so silencing one on a phone also quiets the tablet in the hall. */
+  /* Each reminder sounds like itself. The gesture-unlock listener still has to
+     be installed exactly once for the app, which is what useChime does, so the
+     hook is kept and its player is used only as the fallback. */
   const alertChime = useChime(data?.checkin?.soundOn !== false, "alert");
+  const soundOn = data?.checkin?.soundOn !== false;
   const lastChime = useRef({});
 
   const activeAlerts = data
@@ -959,7 +997,9 @@ export default function HouseholdHub() {
       const step = escalationStep(a.alert, a.overdue);   // step 0 at the due minute
       if (lastChime.current[a.key] !== step) {
         lastChime.current[a.key] = step;
-        alertChime();
+        if (soundOn) {
+          playAlertSound(a.alert, { title: a.title, personName: a.person?.name || "" });
+        }
       }
     }
     // forget anything no longer sounding, so it chimes again next time it does
@@ -1006,7 +1046,10 @@ export default function HouseholdHub() {
     if (a.kind === "chore") {
       return COMPLETION.toggleChore(d, a.id, todayKey, actorFor(d), { assigneeOf: choreAssignee });
     }
-    d.tasks = d.tasks.map((t) => t.id === a.id ? { ...t, done: true, doneAt: todayKey } : t);
+    d.tasks = d.tasks.map((t) => t.id === a.id
+      ? { ...t, done: true, doneAt: todayKey,
+          doneBy: COMPLETION.markCompleted(actorFor(d), { fallbackPersonId: t.personId }) }
+      : t);
     return d;
   });
   const alertSnooze = (a, mins) => update((d) => {
@@ -1061,6 +1104,73 @@ export default function HouseholdHub() {
     chime();
     setModal({ type: "checkin" });
   }, [data, todayKey, now, plan?.time]); // eslint-disable-line
+
+  /* The timer alarm, re-sounded for as long as anything is ringing.
+     
+     A single chime at the moment a timer expires is the one behaviour a kitchen
+     timer cannot have: the whole reason for setting one is that you have left
+     the room. So this repeats every few seconds until somebody stops it, and
+     stopping is written to the document, which is what silences the other
+     screens rather than each of them having to be dismissed in turn. */
+  /* What has appeared on the calendar since this person last looked.
+     
+     The mark moves when they open the Calendar tab, not on every render and not
+     when the app merely loads -- otherwise the wall display, which is always on
+     some tab, would clear everybody's dots overnight without anybody having
+     read anything.
+     
+     A display has no signed-in person and never writes a mark; it falls back to
+     household-wide recency, which clears on its own. See lib/new-events.js. */
+  const mePersonId = data ? defaultPersonId(data.people) : "";
+  const calendarMark = data ? NEW.seenAt(data, mePersonId) : null;
+  const onDisplay = session.isDisplay();
+  const isNewEvent = useCallback(
+    (ev) => NEW.isNewTo(ev, { mark: calendarMark, isDisplay: onDisplay }),
+    [calendarMark, onDisplay]
+  );
+  const newOnCalendar = useMemo(
+    () => (data ? NEW.newEvents(allEvents, { mark: calendarMark, isDisplay: onDisplay }).length : 0),
+    [data, allEvents, calendarMark, onDisplay]
+  );
+
+  const markedRef = useRef(false);
+  useEffect(() => {
+    if (tab !== "calendar") { markedRef.current = false; return; }
+    // Once per visit, and a beat after arriving, so the dots are actually seen
+    // rather than cleared underneath the person on the way in.
+    if (markedRef.current || !mePersonId) return;
+    markedRef.current = true;
+    const id = setTimeout(() => update((d) => NEW.markSeen(d, mePersonId)), 2500);
+    return () => clearTimeout(id);
+  }, [tab, mePersonId, update]);
+
+  const timerChime = useChime(true, "timer");
+
+  /* The app clock ticks every 15 seconds, which is fine for a calendar and
+     useless for a timer: it would let an alarm land up to fifteen seconds after
+     the countdown reached zero, which on a three minute egg is the difference
+     the timer existed to prevent. So rather than polling, this sleeps exactly
+     as long as the soonest timer has left and wakes on the moment. */
+  const [ringTick, setRingTick] = useState(0);
+  const timers = data?.timers || [];
+  useEffect(() => {
+    const soonest = timers
+      .filter((t) => TM.timerState(t) === "running")
+      .map((t) => TM.remainingMs(t))
+      .filter((ms) => ms > 0)
+      .sort((a, b) => a - b)[0];
+    if (soonest === undefined) return undefined;
+    const id = setTimeout(() => setRingTick((n) => n + 1), soonest + 50);
+    return () => clearTimeout(id);
+  }, [timers, ringTick]);
+
+  const anyRinging = TM.ringingTimers({ timers }, Date.now()).length > 0;
+  useEffect(() => {
+    if (!anyRinging) return undefined;
+    timerChime();
+    const id = setInterval(timerChime, 3500);
+    return () => clearInterval(id);
+  }, [anyRinging, timerChime]);
 
 
   if (!loaded) {
@@ -1160,7 +1270,12 @@ export default function HouseholdHub() {
         inFilter={inFilter} filter={filter} todosLeft={todosLeftToday} overdueTotal={overdueTotal} onGoto={setTab} hidden={isMobile} />
 
       <TabBar tab={tab} setTab={setTab} todosLeft={todosLeftToday} groceryLeft={groceryLeft} noteCount={noteCount} agendaOpen={agendaOpen} listsOpen={listsOpen} homeOn={homeConnected}
-        people={people} filter={filter} setFilter={setFilter} />
+        people={people} filter={filter} setFilter={setFilter} newOnCalendar={newOnCalendar} />
+
+      {/* Under the tabs rather than inside Today: a timer that is only visible
+          on one tab is a timer you have to go and find, and the moment you need
+          one is never the moment you are looking at the right screen. */}
+      <TimerBar data={data} update={update} T={T} personId={defaultPersonId(people)} />
 
       <main className={`flex-1 min-h-0 px-3 md:px-5 ${tab === "today" && !isMobile ? "overflow-hidden pb-3" : "overflow-y-auto pb-6"}`}
         style={{ background: T.bg }}>
@@ -1191,7 +1306,8 @@ export default function HouseholdHub() {
             shiftWeek={(n) => setWeekAnchor(ymd(addDays(weekStart, n * 7)))}
             resetWeek={() => setWeekAnchor(ymd(startOfWeek(new Date())))}
             openEvent={(d) => setModal({ type: "event", payload: { date: d } })}
-            editEvent={(ev) => setModal({ type: isReadOnlyEvent(ev) ? "viewEvent" : "event", payload: ev })} />
+            editEvent={(ev) => setModal({ type: isReadOnlyEvent(ev) ? "viewEvent" : "event", payload: ev })}
+            isNew={isNewEvent} />
         )}
         {tab === "meals" && (
           <MealsView weekDays={weekDays} data={data} todayKey={todayKey} personById={personById} filter={filter}
@@ -1226,6 +1342,10 @@ export default function HouseholdHub() {
             openHistory={() => setModal({ type: "history" })} />
         )}
       </main>
+
+      {/* Above every modal: a timer that finished while somebody was editing a
+          chore still has to be answerable without losing what they were doing. */}
+      <TimerAlarm data={data} update={update} T={T} />
 
       {modal?.type === "event" && <EventModal payload={modal.payload} people={people} update={update} calendars={syncTargets} close={() => setModal(null)} />}
       {modal?.type === "viewEvent" && (
@@ -1627,15 +1747,23 @@ const TAB_SCOPE = {
   home: "home",
 };
 
-function TabBar({ tab, setTab, todosLeft, groceryLeft, noteCount, agendaOpen, listsOpen, homeOn, people, filter, setFilter }) {
+function TabBar({ tab, setTab, todosLeft, groceryLeft, noteCount, agendaOpen, listsOpen, homeOn, people, filter, setFilter, newOnCalendar = 0 }) {
   const isMobile = useMobile();
   const all = [
     { id: "today", label: "Today", Icon: Home },
-    { id: "calendar", label: "Calendar", Icon: CalIcon },
+    { id: "calendar", label: "Calendar", Icon: CalIcon, badge: newOnCalendar },
     { id: "meals", label: "Meals", Icon: UtensilsCrossed },
     { id: "chores", label: "To-Dos", Icon: CheckCircle2, badge: todosLeft },
     { id: "grocery", label: "Grocery", Icon: ShoppingCart, badge: groceryLeft },
-    { id: "agenda", label: "Agenda", Icon: MessageCircle, badge: agendaOpen },
+    /* The label is "Together", not "Agenda" and not "Relationship". The tab
+       holds Topics, Status and the Date jar, which for this household is the
+       relationship -- but the app was rebuilt to work for any household of any
+       shape, and three housemates sharing a flat will not open a Relationship
+       tab. "Together" covers both readings.
+
+       The *id* stays `agenda`: it is written into display scopes and saved
+       layouts, and renaming it would quietly break both. */
+    { id: "agenda", label: "Together", Icon: MessageCircle, badge: agendaOpen },
     { id: "board", label: "Board", Icon: StickyNote, badge: noteCount },
     { id: "lists", label: "Lists", Icon: ListChecks, badge: listsOpen },
     ...(homeOn ? [{ id: "home", label: "Home", Icon: Sofa }] : []),
@@ -1721,7 +1849,7 @@ function FilterChip({ label, color, active, onClick }) {
    In wall mode this fills the viewport exactly: the header rows are fixed
    height and the three columns share the remaining space, each scrolling
    internally. The page itself never scrolls.                              */
-function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOffset, setViewOffset,
+export function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOffset, setViewOffset,
   filter, inFilter, colorFor, update, taskDueToday, openMeal, openEvent, viewEvent, openNote,
   gotoBoard, openProject, openTask, openChore, openChoreDay }) {
   const isMobile = useMobile();
@@ -1784,12 +1912,46 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
   const toggleChore = (id) => update((d) => COMPLETION.toggleChore(d, id, viewKey, actorFor(d), { assigneeOf: choreAssignee }))
   // doneAt records which day it was ticked, so a completed task can sit under
   // that day's "done" list instead of vanishing from the view entirely
+  /* Ticking a task records WHO, the same way a chore does.
+     
+     Reported: "on an overdue task, from Today, I can't change the person who
+     did it after I check it off." That was not a locking rule -- there was
+     nothing to correct. A completed task stored `done` and `doneAt` and nothing
+     about who did it, so the name on the row was the *assignee*, and the picker
+     was hard-coded off because there was no record for it to edit.
+     
+     `doneBy` is the same shape chores use, which is what makes the same rules
+     apply: a signed-in member's own tick is a first-person claim and stands, a
+     shared display's is somebody's word and stays correctable. */
   const toggleTask = (id) => update((d) => {
-    d.tasks = d.tasks.map((t) => t.id === id
-      ? (t.done ? { ...t, done: false, doneAt: "" } : { ...t, done: true, doneAt: viewKey })
-      : t);
+    d.tasks = d.tasks.map((t) => {
+      if (t.id !== id) return t;
+      if (t.done) { const n = { ...t, done: false, doneAt: "" }; delete n.doneBy; return n; }
+      return {
+        ...t, done: true, doneAt: viewKey,
+        doneBy: COMPLETION.markCompleted(actorFor(d), { fallbackPersonId: t.personId }),
+      };
+    });
     return d;
   });
+
+  /* Correct who did a task. Refuses on a locked record, exactly as chores do --
+     App's `update` catches and shows the reason. */
+  const creditTask = (id, personId) => {
+    setCreditError(null);
+    try {
+      update((d) => ({
+        ...d,
+        tasks: (d.tasks || []).map((t) => {
+          if (t.id !== id) return t;
+          if (!COMPLETION.canReattribute(t.doneBy, actorFor(d))) {
+            throw new Error("They ticked this off themselves, so it cannot be reassigned.");
+          }
+          return { ...t, doneBy: COMPLETION.reattribute(t.doneBy, personId, actorFor(d)) };
+        }),
+      }));
+    } catch (err) { setCreditError(err.message); }
+  };
 
   const isChoreLate = (c) => !c.done[viewKey] && !!choreState(c, viewKey).missedSince;
   // finished items drop to a "done" group at the bottom rather than holding their place
@@ -1815,8 +1977,14 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
       };
     }),
     ...data.tasks.filter((t) => inFilter(t.personId) && t.done && t.doneAt === viewKey).map((t) => ({
-      key: "t" + t.id, id: t.id, kind: "task", title: t.title,
-      person: personById(t.personId), editable: false, toggle: () => toggleTask(t.id),
+      key: "t" + t.id, id: t.id, kind: "task", title: t.title, mark: t.doneBy || null,
+      /* Whoever actually did it, falling back to the assignee for tasks
+         completed before this was recorded -- those have no doer, and the
+         assignee is the best available guess rather than a blank. */
+      person: personById(COMPLETION.completedBy(t.doneBy)) || personById(t.personId) || null,
+      assignedTo: t.personId || "",
+      editable: COMPLETION.canReattribute(t.doneBy, actorFor(data)),
+      toggle: () => toggleTask(t.id),
     })),
   ];
   const restChores = chores.filter((c) => !isChoreLate(c) && !c.done[viewKey]);
@@ -1853,6 +2021,7 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
     })),
   ].sort((a, b) => b.lateDays - a.lateDays);
   const overdueCount = overdueItems.length;
+
 
   // projects planned for this day. Progress, not a checkbox — working on
   // something isn't the same as finishing it.
@@ -2341,7 +2510,10 @@ function TodayView({ data, allEvents, now, personById, todayKey, viewKey, viewOf
                       </div>
                       {it.editable && creditOpen === it.key && (
                         <CreditPicker people={data.people} currentId={it.person?.id || ""}
-                          onPick={(pid) => { creditChore(it.id, pid); setCreditOpen(null); }}
+                          onPick={(pid) => {
+                            (it.kind === "task" ? creditTask : creditChore)(it.id, pid);
+                            setCreditOpen(null);
+                          }}
                           note={creditError} />
                       )}
                     </div>
@@ -2387,7 +2559,22 @@ function PersonBreakdown({ people, allEvents, chores, tasks, taskDueToday, today
 }
 
 /* ---------------- Calendar view ---------------- */
-function CalendarView({ weekDays, allEvents, personById, colorFor, todayKey, inFilter, shiftWeek, resetWeek, openEvent, editEvent }) {
+/**
+ * The marker on an event that has appeared since this person last looked.
+ *
+ * A dot rather than a "NEW" chip: the calendar is already dense with colour
+ * that means something (whose event it is), and a word competes with the title
+ * for the same glance. The title is what somebody is reading.
+ */
+const NewDot = () => (
+  <span aria-label="New since you last looked" title="New since you last looked"
+    className="shrink-0" style={{
+      width: 7, height: 7, borderRadius: 999, background: T.brand,
+      display: "inline-block", marginTop: 5,
+    }} />
+);
+
+function CalendarView({ weekDays, allEvents, personById, colorFor, todayKey, inFilter, shiftWeek, resetWeek, openEvent, editEvent, isNew = () => false }) {
   const isMobile = useMobile();
   const label = `${MO_LONG[weekDays[0].getMonth()]} ${weekDays[0].getDate()} – ${weekDays[6].getMonth() !== weekDays[0].getMonth() ? MO_LONG[weekDays[6].getMonth()] + " " : ""}${weekDays[6].getDate()}`;
   const eventsFor = (k) => allEvents.filter((e) => e.date === k && inFilter(e.personId)).sort((a, b) => (a.time || "99").localeCompare(b.time || "99"));
@@ -2412,6 +2599,7 @@ function CalendarView({ weekDays, allEvents, personById, colorFor, todayKey, inF
                   <div className="px-3 py-2 flex flex-col gap-1.5">
                     {dayEvents.map((e) => (
                       <button key={e.id} onClick={() => editEvent(e)} className="tapfade text-left rounded-lg px-3 py-2 flex items-center gap-3" style={{ background: colorFor(e) + "14", borderLeft: `3px solid ${colorFor(e)}` }}>
+                        {isNew(e) && <NewDot />}
                         <span className="tabular-nums shrink-0" style={{ color: T.sub, fontSize: 12.5, fontWeight: 700, minWidth: 86 }}>
                           {e.time ? (e.endTime ? fmtRange(e.time, e.endTime) : fmtTime(e.time)) : "All day"}
                         </span>
@@ -2455,6 +2643,7 @@ function CalendarView({ weekDays, allEvents, personById, colorFor, todayKey, inF
                     )}
                     {e.cont && <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }}>cont. · day {e.spanIndex + 1} of {e.spanDays}</div>}
                     <div style={{ fontSize: 14, fontWeight: 600, color: T.ink }} className="leading-tight break-words flex items-start gap-1">
+                      {isNew(e) && <NewDot />}
                       <span>{e.title}</span>{e.source === "ics" && <Lock size={11} style={{ color: T.faint, marginTop: 2 }} className="shrink-0" />}
                     </div>
                   </button>
@@ -2666,7 +2855,16 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
   const finished = projects.filter((p) => !projectOpen(p));
   const allChores = data.chores.filter((c) => inFilter(choreAssignee(c, todayKey)));
   const chores = allChores.filter((c) => choreState(c, todayKey).active);
-  const otherChores = allChores.filter((c) => !choreState(c, todayKey).active);
+  /* Paused chores get their own group rather than falling into "Other days".
+     
+     "Other days" means "not today, but coming"; a paused chore is not coming at
+     all until somebody says so, and filing the two together makes a seasonal
+     pause look like an ordinary gap in the schedule. It also has to be visible
+     SOMEWHERE -- a chore that silently disappears when paused is one nobody can
+     find to unpause. */
+  const pausedChores = allChores.filter((c) => CADENCE.isPausedOn(c, todayKey));
+  const otherChores = allChores.filter((c) =>
+    !choreState(c, todayKey).active && !CADENCE.isPausedOn(c, todayKey));
   const done = chores.filter((c) => c.done[todayKey]).length;
   const toggleChore = (id) => update((d) => COMPLETION.toggleChore(d, id, todayKey, actorFor(d), { assigneeOf: choreAssignee }))
   /* Skip clears every occurrence currently owed — not just one — otherwise a
@@ -2712,10 +2910,18 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
   const removeChore = (id) => update((d) => { d.chores = d.chores.filter((c) => c.id !== id); return d; });
 
   const tasks = data.tasks.filter((t) => inFilter(t.personId));
+  /* Same record as Today writes. Ticking the same task from two screens must
+     not produce two different shapes -- that is how "I can correct it here but
+     not there" bugs are made. */
   const toggleTask = (id) => update((d) => {
-    d.tasks = d.tasks.map((t) => t.id === id
-      ? (t.done ? { ...t, done: false, doneAt: "" } : { ...t, done: true, doneAt: todayKey })
-      : t);
+    d.tasks = d.tasks.map((t) => {
+      if (t.id !== id) return t;
+      if (t.done) { const n = { ...t, done: false, doneAt: "" }; delete n.doneBy; return n; }
+      return {
+        ...t, done: true, doneAt: todayKey,
+        doneBy: COMPLETION.markCompleted(actorFor(d), { fallbackPersonId: t.personId }),
+      };
+    });
     return d;
   });
   const removeTask = (id) => update((d) => { d.tasks = d.tasks.filter((t) => t.id !== id); return d; });
@@ -2879,6 +3085,51 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
               </div>
             );
           })}
+          {pausedChores.length > 0 && (
+            <>
+              <div style={{ color: T.faint, fontSize: 12, fontWeight: 700, letterSpacing: 1 }} className="uppercase mt-2">
+                Paused · {pausedChores.length}
+              </div>
+              {pausedChores.map((c) => {
+                const p = personById(choreAssignee(c, todayKey));
+                return (
+                  <div key={c.id} className="flex items-center gap-3 rounded-2xl px-4 py-3"
+                    style={{ background: T.panelAlt, border: `1px dashed ${T.line}`, opacity: 0.85 }}>
+                    <Hourglass size={20} style={{ color: T.faint }} className="shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <div style={{ fontSize: 16, fontWeight: 600, color: T.sub }} className="truncate">{c.title}</div>
+                      <div style={{ color: T.faint, fontSize: 12.5, fontWeight: 600 }}>
+                        {CADENCE.pauseLabel(c, { todayKey })} · {CADENCE.describeCadence(c, (id) => personById(id)?.name)}
+                      </div>
+                    </div>
+                    {p && (
+                      <span className="shrink-0 rounded-full px-2 py-0.5"
+                        style={{ background: p.color + "1F", color: p.color, fontSize: 11, fontWeight: 800 }}>
+                        {p.name}
+                      </span>
+                    )}
+                    {/* One tap back, from the list it is on. Having to open the
+                        editor to find the switch is how a paused chore stays
+                        paused for a month after the season ends. */}
+                    <button
+                      onClick={() => update((d) => ({
+                        ...d,
+                        chores: (d.chores || []).map((x) => (x.id === c.id ? CADENCE.resumeChore(x) : x)),
+                      }))}
+                      className="tapfade shrink-0 px-3 py-1.5 rounded-full font-bold"
+                      style={{ background: T.panel, border: `1px solid ${T.line}`, color: T.brand, fontSize: 12 }}>
+                      Resume
+                    </button>
+                    <button onClick={() => openChore(c)} className="tapfade p-1 shrink-0" style={{ color: T.faint }}
+                      aria-label={`Edit ${c.title}`}>
+                      <Settings size={15} />
+                    </button>
+                  </div>
+                );
+              })}
+            </>
+          )}
+
           {otherChores.length > 0 && (
             <>
               <div style={{ color: T.faint, fontSize: 12, fontWeight: 700, letterSpacing: 1 }} className="uppercase mt-2">Other days</div>
@@ -2952,6 +3203,18 @@ function ToDosView({ data, personById, todayKey, inFilter, update, openChore, op
                   <div key={t.id} className="flex items-center gap-3 rounded-xl px-4 py-2.5" style={{ opacity: 0.6 }}>
                     <button onClick={() => toggleTask(t.id)} className="tapfade shrink-0" style={{ color: T.brand }}><CheckCircle2 size={26} /></button>
                     <span className="flex-1 min-w-0 truncate" style={{ fontSize: 16, fontWeight: 500, textDecoration: "line-through" }}>{t.title}</span>
+                    {/* Who did it, by name. This list showed nothing at all,
+                        so a fortnight of tasks read as though the household did
+                        them collectively. */}
+                    {(() => {
+                      const who = personById(COMPLETION.completedBy(t.doneBy)) || personById(t.personId);
+                      return who ? (
+                        <span className="shrink-0 rounded-full px-2 py-0.5"
+                          style={{ background: who.color + "1F", color: who.color, fontSize: 11, fontWeight: 800 }}>
+                          {who.name}
+                        </span>
+                      ) : null;
+                    })()}
                     <button onClick={() => removeTask(t.id)} className="tapfade p-1.5 shrink-0" style={{ color: T.faint }}><Trash2 size={16} /></button>
                   </div>
                 ))}
@@ -3624,6 +3887,22 @@ export function StatusGraph({ data, todayKey }) {
               style={{ fill: T.faint, fontSize: 10 }}>{v}</text>
           </g>
         ))}
+
+        {/* Dates along the bottom. The band was already reserved by PAD.b and
+            drew nothing, so the shape of a fortnight was readable and *which*
+            fortnight was not -- and "we dipped" is only useful next to "that
+            was the week your mother stayed". */}
+        {STATUS.axisTicks(todayKey, days).map((t, i, all) => {
+          const x = px(t.x);
+          const first = i === 0, last = i === all.length - 1;
+          return (
+            <text key={`${t.x}-${t.label}`} x={x} y={H - 6}
+              textAnchor={first ? "start" : last ? "end" : "middle"}
+              style={{ fill: T.faint, fontSize: 9.5, fontWeight: t.label === "today" ? 700 : 400 }}>
+              {t.label}
+            </text>
+          );
+        })}
 
         {people.map((p) => {
           const pts = series.get(p.id) || [];
@@ -4529,6 +4808,53 @@ function DateJarPane({ data, update, personById, jarId, setJarId, drawn, setDraw
   );
 }
 
+/**
+ * Who added a list item.
+ *
+ * Shown rather than hidden behind a hover, because on a wall display there is
+ * no hover -- and "who put this on the list" is most often asked by somebody
+ * standing in front of the fridge, not sitting at a laptop.
+ *
+ * Whether it can be corrected follows lib/lists.js, which follows completion.js:
+ * a signed-in member's own entry is a first-person claim and is not up for
+ * reassignment; one recorded on a shared screen is somebody's word for who was
+ * standing there, and can be put right.
+ */
+function ListItemBy({ item, personById, people, onPick }) {
+  const [picking, setPicking] = useState(false);
+  const by = item?.by || null;
+  if (!by) return null;                      // added before this existed, or by nobody known
+
+  const person = by.personId ? personById(by.personId) : null;
+  const label = person?.name || "Someone";
+  const canFix = LISTS.canReattribute(by);
+
+  if (picking) {
+    return (
+      <div className="shrink-0">
+        <CreditPicker people={people} currentId={by.personId || ""}
+          onPick={(pid) => { setPicking(false); onPick(pid); }} />
+      </div>
+    );
+  }
+
+  return (
+    <button
+      onClick={canFix ? () => setPicking(true) : undefined}
+      disabled={!canFix}
+      className={canFix ? "tapfade shrink-0" : "shrink-0"}
+      title={by.source ? `Added on ${by.source}` : "Added by " + label}
+      aria-label={canFix ? `Change who added ${item.text}` : `Added by ${label}`}
+      style={{
+        fontSize: 11.5, fontWeight: 800, color: person?.color || T.faint,
+        border: `1px solid ${T.line}`, borderRadius: 999, padding: "2px 7px",
+        background: "transparent", opacity: canFix ? 1 : 0.75,
+      }}>
+      {label}
+    </button>
+  );
+}
+
 /* ---------------- Lists: running lists for random things ----------------
    Ryan asked for "notes or running lists for random things, similar to the
    notes app in icloud", manageable in the hub or through a native app.
@@ -4546,20 +4872,62 @@ export function ListsView({ data, update, personById }) {
   const [openId, setOpenId] = useState(null);
   const [draft, setDraft] = useState("");
 
-  const open = lists.find((l) => l.id === openId) || null;
+  /* Who is entering this.
+     
+     A signed-in member is recorded silently from the session -- they are
+     speaking for themselves, and asking them a question they have already
+     answered by logging in is just friction.
+     
+     A shared display cannot know, so it asks. Once, and then it remembers:
+     a picker between every item on a shopping list is a control people route
+     around by tapping whoever is first in the household, which produces worse
+     data than asking nothing at all. The memory is per visit, deliberately --
+     it is state in this component, so leaving the tab forgets it, and the next
+     person to walk up is asked rather than inheriting the last one's name. */
+  const isDisplay = session.isDisplay();
+  const myPersonId = defaultPersonId(data.people);
+  const displayName = session.snapshot().displayName || "";
+  const [screenWho, setScreenWho] = useState("");
+  const [asking, setAsking] = useState(null);   // a pending entry, waiting on an answer
 
-  const addList = () => {
-    const l = LISTS.createList("New list");
+  const actorNow = (personId = null) => (isDisplay
+    ? { personId: personId ?? screenWho, isDisplay: true, displayName }
+    : { personId: myPersonId });
+
+  const open = lists.find((l) => l.id === openId) || null;
+  const mutate = (fn) => update((d) => LISTS.withList(d, openId, fn));
+
+  const reallyAddList = (personId = null) => {
+    const l = LISTS.createList("New list", { by: LISTS.attribute(actorNow(personId)) });
     update((d) => LISTS.upsertList(d, l));
     setOpenId(l.id);
   };
-  const mutate = (fn) => update((d) => LISTS.withList(d, openId, fn));
+  const reallyAddItem = (text, personId = null) => {
+    mutate((l) => LISTS.addItem(l, text, { by: LISTS.attribute(actorNow(personId)) }));
+    setDraft("");
+  };
 
+  const addList = () => {
+    if (isDisplay && !screenWho) { setAsking({ kind: "list" }); return; }
+    reallyAddList();
+  };
   const addItem = () => {
     const text = draft.trim();
     if (!text) return;
-    mutate((l) => LISTS.addItem(l, text));
-    setDraft("");
+    if (isDisplay && !screenWho) { setAsking({ kind: "item", text }); return; }
+    reallyAddItem(text);
+  };
+
+  /* The answer to "who is this?", which both records the entry that was waiting
+     and is remembered for the rest of the visit. "Nobody" is a real answer: it
+     records the entry unattributed rather than refusing to record it. */
+  const answered = (personId) => {
+    setScreenWho(personId);
+    const pending = asking;
+    setAsking(null);
+    if (!pending) return;
+    if (pending.kind === "item") reallyAddItem(pending.text, personId);
+    else reallyAddList(personId);
   };
 
   /* ---- one list, opened ---- */
@@ -4591,6 +4959,27 @@ export function ListsView({ data, update, personById }) {
             <Trash2 size={18} />
           </button>
         </div>
+
+        {asking && (
+          <div className="rounded-xl p-3 mb-3" style={{ background: T.panelAlt, border: `1px solid ${T.line}` }}>
+            <p style={{ color: T.sub, fontSize: 13.5, fontWeight: 700, marginBottom: 8 }}>Who's adding this?</p>
+            <CreditPicker people={data.people} currentId="" onPick={answered} />
+          </div>
+        )}
+
+        {/* On a display, who the entries are being recorded against, and one tap
+            to hand over to somebody else. Members do not see this: the session
+            already answers it. */}
+        {isDisplay && screenWho && (
+          <button onClick={() => setAsking({ kind: "switch" })} className="tapfade mb-3 flex items-center gap-2"
+            style={{ color: T.faint, fontSize: 12.5, fontWeight: 700 }}>
+            Adding as
+            <span style={{ color: personById(screenWho)?.color || T.sub }}>
+              {personById(screenWho)?.name || "somebody"}
+            </span>
+            · change
+          </button>
+        )}
 
         <div className="flex gap-2 mb-3">
           <input
@@ -4630,6 +5019,11 @@ export function ListsView({ data, update, personById }) {
                   }}
                   aria-label={`Edit ${item.text}`}
                 />
+                {/* Who added it. A member's own entry is shown and not offered
+                    for correction; one made on a screen can be put right. */}
+                <ListItemBy item={item} personById={personById} people={data.people}
+                  onPick={(pid) => mutate((l) => LISTS.attributeItem(l, item.id, pid, actorNow()))} />
+
                 <div className="flex shrink-0">
                   <button onClick={() => mutate((l) => LISTS.moveItem(l, item.id, i - 1))}
                     disabled={i === 0} className="tapfade p-1"
@@ -4675,6 +5069,13 @@ export function ListsView({ data, update, personById }) {
           style={{ background: T.brand, color: "#fff" }}><Plus size={18} /> List</button>
       </div>
 
+      {asking && (
+        <div className="rounded-xl p-3 mb-3" style={{ background: T.panelAlt, border: `1px solid ${T.line}` }}>
+          <p style={{ color: T.sub, fontSize: 13.5, fontWeight: 700, marginBottom: 8 }}>Who's starting this list?</p>
+          <CreditPicker people={data.people} currentId="" onPick={answered} />
+        </div>
+      )}
+
       {lists.length === 0 ? (
         <Empty text="No lists yet. Packing, DIY, films to watch — whatever needs one." />
       ) : (
@@ -4688,6 +5089,14 @@ export function ListsView({ data, update, personById }) {
                 style={{ background: T.panel, border: `1px solid ${T.line}` }}>
                 <div className="flex items-center justify-between gap-2 mb-1.5">
                   <span className="truncate" style={{ fontSize: 17, fontWeight: 700, color: T.ink }}>{l.title}</span>
+                  {l.by?.personId && (
+                    <span className="shrink-0" style={{
+                      fontSize: 11, fontWeight: 800,
+                      color: personById(l.by.personId)?.color || T.faint,
+                    }}>
+                      {personById(l.by.personId)?.name || ""}
+                    </span>
+                  )}
                   {progress && (
                     <span className="shrink-0 rounded-full px-2 py-0.5"
                       style={{ background: T.panelAlt, color: T.sub, fontSize: 11.5, fontWeight: 800 }}>
@@ -5222,6 +5631,39 @@ function AlertEditor({ value, onChange }) {
               })}
             </div>
           </div>
+          <div className="mt-2.5">
+            <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }} className="uppercase mb-1">Sound</div>
+            <div className="flex gap-1.5 flex-wrap">
+              {SOUNDS.SOUND_CHOICES
+                .filter((c) => c.id !== SOUNDS.SPEAK || canSpeak())
+                .map((c) => {
+                  const sel = SOUNDS.soundOf(a) === c.id;
+                  return (
+                    <button key={c.id}
+                      /* Choosing previews it. A sound picker that does not play
+                         the sound makes somebody save, wait for the reminder,
+                         and come back — six times. */
+                      onClick={() => {
+                        onChange({ ...a, sound: c.id });
+                        if (c.id === SOUNDS.SPEAK) speakAloud(SOUNDS.spokenFor({ sound: c.id }, { title: "Bins out" }));
+                        else playSpec(SOUNDS.specFor(c.id), c.id);
+                      }}
+                      title={c.hint}
+                      className="tapfade px-3 py-2 rounded-xl"
+                      style={{ background: sel ? T.brand : T.panelAlt, color: sel ? "#fff" : T.ink,
+                        border: `1px solid ${sel ? T.brand : T.line}`, fontSize: 13, fontWeight: 700 }}>
+                      {c.label}
+                    </button>
+                  );
+                })}
+            </div>
+            <p style={{ color: T.faint, fontSize: 12 }} className="mt-1.5">
+              {SOUNDS.soundOf(a) === SOUNDS.SPEAK
+                ? "The screen reads the reminder's name aloud, so you can tell which one it is from another room."
+                : (SOUNDS.SOUND_CHOICES.find((c) => c.id === SOUNDS.soundOf(a)) || {}).hint || ""}
+            </p>
+          </div>
+
           <p style={{ color: T.faint, fontSize: 12.5 }} className="mt-2">
             Chimes from {fmtTime(a.at)} until it's ticked off, stopping at {fmtTime(a.until)}.
             A screen has to be awake to sound — for anything critical also turn on
@@ -5361,10 +5803,62 @@ function audioContext() {
   return sharedAudioCtx;
 }
 
-/** Whether a chime would actually be audible right now. */
+/**
+ * Say something aloud.
+ *
+ * The reason this beats a custom beep: from the next room, "that is the
+ * three-note one" is a puzzle and "Bins out" is an answer. It also stores
+ * nothing -- the words are already in the document as the reminder's name.
+ *
+ * Cancels anything still speaking first. Two reminders coming due in the same
+ * minute would otherwise queue up and talk over the top of each other for
+ * however long the backlog took.
+ */
+function speakAloud(text) {
+  try {
+    const synth = typeof window !== "undefined" && window.speechSynthesis;
+    if (!synth || !text) return false;
+    synth.cancel();
+    const u = new SpeechSynthesisUtterance(String(text).slice(0, 120));
+    u.rate = 0.95;      // a shade under default; announcements read better slow
+    u.volume = 1;
+    u.lang = (typeof navigator !== "undefined" && navigator.language) || "en-GB";
+    synth.speak(u);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Whether this screen can speak at all. Firefox on some platforms cannot. */
+export const canSpeak = () =>
+  typeof window !== "undefined" && Boolean(window.speechSynthesis)
+  && typeof SpeechSynthesisUtterance === "function";
+
+/**
+ * Play whatever this alert is set to.
+ *
+ * Falls back from speech to the default tone rather than to silence: a
+ * reminder that makes no sound is the one failure mode that matters, and a
+ * browser without speech synthesis should still ring.
+ */
+export function playAlertSound(alert, opts = {}) {
+  const choice = SOUNDS.soundOf(alert);
+  if (choice === SOUNDS.SPEAK) {
+    if (speakAloud(SOUNDS.spokenFor(alert, opts))) return true;
+    return playSpec(SOUNDS.specFor(SOUNDS.DEFAULT_SOUND), SOUNDS.DEFAULT_SOUND);
+  }
+  return playSpec(SOUNDS.specFor(choice), choice);
+}
+
+/** Whether a chime would actually be audible right now, by either route. */
 export function audioReady() {
   const ctx = audioContext();
-  return Boolean(ctx) && ctx.state === "running";
+  if (ctx && ctx.state === "running") return true;
+  // The media-element route can work when the AudioContext will not -- and on
+  // an iPad it is the route that matters -- so reporting only the context would
+  // tell somebody their sound was broken while it was in fact fine.
+  return chimeArmed;
 }
 
 /* Called from a real user gesture. Until this happens the browser will not let
@@ -5372,6 +5866,35 @@ export function audioReady() {
 function unlockAudio() {
   const ctx = audioContext();
   if (ctx && ctx.state !== "running" && ctx.resume) ctx.resume().catch(() => {});
+
+  /* Media elements need the same permission, and need it on the gesture. An
+     element that has never been played inside one will refuse later, which on a
+     wall tablet means the first reminder of the day is the one that is silent.
+     Playing and immediately pausing is the standard way to bank it. */
+  const el = chimeElement();
+  if (el && !chimeArmed) {
+    try {
+      // The shortest sound there is, so arming costs nothing audible.
+      el.src = srcFor("ping", SOUNDS.specFor("ping"));
+      el.muted = true;
+      const p = el.play();
+      const settle = () => { el.pause(); el.currentTime = 0; el.muted = false; chimeArmed = true; };
+      if (p && typeof p.then === "function") p.then(settle).catch(() => { el.muted = false; });
+      else settle();
+    } catch (e) { el.muted = false; }
+  }
+
+  /* Speech needs the same permission and needs it on a gesture, so an empty
+     utterance banks it. Without this the first spoken reminder of the day is
+     the silent one, which is the only one that matters. */
+  try {
+    const synth = typeof window !== "undefined" && window.speechSynthesis;
+    if (synth && !synth.speaking && typeof SpeechSynthesisUtterance === "function") {
+      const u = new SpeechSynthesisUtterance(" ");
+      u.volume = 0;
+      synth.speak(u);
+    }
+  } catch (e) { /* no speech on this browser */ }
 }
 
 const CHIME_PATTERNS = {
@@ -5379,6 +5902,19 @@ const CHIME_PATTERNS = {
   gentle: {
     wave: "sine", peak: 0.18, decay: 0.55,
     notes: [{ t: 0, f: 587.33 }, { t: 0.28, f: 880 }],
+  },
+  /* A kitchen timer, which is a different job from a reminder: it is heard
+     from another room, over an extractor fan, by somebody who is expecting it.
+     So a repeating three-note figure rather than a single pleasant chime --
+     and re-sounded every few seconds by the caller for as long as it rings,
+     because the one failure a timer must not have is going off once while
+     nobody was in the room. */
+  timer: {
+    wave: "square", peak: 0.22, decay: 0.22,
+    notes: [0, 0.3, 0.6].flatMap((base) => [
+      { t: base, f: 987.77 },        // B5
+      { t: base + 0.13, f: 1318.51 }, // E6
+    ]),
   },
   // deliberately more insistent, and repeated: this one is for something that
   // was supposed to happen and did not
@@ -5392,8 +5928,92 @@ const CHIME_PATTERNS = {
   },
 };
 
+/* ---------------------------------------------------------------
+   Playing it on an iPad.
+
+   Reported: reminders chime on a laptop and are silent on the iPad mounted in
+   the hall -- which is the one screen the whole feature exists for.
+
+   iOS routes Web Audio through the *ringer* channel, so everything scheduled on
+   an AudioContext is silenced by the mute switch. An <audio> element plays on
+   the media channel and is not. There is no API to ask for the media channel;
+   the only way to get it is to be a media element. A laptop has no mute switch,
+   so the identical code behaves differently on the two devices and the tablet
+   looks broken while the test button on the laptop reports success.
+
+   So: a media element first, oscillators second. Each has a failure the other
+   does not, and between them they cover more ground than either alone.
+
+   The elements are built once and reused. Constructing an Audio() per chime
+   works in testing and then stops on the device that has been open on the wall
+   for a fortnight -- the same trap the shared AudioContext exists to avoid. */
+/* ONE element, whose source is swapped, rather than one element per sound.
+   
+   That is not an optimisation, it is how the permission works: iOS grants
+   playback to an *element* that was played inside a user gesture, and the grant
+   survives a later `src` change. One element per sound would mean generating
+   every tone up front to have something to arm -- 424KB and a couple of hundred
+   milliseconds of jank on the tap that arms it -- and would still leave any
+   sound added later unarmed and silent.
+   
+   The rendered audio is cached by name, so a tone is synthesised once per
+   session and only if the household actually uses it. */
+let chimeEl = null;
+let chimeArmed = false;
+const chimeSrc = {};
+
+function chimeElement() {
+  if (chimeEl || typeof Audio !== "function") return chimeEl;
+  try {
+    chimeEl = new Audio();
+    chimeEl.preload = "auto";
+    // Without this, iOS takes a sound over the full screen on some versions.
+    chimeEl.setAttribute("playsinline", "");
+  } catch (e) {
+    chimeEl = null;
+  }
+  return chimeEl;
+}
+
+const srcFor = (key, spec) => (chimeSrc[key] ||= patternDataUri(spec));
+
+/** Try the media element. Returns false if it could not even be attempted. */
+function playViaElement(key, spec) {
+  const el = chimeElement();
+  if (!el) return false;
+  try {
+    el.src = srcFor(key, spec);
+    el.currentTime = 0;
+    const p = el.play();
+    // A rejected promise means the browser refused -- fall through to Web
+    // Audio rather than leaving a reminder silent.
+    if (p && typeof p.catch === "function") p.catch(() => { playViaOscillators(spec, key); });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/** Play an arbitrary pattern spec, cached under `key`. */
+export function playSpec(spec, key) {
+  const id = key || "custom";
+  if (playViaElement(id, spec)) {
+    if (id === "alert" || id === "timer" || id === "klaxon") {
+      try { navigator.vibrate && navigator.vibrate([220, 120, 220, 120, 380]); } catch (e) { /* not on desktop */ }
+    }
+    return true;
+  }
+  return playViaOscillators(spec, id);
+}
+
 function playPattern(patternName) {
-  const spec = CHIME_PATTERNS[patternName] || CHIME_PATTERNS.gentle;
+  return playSpec(CHIME_PATTERNS[patternName] || CHIME_PATTERNS.gentle, patternName);
+}
+
+function playViaOscillators(specOrName, key) {
+  const spec = typeof specOrName === "string"
+    ? (CHIME_PATTERNS[specOrName] || CHIME_PATTERNS.gentle)
+    : (specOrName || CHIME_PATTERNS.gentle);
   const ctx = audioContext();
   if (!ctx) return false;
   const schedule = () => {
@@ -5916,7 +6536,10 @@ function EventModal({ payload, people, update, close, calendars }) {
     const end = time && endTime && endTime > time ? endTime : "";
     update((d) => {
       if (editing) d.events = d.events.map((e) => e.id === payload.id ? { ...e, title, date, time, endTime: end, personId, calendarId } : e);
-      else d.events = [...d.events, { id: uid(), title, date, time, endTime: end, personId, calendarId }];
+      /* addedAt only on creation. Stamping it on an edit would make "what is
+         new" mean "what has been touched", and a typo fixed in a title would
+         reappear as news to the whole household. */
+      else d.events = [...d.events, { id: uid(), title, date, time, endTime: end, personId, calendarId, addedAt: Date.now() }];
       return d;
     });
     close();
@@ -6478,6 +7101,11 @@ export function ChoreDayModal({ chore, dateKey, people, personById, update, clos
   };
 
   const when = parseYMD(dateKey);
+  // The day this occurrence was scheduled for, when it has been moved here.
+  const movedFromKey = CADENCE.movedFrom(chore, dateKey);
+  const stats = INTERVALS.intervalStats(chore, ymd(new Date()));
+  const drift = INTERVALS.scheduleDrift(chore, stats);
+
   return (
     <Overlay close={save}>
       <ModalHead title={chore.title} close={save} />
@@ -6503,6 +7131,81 @@ export function ChoreDayModal({ chore, dateKey, people, personById, update, clos
             </span>
           )}
         </div>
+      )}
+
+      {/* Push this one occurrence to another day.
+          
+          One occurrence, not the schedule: the bins are Tuesdays, and this week
+          the lorry comes Wednesday. Editing the cadence would move every future
+          week and quietly rewrite what was expected of everybody. Offered only
+          while it is still outstanding — moving something already done or
+          skipped would be rewriting history rather than planning. */}
+      {!done && !skipped && (
+        <Field label="Move this one">
+          <div className="flex gap-1.5 flex-wrap">
+            {[1, 2, 3].map((n) => {
+              const to = ymd(addDays(when, n));
+              const td = parseYMD(to);
+              return (
+                <button key={n}
+                  onClick={() => update((d) => ({
+                    ...d,
+                    chores: (d.chores || []).map((c) =>
+                      c.id === chore.id ? CADENCE.moveOccurrence(c, movedFromKey || dateKey, to) : c),
+                  }))}
+                  className="tapfade px-3 py-2.5 rounded-xl font-semibold"
+                  style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.ink, fontSize: 13 }}>
+                  {WD_SHORT[td.getDay()]} {td.getDate()}
+                </button>
+              );
+            })}
+            {movedFromKey && (
+              <button
+                onClick={() => update((d) => ({
+                  ...d,
+                  chores: (d.chores || []).map((c) =>
+                    c.id === chore.id ? CADENCE.moveOccurrence(c, movedFromKey, movedFromKey) : c),
+                }))}
+                className="tapfade px-3 py-2.5 rounded-xl font-semibold"
+                style={{ background: T.panelAlt, border: `1px solid ${T.brand}`, color: T.brand, fontSize: 13 }}>
+                Put it back
+              </button>
+            )}
+          </div>
+          <p style={{ color: T.faint, fontSize: 12.5 }} className="mt-1.5">
+            {movedFromKey
+              ? `Moved from ${WD_LONG[parseYMD(movedFromKey).getDay()]} ${parseYMD(movedFromKey).getDate()}. Next time is unaffected.`
+              : "Just this time — the schedule itself does not change."}
+          </p>
+        </Field>
+      )}
+
+      {/* How often it actually comes round, which is a different question from
+          how often it was scheduled to. */}
+      {stats.count > 0 && (
+        <Field label="How often, in practice">
+          <div className="rounded-xl px-3 py-2.5" style={{ background: T.panelAlt, border: `1px solid ${T.line}` }}>
+            <div style={{ fontSize: 13.5, color: T.ink, fontWeight: 600 }}>
+              {INTERVALS.describeInterval(stats)}
+            </div>
+            {stats.daysSince !== null && (
+              <div style={{ color: T.faint, fontSize: 12.5 }} className="mt-1">
+                Last done {stats.daysSince === 0 ? "today" : `${stats.daysSince} day${stats.daysSince === 1 ? "" : "s"} ago`}
+                {stats.averageDays !== null && Math.abs(stats.averageDays - stats.typicalDays) >= 0.5 && (
+                  <> · mean {INTERVALS.tidy(stats.averageDays)} days, which is dragged by the long gaps</>
+                )}
+              </div>
+            )}
+            {drift && (
+              <div style={{ color: "#8A5F14", fontSize: 12.5, fontWeight: 600 }} className="mt-1.5">
+                Set to every {drift.planned} days, but actually done every{" "}
+                {INTERVALS.tidy(drift.actual)} — {drift.faster
+                  ? "the house needs it sooner than the schedule says"
+                  : "the schedule asks for it sooner than the house needs"}.
+              </div>
+            )}
+          </div>
+        </Field>
       )}
 
       {checklist.length > 0 && (
@@ -6620,6 +7323,7 @@ export function ChoreModal({ payload, people, update, close }) {
   const [personId, setPersonId] = useState(payload.personId || (payload.id ? "" : defaultPersonId(people)));
   const [rotation, setRotation] = useState(Array.isArray(payload.rotation) ? payload.rotation.filter(Boolean) : []);
   const [cad, setCad] = useState(payload.cadence || { type: "daily" });
+  const [pause, setPause] = useState(payload.pause || null);
   const [alert, setAlert] = useState(payload.alert || null);
   const [notes, setNotes] = useState(
     payload.notes && typeof payload.notes === "object" && !Array.isArray(payload.notes) ? payload.notes : {});
@@ -6628,11 +7332,19 @@ export function ChoreModal({ payload, people, update, close }) {
   // tapping a person appends them to the end, so the order you tap is the order it rotates
   const toggleRot = (id) => setRotation((cur) => cur.includes(id) ? cur.filter((x) => x !== id) : [...cur, id]);
   const setType = (type) => setCad(
-    type === "weekly" ? { type, days: cad.days?.length ? cad.days : [new Date().getDay()] }
+    type === "weekly" ? {
+      type,
+      days: cad.days?.length ? cad.days : [new Date().getDay()],
+      everyNWeeks: cad.everyNWeeks || 1,
+      // The week this pattern counts from. Without it, "every other Tuesday"
+      // has no way to know which Tuesday is the first one.
+      anchor: cad.anchor || ymd(new Date()),
+    }
       : type === "monthly" ? { type, dayOfMonth: cad.dayOfMonth || new Date().getDate() }
-        : type === "interval" ? { type, everyN: cad.everyN || 2, start: cad.start || ymd(new Date()) }
-          : type === "perPerson" ? { type, people: cad.people || {} }
-            : { type: "daily" }
+        : type === "monthlyDay" ? { type, dow: cad.dow ?? new Date().getDay(), nth: cad.nth || 1 }
+          : type === "interval" ? { type, everyN: cad.everyN || 2, start: cad.start || ymd(new Date()) }
+            : type === "perPerson" ? { type, people: cad.people || {} }
+              : { type: "daily" }
   );
 
   /* Each person in the rotation picks their own days. Unlike a rotation, where
@@ -6659,8 +7371,9 @@ export function ChoreModal({ payload, people, update, close }) {
     const rot = rotation.length > 1 ? rotation : [];
     const fixed = rotation.length === 1 ? rotation[0] : personId;
     update((d) => {
-      if (editing) d.chores = d.chores.map((c) => c.id === payload.id ? { ...c, title, personId: fixed, rotation: rot, cadence, alert, notes, checklist: checklist.filter((x) => x.trim()) } : c);
-      else d.chores = [...d.chores, { id: uid(), title, personId: fixed, rotation: rot, cadence, alert, notes, checklist: checklist.filter((x) => x.trim()), createdOn: ymd(new Date()), done: {} }];
+      const withPause = (c) => (pause ? { ...c, pause } : (() => { const n = { ...c }; delete n.pause; return n; })());
+      if (editing) d.chores = d.chores.map((c) => c.id === payload.id ? withPause({ ...c, title, personId: fixed, rotation: rot, cadence, alert, notes, checklist: checklist.filter((x) => x.trim()) }) : c);
+      else d.chores = [...d.chores, withPause({ id: uid(), title, personId: fixed, rotation: rot, cadence, alert, notes, checklist: checklist.filter((x) => x.trim()), createdOn: ymd(new Date()), done: {} })];
       return d;
     });
     close();
@@ -6672,9 +7385,15 @@ export function ChoreModal({ payload, people, update, close }) {
       <Field label="Chore"><input autoFocus value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Empty dishwasher" className="w-full px-4 py-3.5 rounded-xl text-lg outline-none" style={inputStyle} /></Field>
       <Field label="Repeats">
         <div className="flex flex-wrap gap-2">
-          {[["daily", "Every day"], ["weekly", "Weekly"], ["monthly", "Monthly"],
+          {[["daily", "Every day"], ["weekly", "Weekly"],
+            ["monthlyDay", "Monthly, on a weekday"], ["monthly", "Monthly, on a date"],
             ["interval", "Every N days"],
-            ...(rotation.length > 1 ? [["perPerson", "Each person's own day"]] : []),
+            /* Ungated. It used to appear only for a chore with a rotation of
+               two or more, which made "each person has their own day" reachable
+               only through taking turns -- and left a per-person chore without a
+               rotation renderable but not editable, its schedule invisible.
+               A household of one still gets to say "Thursdays are mine". */
+            ["perPerson", "Each person's own day"],
            ].map(([v, l]) => (
             <button key={v} onClick={() => setType(v)} className="tapfade px-4 py-2.5 rounded-full font-semibold"
               style={{ background: cad.type === v ? T.brand : T.panelAlt, color: cad.type === v ? "#fff" : T.ink, border: `1px solid ${cad.type === v ? T.brand : T.line}` }}>{l}</button>
@@ -6692,12 +7411,75 @@ export function ChoreModal({ payload, people, update, close }) {
               );
             })}
           </div>
+
+          {/* Counted in whole weeks, not in days: "every 14 days" drifts off
+              the weekday somebody chose the moment a completion runs late. */}
+          <div className="flex gap-1.5 mt-2">
+            {[[1, "Every week"], [2, "Every other"], [3, "Every 3rd"], [4, "Every 4th"]].map(([n, l]) => {
+              const on = (Number(cad.everyNWeeks) || 1) === n;
+              return (
+                <button key={n}
+                  onClick={() => setCad((c) => ({ ...c, everyNWeeks: n, anchor: c.anchor || ymd(new Date()) }))}
+                  className="tapfade flex-1 py-2.5 rounded-xl font-semibold"
+                  style={{ background: on ? T.brand : T.panelAlt, color: on ? "#fff" : T.sub,
+                    border: `1px solid ${on ? T.brand : T.line}`, fontSize: 12.5 }}>{l}</button>
+              );
+            })}
+          </div>
+          {(Number(cad.everyNWeeks) || 1) > 1 && (
+            <p style={{ color: T.faint, fontSize: 12 }} className="mt-1.5">
+              Counting from the week of{" "}
+              <input type="date" value={cad.anchor || ymd(new Date())}
+                onChange={(e) => setCad((c) => ({ ...c, anchor: e.target.value }))}
+                style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.ink,
+                  borderRadius: 8, padding: "2px 6px", fontSize: 12 }} />
+            </p>
+          )}
+        </Field>
+      )}
+
+      {cad.type === "monthlyDay" && (
+        <Field label="Which weekday of the month">
+          <div className="flex gap-1.5 mb-2">
+            {[[1, "1st"], [2, "2nd"], [3, "3rd"], [4, "4th"], [-1, "Last"]].map(([n, l]) => {
+              const on = (Number(cad.nth) || 1) === n;
+              return (
+                <button key={n} onClick={() => setCad((c) => ({ ...c, nth: n }))}
+                  className="tapfade flex-1 py-2.5 rounded-xl font-bold"
+                  style={{ background: on ? T.brand : T.panelAlt, color: on ? "#fff" : T.sub,
+                    border: `1px solid ${on ? T.brand : T.line}`, fontSize: 12.5 }}>{l}</button>
+              );
+            })}
+          </div>
+          <div className="flex gap-1.5">
+            {WD_SHORT.map((w, i) => {
+              const on = (cad.dow ?? 1) === i;
+              return (
+                <button key={i} onClick={() => setCad((c) => ({ ...c, dow: i }))}
+                  aria-label={w}
+                  className="tapfade flex-1 py-3 rounded-xl font-bold"
+                  style={{ background: on ? T.brand : T.panelAlt, color: on ? "#fff" : T.sub,
+                    border: `1px solid ${on ? T.brand : T.line}`, fontSize: 13 }}>{w[0]}</button>
+              );
+            })}
+          </div>
+          <p style={{ color: T.faint, fontSize: 12 }} className="mt-1.5">
+            {CADENCE.describeCadence({ cadence: cad })} — a date lands on a different weekday
+            every month, which is no good for anything tied to a collection day.
+          </p>
         </Field>
       )}
       {cad.type === "perPerson" && (
         <Field label="Who does it, and when">
           <div className="flex flex-col gap-2.5">
-            {rotation.map((pid) => {
+            {/* Everyone in the household, not just the rotation.
+                
+                Iterating the rotation was the other half of the gating: it made
+                the option meaningless without one, and left a per-person chore
+                that had somehow lost its rotation impossible to edit — its
+                schedule rendered on Today and was invisible here. Rotation
+                order first, since that is the order the household chose. */}
+            {[...rotation, ...people.filter((x) => !rotation.includes(x.id)).map((x) => x.id)].map((pid) => {
               const person = people.find((x) => x.id === pid);
               const mine = cad.people?.[pid]?.days || [];
               return (
@@ -6810,6 +7592,64 @@ export function ChoreModal({ payload, people, update, close }) {
       </Field>
       <ChecklistEditor items={checklist} onChange={setChecklist} />
       <ChoreNotesEditor chore={payload} dateKey={ymd(new Date())} notes={notes} onChange={setNotes} />
+      {/* Pausing, for the chores that do not exist for part of the year.
+          
+          Mowing the lawn is not a chore anybody skips from November to March;
+          it is a chore that does not exist then. Skipping it weekly instead
+          would bury five months of skips in the history and make the "who is
+          not pulling their weight" report lie. A paused chore is simply not
+          due, and — because the overdue walk asks the same question — accrues
+          nothing while it sleeps. */}
+      <Field label="Pause">
+        <div className="flex gap-2 mb-2">
+          <button onClick={() => setPause(null)} className="tapfade flex-1 py-2.5 rounded-xl font-semibold"
+            style={{ background: !pause ? T.brand : T.panelAlt, color: !pause ? "#fff" : T.ink,
+              border: `1px solid ${!pause ? T.brand : T.line}` }}>
+            Running
+          </button>
+          <button
+            onClick={() => setPause(pause || {
+              from: ymd(new Date()),
+              until: ymd(addDays(new Date(), 90)),
+              annual: false, paused: true,
+            })}
+            className="tapfade flex-1 py-2.5 rounded-xl font-semibold"
+            style={{ background: pause ? T.brand : T.panelAlt, color: pause ? "#fff" : T.ink,
+              border: `1px solid ${pause ? T.brand : T.line}` }}>
+            Paused
+          </button>
+        </div>
+
+        {pause && (
+          <>
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }} className="uppercase mb-1">From</div>
+                <input type="date" value={pause.from || ""}
+                  onChange={(e) => setPause((p) => ({ ...p, from: e.target.value }))}
+                  className="w-full px-2.5 py-2.5 rounded-xl text-base outline-none" style={inputStyle} />
+              </div>
+              <div>
+                <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }} className="uppercase mb-1">Until</div>
+                <input type="date" value={pause.until || ""}
+                  onChange={(e) => setPause((p) => ({ ...p, until: e.target.value }))}
+                  className="w-full px-2.5 py-2.5 rounded-xl text-base outline-none" style={inputStyle} />
+              </div>
+            </div>
+            <button onClick={() => setPause((p) => ({ ...p, annual: !p.annual }))}
+              className="tapfade w-full mt-2 py-2.5 rounded-xl font-semibold"
+              style={{ background: pause.annual ? T.brand : T.panelAlt, color: pause.annual ? "#fff" : T.ink,
+                border: `1px solid ${pause.annual ? T.brand : T.line}`, fontSize: 13 }}>
+              {pause.annual ? "Every year — seasonal" : "Just this once"}
+            </button>
+            <p style={{ color: T.faint, fontSize: 12.5 }} className="mt-1.5">
+              {CADENCE.pauseLabel({ pause })}. It will not come due or go overdue while paused
+              {pause.annual ? ", and this repeats every year — set it once for the season." : "."}
+            </p>
+          </>
+        )}
+      </Field>
+
       <AlertEditor value={alert} onChange={setAlert} />
       <SaveBar onSave={save} onDelete={editing ? del : null} />
     </Overlay>
@@ -6966,10 +7806,16 @@ export function HistoryModal({ data, update, personById, close }) {
   const [days, setDays] = useState(14);
   const [who, setWho] = useState("all");
   const [error, setError] = useState("");
-  // Off by default. A running tally of who is not pulling their weight is a
-  // thing to go and look at deliberately, not something a shared screen should
-  // put in front of the household every time somebody opens their history.
-  const [showReport, setShowReport] = useState(false);
+  /* One place for the whole record, rather than history here and the archive
+     filed under Settings -- somebody asking "who did what" should not have to
+     know that half the answer is in a different part of the app.
+     
+     "history" is still the default and the report is still opt-in: a running
+     tally of who is not pulling their weight is a thing to go and look at
+     deliberately, not something a shared screen puts in front of the household
+     every time somebody opens this. */
+  const [view, setView] = useState("history");   // history | report | archive
+  const showReport = view === "report";
   const todayKey = ymd(new Date());
   const actor = actorFor(data);
 
@@ -7122,23 +7968,34 @@ export function HistoryModal({ data, update, personById, close }) {
         ))}
       </div>
 
-      {Object.keys(tally).length > 0 && (
-        <div className="flex items-center gap-3 flex-wrap rounded-xl px-3 py-2.5 mb-3" style={{ background: T.panelAlt }}>
-          <span style={{ color: T.sub, fontSize: 11.5, fontWeight: 800, letterSpacing: 0.5 }} className="uppercase">Completed</span>
-          {data.people.map((pp) => (
-            <span key={pp.id} className="flex items-center gap-1.5">
-              <span className="rounded-full" style={{ width: 8, height: 8, background: pp.color }} />
-              <span style={{ fontSize: 13, fontWeight: 700, color: T.ink }}>{pp.name} {tally[pp.id] || 0}</span>
-            </span>
-          ))}
-          <button onClick={() => setShowReport((v) => !v)}
-            className="tapfade ml-auto px-3 py-1.5 rounded-full font-semibold"
-            style={{ background: showReport ? T.brand : T.panel, color: showReport ? "#fff" : T.sub,
-              border: `1px solid ${showReport ? T.brand : T.line}`, fontSize: 12.5 }}>
-            {showReport ? "Hide report" : "Report"}
-          </button>
-        </div>
-      )}
+      {/* The view switch is outside the tally, not inside it. It used to be
+          inside, and with the archive added that would have made Archive
+          unreachable on any household whose current window happens to be empty
+          -- which is exactly the household most likely to go looking for the
+          older record. */}
+      <div className="flex items-center gap-3 flex-wrap rounded-xl px-3 py-2.5 mb-3" style={{ background: T.panelAlt }}>
+          {Object.keys(tally).length > 0 && (
+            <>
+              <span style={{ color: T.sub, fontSize: 11.5, fontWeight: 800, letterSpacing: 0.5 }} className="uppercase">Completed</span>
+              {data.people.map((pp) => (
+                <span key={pp.id} className="flex items-center gap-1.5">
+                  <span className="rounded-full" style={{ width: 8, height: 8, background: pp.color }} />
+                  <span style={{ fontSize: 13, fontWeight: 700, color: T.ink }}>{pp.name} {tally[pp.id] || 0}</span>
+                </span>
+              ))}
+            </>
+          )}
+          <div className="ml-auto flex items-center gap-1.5">
+            {[["history", "History"], ["report", "Report"], ["archive", "Archive"]].map(([id, label]) => (
+              <button key={id} onClick={() => setView(id)}
+                className="tapfade px-3 py-1.5 rounded-full font-semibold"
+                style={{ background: view === id ? T.brand : T.panel, color: view === id ? "#fff" : T.sub,
+                  border: `1px solid ${view === id ? T.brand : T.line}`, fontSize: 12.5 }}>
+                {label}
+              </button>
+            ))}
+          </div>
+      </div>
 
       {showReport && (
         <div className="rounded-xl px-3 py-3 mb-3" style={{ background: T.panel, border: `1px solid ${T.line}` }}>
@@ -7193,7 +8050,11 @@ export function HistoryModal({ data, update, personById, close }) {
         </div>
       )}
 
-      {rows.length === 0 ? (
+      {view === "archive" && (
+        <ArchiveRecord theme={T} data={data} update={update} />
+      )}
+
+      {view === "history" && (rows.length === 0 ? (
         <Empty text="Nothing completed in this window." />
       ) : (
         <div className="flex flex-col gap-3.5">
@@ -7258,7 +8119,7 @@ export function HistoryModal({ data, update, personById, close }) {
             );
           })}
         </div>
-      )}
+      ))}
 
       <p style={{ color: T.faint, fontSize: 12 }} className="mt-3">
         Tap a name to change who gets credit — handy when the rotation said one of you but
@@ -7457,9 +8318,23 @@ function PersonPicker({ people, value, onChange }) {
 }
 
 /* ---------------- Settings ---------------- */
-function SettingsModal({ data, update, saveNow, syncCalendars, close, currentUser }) {
+/* The sections of Settings, in the order they are offered. Grouped by what
+   somebody came in to change rather than by which part of the code owns it --
+   "Displays" and "Sticky notes on Today" are both about what the screens show,
+   and were four hundred lines apart. */
+const SECTION_TABS = [
+  { id: "household", label: "Household", Icon: Users },
+  { id: "screens", label: "Screens", Icon: Sofa },
+  { id: "connections", label: "Connections", Icon: Link2 },
+  { id: "evening", label: "Evening", Icon: BellRing },
+  { id: "record", label: "Record", Icon: Archive },
+  { id: "account", label: "Account & data", Icon: Lock },
+  { id: "server", label: "Server", Icon: Wrench },
+];
+
+export function SettingsModal({ data, update, saveNow, syncCalendars, close, currentUser }) {
   const [name, setName] = useState(data.householdName || "Our Home");
-  const [tab, setTab] = useState("people");
+  const [section, setSection] = useState("household");
   const saveName = () => {
     const next = name.trim() || "Our Home";
     update((d) => { d.householdName = next; return d; });
@@ -7481,204 +8356,254 @@ function SettingsModal({ data, update, saveNow, syncCalendars, close, currentUse
   return (
     <Overlay close={close} wide>
       <ModalHead title="Settings" close={close} />
-      <Field label="Household name">
-        <input value={name} onChange={(e) => setName(e.target.value)} onBlur={saveName} className="w-full px-4 py-3.5 rounded-xl text-lg outline-none" style={inputStyle} />
-      </Field>
-      {/* Who is in this household, and letting new people in. The key wrap that
-          admits someone happens in the browser, so it has to live in the UI. */}
-      <Field label="People">
-        <HouseholdPanel theme={T} me={currentUser} householdName={data.householdName} />
-      </Field>
-      <Field label="Archive">
-        <ArchivePanel theme={T} data={data} update={update} me={currentUser} />
-      </Field>
-      <Field label="Displays">
-        <DisplaysPanel theme={T} me={currentUser} />
-      </Field>
-      <Field label="Home Assistant">
-        <HomeAssistantPanel theme={T} />
-      </Field>
-      <Field label="Devices">
-        <DevicesPanel theme={T} />
-      </Field>
-      <Field label="Cameras">
-        <CamerasPanel theme={T} />
-      </Field>
-      <Field label="AI">
-        <AiPanel theme={T} data={data} update={update} />
-      </Field>
-      <Field label="Two-way calendar sync">
-        <CaldavPanel theme={T} iAmAdmin={currentUser?.role === "admin"}
-          collectEvents={(calId) => eventsForSync(data, calId)} />
-      </Field>
-      <Field label="Extra row on Today">
-        <SecondBlockSettings data={data} update={update} theme={T} people={data.people} />
-      </Field>
-      <Field label="Import from the old HouseHub">
-        <ImportPanel theme={T} data={data} update={update} saveNow={saveNow} />
-      </Field>
-      <Field label="Staying signed in">
-        <SessionPolicyPanel theme={T} />
-      </Field>
-      <Field label="Your data">
-        <PrivacyPanel theme={T} data={data} me={currentUser} />
-      </Field>
-      {currentUser?.isSuperAdmin && (
-        <Field label="Server (super admin)">
-          <SuperAdminPanel theme={T} />
-        </Field>
-      )}
-      <Field label="Account">
-        <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-          <button
-            className="tapfade px-4 py-3 rounded-xl font-semibold"
-            style={{ background: T.panelAlt, color: T.ink, border: `1px solid ${T.line}` }}
-            onClick={() => window.dispatchEvent(new CustomEvent("househub:switch-household"))}
-          >
-            Switch household
-          </button>
-          {/* Signing out was only reachable from the household picker, which you
-              cannot get back to once inside a household. */}
-          <button
-            className="tapfade px-4 py-3 rounded-xl font-semibold"
-            style={{ background: T.panelAlt, color: "#a12f1c", border: `1px solid ${T.line}` }}
-            onClick={async () => {
-              if (!confirm("Sign out?\n\nYour keys are only held in memory, so you will need your password again.")) return;
-              await session.signOut();
-              window.location.reload();
-            }}
-          >
-            Sign out
-          </button>
-          <span style={{ color: T.faint, fontSize: 13 }}>{currentUser?.email || ""}</span>
-        </div>
-      </Field>
-      <Field label="Display mode">
-        <div className="flex gap-2">
-          {[["auto", "Auto"], ["wall", "Wall (row)"], ["compact", "Compact"]].map(([v, l]) => {
-            const active = (data.layoutMode || "auto") === v;
-            return (
-              <button key={v} onClick={() => update((d) => { d.layoutMode = v; return d; })} className="tapfade flex-1 py-3 rounded-xl font-semibold"
-                style={{ background: active ? T.brand : T.panelAlt, color: active ? "#fff" : T.ink, border: `1px solid ${active ? T.brand : T.line}` }}>{l}</button>
-            );
-          })}
-        </div>
-        <p style={{ color: T.faint, fontSize: 13 }} className="mt-2">Wall keeps the side-by-side dashboard for a mounted iPad. Compact stacks everything for a phone. Auto chooses by screen width.</p>
-      </Field>
-      <Field label="Sticky notes on Today">
-        <div className="flex gap-2">
-          {[["overlay", "Stuck on"], ["row", "Compact row"], ["off", "Hidden"]].map(([v, l]) => {
-            const active = (data.noteDisplay || "overlay") === v;
-            return (
-              <button key={v} onClick={() => update((d) => { d.noteDisplay = v; return d; })} className="tapfade flex-1 py-3 rounded-xl font-semibold"
-                style={{ background: active ? T.brand : T.panelAlt, color: active ? "#fff" : T.ink, border: `1px solid ${active ? T.brand : T.line}` }}>{l}</button>
-            );
-          })}
-        </div>
-        <p style={{ color: T.faint, fontSize: 13 }} className="mt-2">
-          "Stuck on" lays notes over the Today screen — drag to move them, tap to edit. Phones always use the compact row.
-        </p>
 
-        {(data.noteDisplay || "overlay") === "overlay" && (
-          <div className="mt-3">
-            <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }} className="uppercase mb-1">Idle drift</div>
-            <div className="flex gap-2">
-              {[[false, "Still"], [true, "Gentle drift"]].map(([v, l]) => {
-                const on = !!data.noteDrift === v;
-                return (
-                  <button key={String(v)} onClick={() => update((d) => { d.noteDrift = v; return d; })}
-                    className="tapfade flex-1 py-2.5 rounded-xl font-semibold"
-                    style={{ background: on ? T.brand : T.panelAlt, color: on ? "#fff" : T.ink, border: `1px solid ${on ? T.brand : T.line}` }}>{l}</button>
-                );
-              })}
-            </div>
-            <p style={{ color: T.faint, fontSize: 12.5 }} className="mt-1.5">
-              Lets the notes wander a few pixels every so often, which stops a wall display
-              burning a fixed image into the panel. Off if you find movement distracting.
-            </p>
-          </div>
-        )}
-        {(data.notes || []).some((n) => typeof n.x === "number") && (
-          <button onClick={() => update((d) => { d.notes = d.notes.map(({ x, y, ...rest }) => rest); return d; })}
-            className="tapfade mt-3 w-full py-2.5 rounded-xl font-semibold" style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.sub }}>
-            Tidy notes back into place
-          </button>
-        )}
-      </Field>
-      <Field label="Per-person summary on Today">
-        <div className="flex gap-2">
-          {[[true, "Show"], [false, "Hide"]].map(([v, l]) => {
-            const active = (data.showBreakdown !== false) === v;
-            return (
-              <button key={String(v)} onClick={() => update((d) => { d.showBreakdown = v; return d; })}
-                className="tapfade flex-1 py-3 rounded-xl font-semibold"
-                style={{ background: active ? T.brand : T.panelAlt, color: active ? "#fff" : T.ink, border: `1px solid ${active ? T.brand : T.line}` }}>{l}</button>
-            );
-          })}
-        </div>
-        <p style={{ color: T.faint, fontSize: 13 }} className="mt-2">Hiding it gives the three columns more vertical room.</p>
-      </Field>
-      <Field label="“Up next” draws from">
-        {(data.calendars || []).length === 0 ? (
-          <p style={{ color: T.faint, fontSize: 14, lineHeight: 1.5 }}>
-            No calendars connected yet. Add one under <b>Calendar sync</b> and it will appear
-            here so you can choose which ones feed the “Up next” card.
-          </p>
-        ) : (
-          <>
-            <button onClick={() => update((d) => { d.upNextSources = null; return d; })}
-              className="tapfade w-full text-left px-4 py-3 rounded-xl font-semibold mb-2"
-              style={{
-                background: upNextAll ? T.brand : T.panelAlt,
-                color: upNextAll ? "#fff" : T.ink,
-                border: `1px solid ${upNextAll ? T.brand : T.line}`,
-              }}>
-              Every calendar
-            </button>
-            <div className="flex flex-col gap-2">
-              {[{ id: "local", name: "Events added here", color: T.brand }, ...(data.calendars || [])].map((src) => {
-                const on = !upNextAll && (data.upNextSources || []).includes(src.id);
-                return (
-                  <button key={src.id} onClick={() => update((d) => {
-                    const cur = Array.isArray(d.upNextSources) ? [...d.upNextSources] : [];
-                    const i = cur.indexOf(src.id);
-                    if (i >= 0) cur.splice(i, 1); else cur.push(src.id);
-                    d.upNextSources = cur.length ? cur : null;   // none picked = back to all
-                    return d;
-                  })}
-                    className="tapfade text-left px-3 py-3 rounded-xl font-semibold flex items-center gap-2.5"
-                    style={{ background: on ? T.brandSoft : T.panelAlt, border: `1px solid ${on ? T.brand : T.line}`, color: T.ink }}>
-                    <span className="w-5 h-5 rounded flex items-center justify-center shrink-0"
-                      style={{ background: on ? T.brand : "transparent", border: `2px solid ${on ? T.brand : T.faint}` }}>
-                      {on && <CheckCircle2 size={13} style={{ color: "#fff" }} />}
-                    </span>
-                    <span className="w-3 h-3 rounded-full shrink-0" style={{ background: src.color }} />
-                    <span className="truncate">{src.name}</span>
-                  </button>
-                );
-              })}
-            </div>
-            <p style={{ color: T.faint, fontSize: 13 }} className="mt-2">
-              Pick any combination. Unchecking everything goes back to using them all.
-            </p>
-          </>
-        )}
-      </Field>
-      <div className="flex gap-2 mb-5">
-        {[["people", "People", Users], ["calendars", "Calendar sync", Link2], ["weather", "Weather", Thermometer], ["voice", "Voice", Mic], ["home", "Home", Sofa], ["checkin", "Check-in", BellRing]].map(([id, label, Icon]) => (
-          <button key={id} onClick={() => setTab(id)} className="tapfade flex items-center gap-2 px-4 py-2.5 rounded-full font-semibold"
-            style={{ background: tab === id ? T.brand : T.panelAlt, color: tab === id ? "#fff" : T.sub, border: `1px solid ${tab === id ? T.brand : T.line}` }}>
-            <Icon size={17} />{label}
+      {/* Settings used to be twenty fields in a flat scroll with a tab strip
+          underneath them -- so half of it was tabbed, the other half was not,
+          and the tabs were below the scroll they were meant to be navigating.
+          One nav, at the top, and one section at a time. */}
+      <div className="flex gap-2 flex-wrap mb-5">
+        {SECTION_TABS.filter((s) => s.id !== "server" || currentUser?.isSuperAdmin).map((s) => (
+          <button key={s.id} onClick={() => setSection(s.id)}
+            className="tapfade flex items-center gap-2 px-4 py-2.5 rounded-full font-semibold"
+            style={{
+              background: section === s.id ? T.brand : T.panelAlt,
+              color: section === s.id ? "#fff" : T.sub,
+              border: `1px solid ${section === s.id ? T.brand : T.line}`,
+            }}>
+            <s.Icon size={17} />{s.label}
           </button>
         ))}
       </div>
-      {tab === "people" ? <PeopleSettings data={data} update={update} />
-        : tab === "voice" ? <VoiceSettings data={data} />
-        : tab === "home" ? <HomeSettings data={data} update={update} />
-        : tab === "checkin" ? <CheckInSettings data={data} update={update} />
-        : tab === "weather" ? <WeatherSettings data={data} update={update} />
-          : <CalendarSettings data={data} update={update} syncCalendars={syncCalendars} />}
-      <button onClick={resetAll} className="tapfade w-full py-3.5 rounded-2xl font-semibold mt-5" style={{ background: "#E86A4C14", color: "#E86A4C" }}>Reset everything</button>
+
+      {section === "household" && (
+        <>
+        <Field label="Household name">
+          <input value={name} onChange={(e) => setName(e.target.value)} onBlur={saveName} className="w-full px-4 py-3.5 rounded-xl text-lg outline-none" style={inputStyle} />
+        </Field>
+        {/* Who is in this household, and letting new people in. The key wrap that
+            admits someone happens in the browser, so it has to live in the UI. */}
+        <Field label="People">
+          <HouseholdPanel theme={T} me={currentUser} householdName={data.householdName} />
+        </Field>
+          <PeopleSettings data={data} update={update} />
+        </>
+      )}
+
+      {section === "screens" && (
+        <>
+        <Field label="Display mode">
+          <div className="flex gap-2">
+            {[["auto", "Auto"], ["wall", "Wall (row)"], ["compact", "Compact"]].map(([v, l]) => {
+              const active = (data.layoutMode || "auto") === v;
+              return (
+                <button key={v} onClick={() => update((d) => { d.layoutMode = v; return d; })} className="tapfade flex-1 py-3 rounded-xl font-semibold"
+                  style={{ background: active ? T.brand : T.panelAlt, color: active ? "#fff" : T.ink, border: `1px solid ${active ? T.brand : T.line}` }}>{l}</button>
+              );
+            })}
+          </div>
+          <p style={{ color: T.faint, fontSize: 13 }} className="mt-2">Wall keeps the side-by-side dashboard for a mounted iPad. Compact stacks everything for a phone. Auto chooses by screen width.</p>
+        </Field>
+        <Field label="Sticky notes on Today">
+          <div className="flex gap-2">
+            {[["overlay", "Stuck on"], ["row", "Compact row"], ["off", "Hidden"]].map(([v, l]) => {
+              const active = (data.noteDisplay || "overlay") === v;
+              return (
+                <button key={v} onClick={() => update((d) => { d.noteDisplay = v; return d; })} className="tapfade flex-1 py-3 rounded-xl font-semibold"
+                  style={{ background: active ? T.brand : T.panelAlt, color: active ? "#fff" : T.ink, border: `1px solid ${active ? T.brand : T.line}` }}>{l}</button>
+              );
+            })}
+          </div>
+          <p style={{ color: T.faint, fontSize: 13 }} className="mt-2">
+            "Stuck on" lays notes over the Today screen — drag to move them, tap to edit. Phones always use the compact row.
+          </p>
+
+          {(data.noteDisplay || "overlay") === "overlay" && (
+            <div className="mt-3">
+              <div style={{ color: T.sub, fontSize: 11, fontWeight: 700 }} className="uppercase mb-1">Idle drift</div>
+              <div className="flex gap-2">
+                {[[false, "Still"], [true, "Gentle drift"]].map(([v, l]) => {
+                  const on = !!data.noteDrift === v;
+                  return (
+                    <button key={String(v)} onClick={() => update((d) => { d.noteDrift = v; return d; })}
+                      className="tapfade flex-1 py-2.5 rounded-xl font-semibold"
+                      style={{ background: on ? T.brand : T.panelAlt, color: on ? "#fff" : T.ink, border: `1px solid ${on ? T.brand : T.line}` }}>{l}</button>
+                  );
+                })}
+              </div>
+              <p style={{ color: T.faint, fontSize: 12.5 }} className="mt-1.5">
+                Lets the notes wander a few pixels every so often, which stops a wall display
+                burning a fixed image into the panel. Off if you find movement distracting.
+              </p>
+            </div>
+          )}
+          {(data.notes || []).some((n) => typeof n.x === "number") && (
+            <button onClick={() => update((d) => { d.notes = d.notes.map(({ x, y, ...rest }) => rest); return d; })}
+              className="tapfade mt-3 w-full py-2.5 rounded-xl font-semibold" style={{ background: T.panelAlt, border: `1px solid ${T.line}`, color: T.sub }}>
+              Tidy notes back into place
+            </button>
+          )}
+        </Field>
+        <Field label="Per-person summary on Today">
+          <div className="flex gap-2">
+            {[[true, "Show"], [false, "Hide"]].map(([v, l]) => {
+              const active = (data.showBreakdown !== false) === v;
+              return (
+                <button key={String(v)} onClick={() => update((d) => { d.showBreakdown = v; return d; })}
+                  className="tapfade flex-1 py-3 rounded-xl font-semibold"
+                  style={{ background: active ? T.brand : T.panelAlt, color: active ? "#fff" : T.ink, border: `1px solid ${active ? T.brand : T.line}` }}>{l}</button>
+              );
+            })}
+          </div>
+          <p style={{ color: T.faint, fontSize: 13 }} className="mt-2">Hiding it gives the three columns more vertical room.</p>
+        </Field>
+        <Field label="“Up next” draws from">
+          {(data.calendars || []).length === 0 ? (
+            <p style={{ color: T.faint, fontSize: 14, lineHeight: 1.5 }}>
+              No calendars connected yet. Add one under <b>Calendar sync</b> and it will appear
+              here so you can choose which ones feed the “Up next” card.
+            </p>
+          ) : (
+            <>
+              <button onClick={() => update((d) => { d.upNextSources = null; return d; })}
+                className="tapfade w-full text-left px-4 py-3 rounded-xl font-semibold mb-2"
+                style={{
+                  background: upNextAll ? T.brand : T.panelAlt,
+                  color: upNextAll ? "#fff" : T.ink,
+                  border: `1px solid ${upNextAll ? T.brand : T.line}`,
+                }}>
+                Every calendar
+              </button>
+              <div className="flex flex-col gap-2">
+                {[{ id: "local", name: "Events added here", color: T.brand }, ...(data.calendars || [])].map((src) => {
+                  const on = !upNextAll && (data.upNextSources || []).includes(src.id);
+                  return (
+                    <button key={src.id} onClick={() => update((d) => {
+                      const cur = Array.isArray(d.upNextSources) ? [...d.upNextSources] : [];
+                      const i = cur.indexOf(src.id);
+                      if (i >= 0) cur.splice(i, 1); else cur.push(src.id);
+                      d.upNextSources = cur.length ? cur : null;   // none picked = back to all
+                      return d;
+                    })}
+                      className="tapfade text-left px-3 py-3 rounded-xl font-semibold flex items-center gap-2.5"
+                      style={{ background: on ? T.brandSoft : T.panelAlt, border: `1px solid ${on ? T.brand : T.line}`, color: T.ink }}>
+                      <span className="w-5 h-5 rounded flex items-center justify-center shrink-0"
+                        style={{ background: on ? T.brand : "transparent", border: `2px solid ${on ? T.brand : T.faint}` }}>
+                        {on && <CheckCircle2 size={13} style={{ color: "#fff" }} />}
+                      </span>
+                      <span className="w-3 h-3 rounded-full shrink-0" style={{ background: src.color }} />
+                      <span className="truncate">{src.name}</span>
+                    </button>
+                  );
+                })}
+              </div>
+              <p style={{ color: T.faint, fontSize: 13 }} className="mt-2">
+                Pick any combination. Unchecking everything goes back to using them all.
+              </p>
+            </>
+          )}
+        </Field>
+        <Field label="Extra row on Today">
+          <SecondBlockSettings data={data} update={update} theme={T} people={data.people} />
+        </Field>
+        <Field label="Displays">
+          <DisplaysPanel theme={T} me={currentUser} />
+        </Field>
+          <HomeSettings data={data} update={update} />
+        </>
+      )}
+
+      {section === "connections" && (
+        <>
+        <Field label="Home Assistant">
+          <HomeAssistantPanel theme={T} />
+        </Field>
+        <Field label="Devices">
+          <DevicesPanel theme={T} />
+        </Field>
+        <Field label="Cameras">
+          <CamerasPanel theme={T} />
+        </Field>
+        <Field label="Two-way calendar sync">
+          <CaldavPanel theme={T} iAmAdmin={currentUser?.role === "admin"}
+            collectEvents={(calId) => eventsForSync(data, calId)} />
+        </Field>
+          <CalendarSettings data={data} update={update} syncCalendars={syncCalendars} />
+          <WeatherSettings data={data} update={update} />
+        <Field label="AI">
+          <AiPanel theme={T} data={data} update={update} />
+        </Field>
+        </>
+      )}
+
+      {section === "evening" && (
+        <>
+          <CheckInSettings data={data} update={update} />
+          <VoiceSettings data={data} />
+        </>
+      )}
+
+      {section === "record" && (
+        <>
+        <Field label="Archive">
+          <ArchivePanel theme={T} data={data} update={update} me={currentUser} />
+        </Field>
+        </>
+      )}
+
+      {section === "account" && (
+        <>
+        <Field label="Staying signed in">
+          <SessionPolicyPanel theme={T} />
+        </Field>
+        <Field label="Your data">
+          <PrivacyPanel theme={T} data={data} me={currentUser} />
+        </Field>
+        <Field label="Import from the old HouseHub">
+          <ImportPanel theme={T} data={data} update={update} saveNow={saveNow} />
+        </Field>
+        <Field label="Account">
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <button
+              className="tapfade px-4 py-3 rounded-xl font-semibold"
+              style={{ background: T.panelAlt, color: T.ink, border: `1px solid ${T.line}` }}
+              onClick={() => window.dispatchEvent(new CustomEvent("househub:switch-household"))}
+            >
+              Switch household
+            </button>
+            {/* Signing out was only reachable from the household picker, which you
+                cannot get back to once inside a household. */}
+            <button
+              className="tapfade px-4 py-3 rounded-xl font-semibold"
+              style={{ background: T.panelAlt, color: "#a12f1c", border: `1px solid ${T.line}` }}
+              onClick={async () => {
+                if (!confirm("Sign out?\n\nYour keys are only held in memory, so you will need your password again.")) return;
+                await session.signOut();
+                window.location.reload();
+              }}
+            >
+              Sign out
+            </button>
+            <span style={{ color: T.faint, fontSize: 13 }}>{currentUser?.email || ""}</span>
+          </div>
+        </Field>
+        {/* Kept at the very bottom of Account & data rather than floating under
+            every section: it wipes the household's content, and a destructive
+            button that follows you around is one you eventually press. */}
+        <button onClick={resetAll} className="tapfade w-full py-3.5 rounded-2xl font-semibold mt-5" style={{ background: "#E86A4C14", color: "#E86A4C" }}>Reset everything</button>
+
+        </>
+      )}
+
+      {section === "server" && (
+        <>
+        {currentUser?.isSuperAdmin && (
+          <Field label="Server (super admin)">
+            <SuperAdminPanel theme={T} />
+          </Field>
+        )}
+        </>
+      )}
+
       <p style={{ color: T.faint, fontSize: 13 }} className="text-center mt-3">Everything saves automatically on this device.</p>
       <p style={{ color: T.faint, fontSize: 12 }} className="text-center mt-1">Build {BUILD} · {useMobile() ? "compact layout" : "wall layout"} · {typeof window !== "undefined" ? window.innerWidth : "?"}px wide</p>
     </Overlay>
@@ -7983,9 +8908,10 @@ function CheckInSettings({ data, update }) {
 
         <p style={{ color: T.faint, fontSize: 12.5 }} className="mt-2">
           Browsers block audio until someone has tapped the page at least once, so the very
-          first chime after a reboot may be silent. If the test above is silent too, it is the
-          device rather than the app — check the volume, and on an iPad the physical mute
-          switch, which Safari honours even for web audio.
+          first chime after a reboot may be silent — tapping the button above is what permits
+          it for the rest of the session. If the test is silent too, it is the device rather
+          than the app: check the volume, and check the screen has not gone to sleep, since a
+          tab that is not on screen cannot make a sound.
         </p>
       </Field>
 

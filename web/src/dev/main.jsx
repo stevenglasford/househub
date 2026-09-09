@@ -9,13 +9,14 @@ import ReactDOM from "react-dom/client";
 
 import App from "../App.jsx";
 import { hydrateConfig } from "../config.js";
-import { resetDoc } from "./mock-session.js";
+import { resetDoc, isDisplay } from "./mock-session.js";
 import "../index.css";
 
 // Deliberately unmissable. A screenshot of the sandbox should never be mistaken
 // for a screenshot of the real app -- the data in it is invented.
 function SandboxBadge() {
   const [open, setOpen] = useState(false);
+  const display = isDisplay();
   return (
     <div style={{
       position: "fixed", bottom: 10, right: 10, zIndex: 99999,
@@ -30,6 +31,36 @@ function SandboxBadge() {
           <div style={{ marginBottom: 6 }}>
             Fixture data in localStorage. No server, no login, no encryption.
           </div>
+          {/* Signed in vs. shared display, as buttons rather than a console
+              call. The two are genuinely different apps -- a display's
+              completions are attributable to a screen rather than a person,
+              which is what makes them correctable -- and until this was on
+              screen the difference could only be tried from a laptop with
+              devtools open. On a wall tablet, or on the hosted build, that
+              meant it could not be tried at all. */}
+          <div style={{ marginBottom: 8 }}>
+            <div style={{ color: "#9ca3af", marginBottom: 5 }}>Signed in as</div>
+            <div style={{ display: "flex", gap: 5 }}>
+              {[[false, "Ryan", "a member — their own ticks are locked"],
+                [true, "Kitchen wall", "a display — ticks are correctable"]].map(([on, label, hint]) => (
+                <button key={label} title={hint}
+                  onClick={() => window.__hub.display(on)}
+                  style={{
+                    flex: 1, background: display === on ? "#B45309" : "#374151",
+                    color: "#fff", border: 0, borderRadius: 6,
+                    padding: "6px 8px", cursor: "pointer", fontSize: 11, fontWeight: 600,
+                  }}>
+                  {label}
+                </button>
+              ))}
+            </div>
+            <div style={{ color: "#9ca3af", marginTop: 6, lineHeight: 1.45 }}>
+              {display
+                ? "No signed-in person. Tap a name on a finished row to say who really did it."
+                : "Ryan's own completions stand and cannot be reassigned — that is the rule, not a bug."}
+            </div>
+          </div>
+
           <div style={{ marginBottom: 8, color: "#9ca3af" }}>
             Console: <code>__hub.doc()</code>, <code>__hub.set(fn)</code>
           </div>
@@ -52,7 +83,7 @@ function SandboxBadge() {
           letterSpacing: ".04em", boxShadow: "0 2px 10px rgba(0,0,0,.25)",
         }}
       >
-        SANDBOX
+        SANDBOX{display ? " · DISPLAY" : " · RYAN"}
       </button>
     </div>
   );

@@ -129,6 +129,15 @@ export function seed() {
     reminderRelay: { enabled: false, endpoint: "", priority: "default" },
     alertRelayed: {},          // { alertKey: escalationStep } -- stops duplicate sends
     noteDrift: false,          // gentle idle wander for the sticky notes
+    // Kitchen timers. In the document rather than per-device for the same
+    // reason snoozes are: a timer started in the kitchen has to be visible from
+    // a phone, and silencing the alarm anywhere has to quiet the tablet too.
+    // Only timestamps are stored -- see lib/timers.js for why nothing here is
+    // a running/ringing flag.
+    timers: [],                // { id, label, durationMs, startedAt, endsAt, pausedAt, remainingMs, silencedAt, personId }
+    // When each person last looked at the calendar, so "new" can mean new *to
+    // them* rather than merely recent. See lib/new-events.js.
+    seenCalendar: {},          // { personId: epochMs }
   };
 }
 
@@ -174,6 +183,8 @@ export function normalize(state) {
     state.reminderRelay = { ...d.reminderRelay };
   }
   if (state.noteDrift === undefined) state.noteDrift = d.noteDrift;
+  if (!Array.isArray(state.timers)) state.timers = [];
+  if (!state.seenCalendar || typeof state.seenCalendar !== "object") state.seenCalendar = {};
   // migrate the old single-source field to the multi-select list
   if (state.upNextSources === undefined) {
     state.upNextSources = (state.upNextSource && state.upNextSource !== "all")

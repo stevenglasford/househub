@@ -32,6 +32,11 @@ const pad = (n) => String(n).padStart(2, "0");
 const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 const parseYMD = (s) => { const [y, m, d] = String(s).split("-").map(Number); return new Date(y, m - 1, d); };
 const daysInMonth = (y, m) => new Date(y, m + 1, 0).getDate();
+/* Weeks are counted from a Sunday, matching WEEKDAYS and the rest of the app.
+   Only used for "every other week", where all that matters is that two dates in
+   the same week land on the same number. */
+const weekStart = (d) => { const x = new Date(d); x.setDate(x.getDate() - x.getDay()); x.setHours(0, 0, 0, 0); return x; };
+const weeksBetween = (a, b) => Math.round((weekStart(b) - weekStart(a)) / (7 * 86400000));
 
 export const WEEKDAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
@@ -46,12 +51,165 @@ export const scheduleFor = (chore, personId) => {
 };
 
 /** Is this chore due on this day at all? */
+/* ------------------------------------------------------------- pausing --- */
+//
+// Ryan: "instill a pause feature for chores in the case of which it's a
+// seasonal one."
+//
+// Mowing the lawn is not a chore anybody skips from November to March; it is a
+// chore that does not exist from November to March. The difference matters,
+// because the alternative -- letting it come due and skipping it every week --
+// buries five months of skips in the history and makes the "who is not pulling
+// their weight" report lie.
+//
+// So a paused chore is NOT DUE, which also means it accrues nothing while it
+// sleeps. That second part is the one that would have bitten: `oldestOwed`
+// walks back looking for scheduled days nobody completed, so without this a
+// lawn paused for the winter would resume in April with twenty overdue
+// occurrences and a red badge.
+//
+// `annual` is what makes it seasonal rather than a one-off. Compared on
+// month-and-day, and it handles a window that crosses the new year, because
+// every genuinely seasonal pause does.
+
+export const pauseOf = (chore) => (chore && chore.pause) || null;
+
+const mmdd = (key) => String(key || "").slice(5); // "2026-11-01" -> "11-01"
+
+/** Is this chore asleep on this day? */
+export function isPausedOn(chore, dateKey) {
+  const p = pauseOf(chore);
+  if (!p || !dateKey) return false;
+
+  if (p.annual) {
+    const from = mmdd(p.from), until = mmdd(p.until), day = mmdd(dateKey);
+    if (!from || !until) return false;
+    // A window that does not cross the new year: November to March does, June
+    // to August does not, and both have to work.
+    return from <= until
+      ? (day >= from && day <= until)
+      : (day >= from || day <= until);
+  }
+
+  if (p.from && dateKey < p.from) return false;
+  if (p.until && dateKey > p.until) return false;
+  return Boolean(p.from || p.until || p.paused);
+}
+
+/** Pause from a day, optionally until another. No `until` means indefinitely. */
+export function pauseChore(chore, { from, until = null, annual = false } = {}) {
+  return { ...chore, pause: { from: from || null, until: until || null, annual: Boolean(annual), paused: true } };
+}
+
+/** Wake it up. Drops the pause entirely rather than leaving a spent one behind. */
+export function resumeChore(chore) {
+  const next = { ...chore };
+  delete next.pause;
+  return next;
+}
+
+/** "Paused until 1 April" / "Paused each year, 1 Nov – 31 Mar" / "" */
+export function pauseLabel(chore, { todayKey } = {}) {
+  const p = pauseOf(chore);
+  if (!p) return "";
+  const nice = (key) => {
+    if (!key) return "";
+    const [, m, d] = String(key).split("-");
+    const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    return `${Number(d)} ${MONTHS[Number(m) - 1] || ""}`.trim();
+  };
+  if (p.annual) return `Paused each year, ${nice(p.from)} – ${nice(p.until)}`;
+  if (p.until) return `Paused until ${nice(p.until)}`;
+  if (todayKey && p.from && p.from > todayKey) return `Pauses on ${nice(p.from)}`;
+  return "Paused";
+}
+
+/* ------------------------------------------- moving one occurrence --- */
+//
+// Ryan: "there should be a 'reschedule this occurrence' of a chore if we want
+// or need to push it to another day that week."
+//
+// One occurrence, not the schedule. Bins are Tuesdays; this week the lorry
+// comes Wednesday. Changing the cadence would be wrong twice: it moves every
+// future week, and it quietly rewrites what was expected of everybody.
+//
+// Stored as a map from the day it was scheduled to the day it moved to, which
+// is what lets the move be undone and lets the history still say the occurrence
+// belonged to Tuesday.
+
+export const movedTo = (chore, dateKey) => (chore?.moved || {})[dateKey] || null;
+
+export function movedFrom(chore, dateKey) {
+  const moved = chore?.moved || {};
+  for (const from of Object.keys(moved)) if (moved[from] === dateKey) return from;
+  return null;
+}
+
+/** Push a scheduled occurrence to another day. Same day clears the move. */
+export function moveOccurrence(chore, fromKey, toKey) {
+  const moved = { ...(chore?.moved || {}) };
+  if (!toKey || toKey === fromKey) delete moved[fromKey];
+  else moved[fromKey] = toKey;
+  const next = { ...chore, moved };
+  if (!Object.keys(moved).length) delete next.moved;
+  return next;
+}
+
+/** Forget moves for days already gone, so the map cannot grow forever. */
+export function pruneMoves(chore, beforeKey) {
+  const moved = chore?.moved || {};
+  const kept = {};
+  for (const [from, to] of Object.entries(moved)) {
+    if (from >= beforeKey || to >= beforeKey) kept[from] = to;
+  }
+  const next = { ...chore, moved: kept };
+  if (!Object.keys(kept).length) delete next.moved;
+  return next;
+}
+
 export function dueOn(chore, dateKey) {
+  /* A moved occurrence is checked before anything else, including the pause:
+     somebody moved this deliberately and on purpose, and the day they moved it
+     to is when they expect it. */
+  if (movedFrom(chore, dateKey)) return true;
+  if (movedTo(chore, dateKey)) return false;
+
+  // Asleep. Not due, and -- because oldestOwed asks this same question -- not
+  // accruing anything to be overdue about when it wakes.
+  if (isPausedOn(chore, dateKey)) return false;
+
   const c = cadenceOf(chore);
   if (!c || c.type === "daily") return true;
   const d = parseYMD(dateKey);
 
-  if (c.type === "weekly") return (c.days || []).includes(d.getDay());
+  if (c.type === "weekly") {
+    if (!(c.days || []).includes(d.getDay())) return false;
+    /* "Every other Tuesday", and every third, and so on.
+       
+       Counted in whole weeks from an anchor rather than in days, because the
+       alternative -- every 14 days from a start date -- drifts off the weekday
+       the household chose the moment anybody completes it late. The week is the
+       unit people actually mean. */
+    const every = Math.max(1, Number(c.everyNWeeks) || 1);
+    if (every === 1) return true;
+    const anchor = parseYMD(c.anchor || dateKey);
+    return weeksBetween(anchor, d) % every === 0;
+  }
+
+  /* A weekday of the month: "the first Monday", "the last Friday". Distinct
+     from `monthly`, which is a date -- the 15th falls on a different weekday
+     every month, and a chore like putting the bins out is a weekday, not a
+     number. */
+  if (c.type === "monthlyDay") {
+    const dow = Number(c.dow ?? 1);
+    if (d.getDay() !== dow) return false;
+    const nth = Number(c.nth ?? 1);
+    if (nth === -1) {
+      // The last one of the month: no same weekday remains after this.
+      return d.getDate() + 7 > daysInMonth(d.getFullYear(), d.getMonth());
+    }
+    return Math.floor((d.getDate() - 1) / 7) + 1 === nth;
+  }
 
   if (c.type === "monthly") {
     const want = Math.min(c.dayOfMonth || 1, daysInMonth(d.getFullYear(), d.getMonth()));
@@ -139,10 +297,19 @@ export function describeCadence(chore, personName) {
     case "weekly": {
       const days = (c.days || []).slice().sort();
       if (!days.length) return "Weekly";
-      if (days.length === 7) return "Every day";
-      return `Every ${days.map((d) => WEEKDAYS[d]).join(", ")}`;
+      const every = Math.max(1, Number(c.everyNWeeks) || 1);
+      if (days.length === 7 && every === 1) return "Every day";
+      const named = days.map((d) => WEEKDAYS[d]).join(", ");
+      if (every === 1) return `Every ${named}`;
+      if (every === 2) return `Every other ${named}`;
+      return `Every ${ordinal(every)} week, on ${named}`;
     }
     case "monthly": return `Monthly, on the ${ordinal(c.dayOfMonth || 1)}`;
+    case "monthlyDay": {
+      const day = WEEKDAYS[Number(c.dow ?? 1)] || "Monday";
+      const nth = Number(c.nth ?? 1);
+      return nth === -1 ? `Monthly, the last ${day}` : `Monthly, the ${ordinal(nth)} ${day}`;
+    }
     case "interval": {
       const n = Math.max(1, c.everyN || 2);
       return n === 1 ? "Every day" : `Every ${n} days`;
